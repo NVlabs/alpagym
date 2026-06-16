@@ -1,0 +1,98 @@
+# Render every Marp deck to HTML and publish it to GitHub Pages.
+#
+# Auto-discovers every decks/*/slides.tpl.md, regenerates its slides.md, and
+# renders it to interactive HTML — so the in-figure deep-links and per-slide
+# permalinks keep working. HTML output needs no Chromium, so this runs on plain
+# Node — no browser, no Docker.
+#
+# First-time setup: repo Settings → Pages → "Build and deployment" → Source =
+# "GitHub Actions" (the configure-pages step below also enables it via the API).
+# Ensure the `github-pages` environment allows deployments from the `gh-pages`
+# branch. Then every push to gh-pages republishes the site.
+
+name: Deploy decks to GitHub Pages
+
+on:
+  push:
+    branches: [gh-pages]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; let a newer push supersede an in-flight one.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Enable Pages and set its source to GitHub Actions via the API, so the
+      # deploy job doesn't depend on the repo's Settings → Pages toggle being
+      # flipped by hand. Idempotent if Pages is already enabled.
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Render decks to HTML
+        working-directory: decks
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          decks=()
+          for tpl in */slides.tpl.md; do
+            deck="$(dirname "$tpl")"
+            decks+=("$deck")
+            echo "rendering $deck ..."
+            python3 tools/build_deck.py "$deck"
+            # --html: allow the decks' inline SVG. No --pdf, so no Chromium needed.
+            npx --yes @marp-team/marp-cli@latest "$deck/slides.md" \
+              --html --allow-local-files --theme-set themes/ \
+              -o "_site/$deck.html"
+          done
+          # Landing page listing every deck.
+          {
+            echo '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            echo '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            echo '<title>AlpaGym decks</title>'
+            echo '<style>body{margin:0;min-height:100vh;display:flex;flex-direction:column;'
+            echo 'align-items:center;justify-content:center;background:#0a0a0a;color:#f0f0f0;'
+            echo "font-family:Inter,-apple-system,BlinkMacSystemFont,sans-serif}"
+            echo 'h1{font-weight:800;letter-spacing:-.03em;border-top:3px solid #76b900;padding-top:1rem}'
+            echo 'a{display:block;margin:.5rem 0;padding:.7rem 1.4rem;color:#f0f0f0;text-decoration:none;'
+            echo 'background:#1a1a1a;border:1px solid #2a2a2a;border-left:3px solid #76b900;border-radius:8px;min-width:14rem}'
+            echo 'a:hover{border-color:#76b900}</style></head><body><h1>AlpaGym decks</h1>'
+            for deck in "${decks[@]}"; do
+              echo "<a href=\"$deck.html\">$deck</a>"
+            done
+            echo '</body></html>'
+          } > _site/index.html
+          echo "built: ${decks[*]}"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: decks/_site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

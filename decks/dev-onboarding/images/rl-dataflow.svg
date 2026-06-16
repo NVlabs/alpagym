@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 600" font-family="Inter, sans-serif">
+  <defs>
+    <marker id="m" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#76b900"/></marker>
+  </defs>
+  <rect x="0" y="0" width="1160" height="600" fill="#111111"/>
+  <style>
+    .t{fill:#f0f0f0;font-weight:700}.m{font-family:'JetBrains Mono',monospace;fill:#a3d44a}.d{fill:#a0a0a0}.lnk{fill:#58a6ff}
+  </style>
+
+  <text x="30" y="64" class="d" font-size="15"><tspan fill="#76b900" font-weight="700">①  Generate rollouts</tspan>  —  the actor collects experience by driving the simulator</text>
+
+  <!-- TOP ROW -->
+  <g>
+    <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/cosmos/dataset.py" target="_blank">
+      <rect x="30" y="90" width="240" height="104" rx="12" fill="#1a1a1a" stroke="#2a2a2a"/>
+      <text x="48" y="124" class="t" font-size="17">Scene dataset</text>
+      <text x="48" y="148" class="m" font-size="12.5">cosmos/dataset.py</text>
+      <text x="48" y="174" class="d" font-size="13">scene_ids → "prompts"</text>
+    </a>
+    <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/cosmos/entrypoint.py" target="_blank">
+      <rect x="300" y="90" width="240" height="104" rx="12" fill="#1a1a1a" stroke="#2a2a2a"/>
+      <text x="318" y="124" class="t" font-size="17">Cosmos dispatcher</text>
+      <text x="318" y="148" class="m" font-size="12.5">cosmos/entrypoint.py</text>
+      <text x="318" y="174" class="d" font-size="13">queues + fans out prompts</text>
+    </a>
+    <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/cosmos/rollout_backend.py" target="_blank">
+      <rect x="570" y="90" width="240" height="104" rx="12" fill="#1a1a1a" stroke="#76b900" stroke-width="2"/>
+      <text x="588" y="124" class="t" font-size="17">Rollout backend</text>
+      <text x="588" y="148" class="m" font-size="12.5">cosmos/rollout_backend.py</text>
+      <text x="588" y="174" class="d" font-size="13">the actor · prompt→scene_id</text>
+    </a>
+    <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/episode_runner/streaming_worker.py" target="_blank">
+      <rect x="840" y="90" width="240" height="104" rx="12" fill="#1a1a1a" stroke="#76b900" stroke-width="2"/>
+      <text x="858" y="124" class="t" font-size="17">run_batch()</text>
+      <text x="858" y="148" class="m" font-size="12.5">episode_runner/streaming_worker.py</text>
+      <text x="858" y="174" class="d" font-size="13">runs N×G sim episodes</text>
+    </a>
+    <path d="M270,142 L298,142" fill="none" stroke="#76b900" stroke-width="2.5" marker-end="url(#m)"/>
+    <path d="M540,142 L568,142" fill="none" stroke="#76b900" stroke-width="2.5" marker-end="url(#m)"/>
+    <path d="M810,142 L838,142" fill="none" stroke="#76b900" stroke-width="2.5" marker-end="url(#m)"/>
+  </g>
+
+  <!-- closed-loop note under run_batch -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/alpasim/driver_server.py" target="_blank">
+    <rect x="660" y="232" width="420" height="74" rx="10" fill="#0d1117" stroke="#58a6ff" stroke-width="1.3" stroke-dasharray="5 4"/>
+    <text x="870" y="262" text-anchor="middle" class="lnk" font-size="14" font-weight="700">each episode = a closed loop with AlpaSim</text>
+    <text x="870" y="286" text-anchor="middle" class="d" font-size="12.5">egodriver server · policy.step() · inference engine  (see next figure)</text>
+  </a>
+  <path d="M960,194 L960,230" fill="none" stroke="#58a6ff" stroke-width="2" marker-end="url(#m)"/>
+
+  <!-- turn-down from run_batch to bottom row -->
+  <path d="M960,306 C960,350 960,350 960,398" fill="none" stroke="#76b900" stroke-width="2.5" marker-end="url(#m)"/>
+  <text x="975" y="356" class="d" font-size="12.5">EpisodeOutput</text>
+
+  <text x="30" y="372" class="d" font-size="15"><tspan fill="#76b900" font-weight="700">②  Score &amp; train</tspan>  —  reward the episode, persist it, feed the learner  (read right → left)</text>
+
+  <!-- BOTTOM ROW (right to left) -->
+  <g>
+    <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/rewards/compute.py" target="_blank">
+      <rect x="840" y="398" width="240" height="104" rx="12" fill="#1a1a1a" stroke="#76b900" stroke-width="2"/>
+      <text x="858" y="432" class="t" font-size="17">compute_reward()</text>
+      <text x="858" y="456" class="m" font-size="12.5">rewards/compute.py</text>
+      <text x="858" y="482" class="d" font-size="13">Σ reward terms → reward</text>
+    </a>
+    <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/transport/disk.py" target="_blank">
+      <rect x="570" y="398" width="240" height="104" rx="12" fill="#1a1a1a" stroke="#2a2a2a"/>
+      <text x="588" y="432" class="t" font-size="17">JSON artifact</text>
+      <text x="588" y="456" class="m" font-size="12.5">transport/disk.py</text>
+      <text x="588" y="482" class="d" font-size="13">write_rollout_artifact()</text>
+    </a>
+    <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/cosmos/reward_fn.py" target="_blank">
+      <rect x="300" y="398" width="240" height="104" rx="12" fill="#1a1a1a" stroke="#2a2a2a"/>
+      <text x="318" y="432" class="t" font-size="17">reward_fn</text>
+      <text x="318" y="456" class="m" font-size="12.5">cosmos/reward_fn.py</text>
+      <text x="318" y="482" class="d" font-size="13">reads episode.reward.total</text>
+    </a>
+    <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/cosmos/trainer.py" target="_blank">
+      <rect x="30" y="398" width="240" height="104" rx="12" fill="#1a1a1a" stroke="#58a6ff" stroke-width="2"/>
+      <text x="48" y="432" class="t" font-size="17">step_training()</text>
+      <text x="48" y="456" class="m" font-size="12.5">cosmos/trainer.py</text>
+      <text x="48" y="482" class="d" font-size="13">GRPO update · stub today</text>
+    </a>
+    <path d="M838,450 L812,450" fill="none" stroke="#76b900" stroke-width="2.5" marker-end="url(#m)"/>
+    <path d="M568,450 L542,450" fill="none" stroke="#76b900" stroke-width="2.5" marker-end="url(#m)"/>
+    <path d="M298,450 L272,450" fill="none" stroke="#76b900" stroke-width="2.5" marker-end="url(#m)"/>
+  </g>
+
+  <text x="30" y="560" class="d" font-size="12.5">Registered with Cosmos-RL at import in <tspan class="m" font-size="12">cosmos/entrypoint.py</tspan>: the rollout backend, trainer, model, data packer and reward fns.</text>
+</svg>

@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 600" font-family="Inter, sans-serif">
+  <defs>
+    <marker id="g" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#888"/></marker>
+    <marker id="gr" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#76b900"/></marker>
+  </defs>
+  <rect x="0" y="0" width="1160" height="600" fill="#111111"/>
+  <style>.t{fill:#f0f0f0;font-weight:700}.m{font-family:'JetBrains Mono',monospace;fill:#a3d44a}.d{fill:#a0a0a0}.lnk{fill:#58a6ff}</style>
+
+  <!-- Rollout (sender) -->
+  <rect x="34" y="250" width="210" height="116" rx="13" fill="#1a1a1a" stroke="#76b900" stroke-width="1.8"/>
+  <text x="139" y="296" text-anchor="middle" class="t" font-size="16">Rollout replica</text>
+  <text x="139" y="320" text-anchor="middle" class="d" font-size="13">sender</text>
+  <text x="139" y="344" text-anchor="middle" class="d" font-size="12.5">episode tensors</text>
+
+  <!-- seam -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/transport/base.py" target="_blank">
+    <rect x="300" y="262" width="150" height="92" rx="11" fill="#0d1117" stroke="#58a6ff" stroke-width="1.4"/>
+    <text x="375" y="296" text-anchor="middle" class="lnk" font-size="13.5" font-weight="700">EpisodeWriter</text>
+    <text x="375" y="318" text-anchor="middle" class="d" font-size="11.5">transport/base.py</text>
+    <text x="375" y="338" text-anchor="middle" class="m" font-size="11">transport={disk|nccl}</text>
+  </a>
+  <path d="M244,308 L298,308" stroke="#888" stroke-width="2" marker-end="url(#g)"/>
+
+  <!-- DISK lane (top, default) -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/transport/disk.py" target="_blank">
+    <rect x="540" y="96" width="290" height="92" rx="12" fill="#1a1a1a" stroke="#2a2a2a"/>
+    <text x="685" y="130" text-anchor="middle" class="t" font-size="15">JSON artifact on disk</text>
+    <text x="685" y="154" text-anchor="middle" class="m" font-size="12">transport/disk.py</text>
+    <text x="685" y="174" text-anchor="middle" class="d" font-size="11.5">write → Lustre → read</text>
+  </a>
+  <path d="M392,260 C392,142 430,142 538,142" fill="none" stroke="#888" stroke-width="2" marker-end="url(#g)"/>
+  <path d="M830,142 C900,142 900,250 916,300" fill="none" stroke="#888" stroke-width="2" marker-end="url(#g)"/>
+  <rect x="690" y="60" width="86" height="26" rx="13" fill="rgba(118,185,0,0.15)"/>
+  <text x="733" y="78" text-anchor="middle" fill="#76b900" font-size="12" font-weight="700">DEFAULT</text>
+
+  <!-- NCCL lane (bottom, in progress) -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/transport/nccl/README.md" target="_blank">
+    <rect x="540" y="420" width="290" height="92" rx="12" fill="#161616" stroke="#76b900" stroke-width="1.8"/>
+    <text x="685" y="454" text-anchor="middle" class="t" font-size="15">NCCL — GPU → GPU tensors</text>
+    <text x="685" y="478" text-anchor="middle" class="m" font-size="12">transport/nccl/</text>
+    <text x="685" y="498" text-anchor="middle" class="d" font-size="11.5">no disk round-trip</text>
+  </a>
+  <path d="M392,356 C392,466 430,466 538,466" fill="none" stroke="#76b900" stroke-width="2.4" marker-end="url(#gr)"/>
+  <path d="M830,466 C900,466 900,360 916,318" fill="none" stroke="#76b900" stroke-width="2.4" marker-end="url(#gr)"/>
+  <rect x="652" y="384" width="166" height="26" rx="13" fill="rgba(240,136,62,0.15)"/>
+  <text x="735" y="402" text-anchor="middle" fill="#f0883e" font-size="12" font-weight="700">OPT-IN · IN PROGRESS</text>
+
+  <!-- Trainer (receiver) -->
+  <rect x="916" y="250" width="210" height="116" rx="13" fill="#1a1a1a" stroke="#76b900" stroke-width="1.8"/>
+  <text x="1021" y="296" text-anchor="middle" class="t" font-size="16">Policy / trainer</text>
+  <text x="1021" y="320" text-anchor="middle" class="d" font-size="13">receiver</text>
+  <text x="1021" y="344" text-anchor="middle" class="d" font-size="12.5">training step</text>
+
+  <!-- title hint -->
+  <text x="34" y="60" class="d" font-size="13">The rollout → trainer episode hand-off goes through one swappable <tspan fill="#f0f0f0" font-weight="700">transport</tspan> seam:</text>
+</svg>

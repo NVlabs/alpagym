@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 600" font-family="Inter, sans-serif">
+  <defs>
+    <style>.t{fill:#f0f0f0;font-weight:700}.m{font-family:'JetBrains Mono',monospace;fill:#a3d44a}.d{fill:#a0a0a0}.l{fill:#f0f0f0;font-weight:600}</style>
+    <marker id="lg" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#76b900"/></marker>
+    <marker id="lb" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#58a6ff"/></marker>
+    <marker id="lgr" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#666"/></marker>
+  </defs>
+  <rect x="0" y="0" width="1160" height="600" fill="#111111"/>
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/host/src/alpagym_host/cli.py" target="_blank">
+    <rect x="130" y="26" width="900" height="68" rx="12" fill="#1a1a1a" stroke="#76b900" stroke-width="1.5" stroke-dasharray="6 4"/>
+    <text x="580" y="58" text-anchor="middle" class="t" font-size="21">AlpaGym host <tspan class="m" font-size="15">alpagym_host.cli</tspan></text>
+    <text x="580" y="82" text-anchor="middle" class="d" font-size="14">one command: resolve config &#183; launch both engines</text>
+  </a>
+  <path d="M300,94 L300,176" fill="none" stroke="#666" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#lgr)"/>
+  <path d="M860,94 L860,176" fill="none" stroke="#666" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#lgr)"/>
+  <text x="312" y="138" class="d" font-size="12">launch</text>
+  <text x="848" y="138" text-anchor="end" class="d" font-size="12">launch</text>
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/types.py" target="_blank">
+    <rect x="120" y="178" width="320" height="152" rx="14" fill="#1a1a1a" stroke="#76b900" stroke-width="2"/>
+    <text x="280" y="222" text-anchor="middle" class="t" font-size="23">Policy <tspan fill="#76b900">&#960;&#952;</tspan></text>
+    <text x="280" y="252" text-anchor="middle" class="m" font-size="15">Policy.step()</text>
+    <text x="280" y="282" text-anchor="middle" class="d" font-size="14">your model + checkpoint —</text>
+    <text x="280" y="302" text-anchor="middle" class="d" font-size="14">observations in, trajectory out</text>
+  </a>
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/alpasim/driver_server.py" target="_blank">
+    <rect x="720" y="178" width="320" height="152" rx="14" fill="#1a1a1a" stroke="#76b900" stroke-width="2"/>
+    <text x="880" y="222" text-anchor="middle" class="t" font-size="23">AlpaSim</text>
+    <text x="880" y="252" text-anchor="middle" class="m" font-size="15">closed-loop simulator</text>
+    <text x="880" y="282" text-anchor="middle" class="d" font-size="14">rolls the ego car through</text>
+    <text x="880" y="302" text-anchor="middle" class="d" font-size="14">a recorded driving scene</text>
+  </a>
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/cosmos/trainer.py" target="_blank">
+    <rect x="420" y="430" width="320" height="142" rx="14" fill="#1a1a1a" stroke="#58a6ff" stroke-width="2"/>
+    <text x="580" y="472" text-anchor="middle" class="t" font-size="22">Cosmos-RL</text>
+    <text x="580" y="502" text-anchor="middle" class="m" font-size="15">GRPO trainer</text>
+    <text x="580" y="532" text-anchor="middle" class="d" font-size="14">scores the rollouts &amp;</text>
+    <text x="580" y="552" text-anchor="middle" class="d" font-size="14">updates the policy</text>
+  </a>
+  <path d="M440,210 C560,176 600,176 720,210" fill="none" stroke="#76b900" stroke-width="2.5" marker-end="url(#lg)"/>
+  <text x="580" y="150" text-anchor="middle" class="l" font-size="15">&#9312; acts — planned trajectory each tick</text>
+  <text x="580" y="170" text-anchor="middle" fill="#58a6ff" font-size="12">&#8644; over gRPC (egodriver)</text>
+  <path d="M832,330 C812,392 770,404 706,430" fill="none" stroke="#76b900" stroke-width="2.5" marker-end="url(#lg)"/>
+  <text x="840" y="392" text-anchor="middle" class="l" font-size="14">&#9313; rollouts + reward</text>
+  <path d="M420,470 C300,440 296,398 290,332" fill="none" stroke="#58a6ff" stroke-width="2.5" marker-end="url(#lb)"/>
+  <text x="318" y="392" text-anchor="middle" fill="#58a6ff" font-weight="600" font-size="14">&#9314; updated weights</text>
+  <text x="580" y="300" text-anchor="middle" fill="#666" font-weight="700" font-size="22">the RL loop</text>
+</svg>

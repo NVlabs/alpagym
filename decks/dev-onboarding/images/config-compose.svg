@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 600" font-family="Inter, sans-serif">
+  <defs>
+    <marker id="c" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#76b900"/></marker>
+  </defs>
+  <rect x="0" y="0" width="1160" height="600" fill="#111111"/>
+  <style>.t{fill:#f0f0f0;font-weight:700}.m{font-family:'JetBrains Mono',monospace;fill:#58a6ff}.d{fill:#a0a0a0}.g{fill:#76b900;font-weight:700}</style>
+
+  <text x="30" y="50" class="d" font-size="15"><tspan class="g">One source of truth</tspan> — Hydra composes YAML defaults + CLI overrides into a typed, frozen config.</text>
+
+  <!-- INPUTS -->
+  <text x="30" y="92" class="g" font-size="13">INPUTS</text>
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/host/src/alpagym_host/conf/default.yaml" target="_blank">
+    <rect x="24" y="104" width="288" height="64" rx="10" fill="#1a1a1a" stroke="#2a2a2a"/>
+    <text x="40" y="130" class="t" font-size="14">conf/default.yaml</text>
+    <text x="40" y="152" class="d" font-size="12">root defaults for every group</text>
+  </a>
+  <a href="https://github.com/NVlabs/alpagym/tree/main/packages/host/src/alpagym_host/conf/policy" target="_blank">
+    <rect x="24" y="180" width="288" height="64" rx="10" fill="#1a1a1a" stroke="#2a2a2a"/>
+    <text x="40" y="206" class="t" font-size="14">conf/policy/*.yaml</text>
+    <text x="40" y="228" class="d" font-size="12">alpamayo</text>
+  </a>
+  <a href="https://github.com/NVlabs/alpagym/tree/main/packages/host/src/alpagym_host/conf/reward" target="_blank">
+    <rect x="24" y="256" width="288" height="64" rx="10" fill="#1a1a1a" stroke="#2a2a2a"/>
+    <text x="40" y="282" class="t" font-size="14">conf/reward/*.yaml</text>
+    <text x="40" y="304" class="d" font-size="12">distance_to_gt · metrics · progress_safety</text>
+  </a>
+  <rect x="24" y="332" width="288" height="64" rx="10" fill="#0d1117" stroke="#f0883e" stroke-width="1.4"/>
+  <text x="40" y="358" class="t" font-size="14">CLI overrides</text>
+  <text x="40" y="380" class="d m" font-size="11.5" fill="#f0883e">policy=alpamayo  policy.model.path=…</text>
+
+  <!-- compose arrows -->
+  <path d="M314,136 C350,136 350,236 384,236" fill="none" stroke="#76b900" stroke-width="2" marker-end="url(#c)"/>
+  <path d="M314,212 L384,230" stroke="#76b900" stroke-width="2" marker-end="url(#c)"/>
+  <path d="M314,288 C350,288 350,244 384,244" fill="none" stroke="#76b900" stroke-width="2" marker-end="url(#c)"/>
+  <path d="M314,364 C350,364 350,256 384,252" fill="none" stroke="#76b900" stroke-width="2" marker-end="url(#c)"/>
+
+  <!-- RunConfig -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/host/src/alpagym_host/config.py" target="_blank">
+    <rect x="388" y="120" width="356" height="300" rx="12" fill="#161616" stroke="#76b900" stroke-width="2"/>
+  </a>
+  <text x="408" y="152" class="t" font-size="17">RunConfig</text>
+  <text x="408" y="172" class="m" font-size="12">config.py · typed dataclasses</text>
+  <text x="408" y="190" class="d" font-size="11.5">registered with Hydra ConfigStore</text>
+  <g>
+    <rect x="408" y="206" width="316" height="30" rx="6" fill="#1a1a1a"/><text x="420" y="226" class="d" font-size="12.5"><tspan class="g">policy</tspan>  — model kind, checkpoint, sampling</text>
+    <rect x="408" y="240" width="316" height="30" rx="6" fill="#1a1a1a"/><text x="420" y="260" class="d" font-size="12.5"><tspan class="g">reward</tspan>  — weighted reward terms</text>
+    <rect x="408" y="274" width="316" height="30" rx="6" fill="#1a1a1a"/><text x="420" y="294" class="d" font-size="12.5"><tspan class="g">execution</tspan>  — local_process / slurm</text>
+    <rect x="408" y="308" width="316" height="30" rx="6" fill="#1a1a1a"/><text x="420" y="328" class="d" font-size="12.5"><tspan class="g">alpasim</tspan>  — Wizard checkout + startup</text>
+    <rect x="408" y="342" width="316" height="30" rx="6" fill="#1a1a1a"/><text x="420" y="362" class="d" font-size="12.5"><tspan class="g">cosmos</tspan>  — replicas, parallelism, training</text>
+    <rect x="408" y="376" width="316" height="30" rx="6" fill="#1a1a1a"/><text x="420" y="396" class="d" font-size="12.5"><tspan class="g">dataset</tspan>  — scene_ids</text>
+  </g>
+
+  <!-- produce arrow -->
+  <path d="M744,270 L800,270" stroke="#76b900" stroke-width="2.4" marker-end="url(#c)"/>
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/host/src/alpagym_host/run_artifacts.py" target="_blank">
+    <text x="772" y="262" text-anchor="middle" class="d" font-size="10.5">write_run_artifacts()</text>
+  </a>
+
+  <!-- OUTPUTS -->
+  <text x="816" y="92" class="g" font-size="13">PER-RUN ARTIFACTS</text>
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/host/src/alpagym_host/run_artifacts.py" target="_blank">
+    <rect x="812" y="120" width="324" height="80" rx="10" fill="#1a1a1a" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="830" y="148" class="t" font-size="14">resolved_config.yaml</text>
+    <text x="830" y="170" class="d" font-size="12">the frozen run — re-loaded verbatim</text>
+    <text x="830" y="190" class="d" font-size="12">when a Slurm job re-runs on the node</text>
+  </a>
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/host/src/alpagym_host/run_artifacts.py" target="_blank">
+    <rect x="812" y="212" width="324" height="80" rx="10" fill="#1a1a1a" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="830" y="240" class="t" font-size="14">cosmos_config.toml</text>
+    <text x="830" y="262" class="d" font-size="12">launcher config consumed by</text>
+    <text x="830" y="282" class="d" font-size="12">Cosmos-RL (mode, replicas, GRPO)</text>
+  </a>
+  <rect x="812" y="304" width="324" height="74" rx="10" fill="#1a1a1a" stroke="#2a2a2a"/>
+  <text x="830" y="332" class="t" font-size="14">cosmos_config.toml</text>
+  <text x="830" y="354" class="d" font-size="12">minimal HF config for the placeholder</text>
+  <text x="830" y="372" class="d" font-size="12">model Cosmos loads on the trainer side</text>
+
+  <!-- inspect tip -->
+  <rect x="24" y="436" width="1112" height="56" rx="10" fill="#0d1117" stroke="#2a2a2a"/>
+  <text x="44" y="470" class="d" font-size="14">Inspect the fully-resolved config before launching:  <tspan class="m" font-size="13">uv run --package alpagym-host -m alpagym_host.cli --cfg job</tspan></text>
+</svg>

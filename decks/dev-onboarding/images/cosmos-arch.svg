@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 600" font-family="Inter, sans-serif">
+  <defs>
+    <marker id="th" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#58a6ff"/></marker>
+    <marker id="thr" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#58a6ff"/></marker>
+    <marker id="nc" markerWidth="10" markerHeight="10" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#76b900"/></marker>
+    <marker id="g" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#888"/></marker>
+  </defs>
+  <rect x="0" y="0" width="1160" height="600" fill="#111111"/>
+  <style>.t{fill:#f0f0f0;font-weight:700}.m{font-family:'JetBrains Mono',monospace;fill:#a3d44a}.d{fill:#a0a0a0}.blue{fill:#58a6ff}</style>
+
+  <!-- Dataset -->
+  <rect x="28" y="92" width="180" height="78" rx="11" fill="#1a1a1a" stroke="#2a2a2a"/>
+  <text x="118" y="126" text-anchor="middle" class="t" font-size="15">Scene dataset</text>
+  <text x="118" y="150" text-anchor="middle" class="d" font-size="12.5">prompts</text>
+
+  <!-- Controller -->
+  <a href="https://github.com/nvidia-cosmos/cosmos-rl/blob/main/cosmos_rl/dispatcher/controller.py" target="_blank">
+    <rect x="338" y="52" width="486" height="158" rx="13" fill="#161616" stroke="#76b900" stroke-width="2"/>
+  </a>
+  <text x="358" y="84" class="t" font-size="18">Controller</text>
+  <text x="358" y="106" class="d" font-size="13">single coordinator · dispatcher · data fetcher · shard mapper</text>
+  <text x="358" y="126" class="d" font-size="12">starts its own Redis ▸</text>
+  <!-- Redis sub-box -->
+  <a href="https://github.com/nvidia-cosmos/cosmos-rl/blob/main/cosmos_rl/utils/redis_stream.py" target="_blank">
+    <rect x="600" y="120" width="206" height="74" rx="9" fill="#0d1117" stroke="#58a6ff" stroke-width="1.4"/>
+    <text x="703" y="148" text-anchor="middle" class="blue" font-size="14" font-weight="700">Redis streams</text>
+    <text x="703" y="172" text-anchor="middle" class="d" font-size="11.5">command + rollout bus</text>
+  </a>
+
+  <!-- launcher note -->
+  <a href="https://github.com/nvidia-cosmos/cosmos-rl/blob/main/cosmos_rl/launcher/launch_all.py" target="_blank">
+    <text x="28" y="210" class="d" font-size="12">▸ <tspan class="m" font-size="11.5">launch_all.py</tspan> brings up the controller + all replicas</text>
+  </a>
+
+  <!-- Rollout replicas -->
+  <a href="https://github.com/nvidia-cosmos/cosmos-rl/blob/main/cosmos_rl/rollout/rollout_base.py" target="_blank">
+    <rect x="300" y="398" width="300" height="150" rx="13" fill="#1a1a1a" stroke="#76b900" stroke-width="1.8"/>
+  </a>
+  <text x="450" y="432" text-anchor="middle" class="t" font-size="17">Rollout replicas</text>
+  <text x="450" y="456" text-anchor="middle" class="d" font-size="13">actors — generate + reward</text>
+  <text x="450" y="478" text-anchor="middle" class="d" font-size="12.5">vLLM / TRT-LLM / custom backend</text>
+  <text x="450" y="522" text-anchor="middle" class="m" font-size="12">@RolloutRegistry.register</text>
+
+  <!-- Policy replicas -->
+  <a href="https://github.com/nvidia-cosmos/cosmos-rl/blob/main/cosmos_rl/launcher/worker_entry.py" target="_blank">
+    <rect x="700" y="398" width="300" height="150" rx="13" fill="#1a1a1a" stroke="#76b900" stroke-width="1.8"/>
+  </a>
+  <text x="850" y="432" text-anchor="middle" class="t" font-size="17">Policy replicas</text>
+  <text x="850" y="456" text-anchor="middle" class="d" font-size="13">trainers — optimizer step</text>
+  <text x="850" y="478" text-anchor="middle" class="d" font-size="12.5">GRPO · TP / FSDP / CP / PP</text>
+  <text x="850" y="522" text-anchor="middle" class="m" font-size="12">@TrainerRegistry.register</text>
+
+  <!-- dataset -> controller -->
+  <path d="M208,131 L336,131" stroke="#888" stroke-width="2" marker-end="url(#g)"/>
+  <text x="270" y="123" text-anchor="middle" class="d" font-size="11">prompts</text>
+
+  <!-- controller <-> rollout (redis) -->
+  <path d="M430,212 L430,396" stroke="#58a6ff" stroke-width="1.8" marker-end="url(#th)"/>
+  <text x="392" y="310" text-anchor="middle" class="blue" font-size="11" transform="rotate(-90 392 310)">commands</text>
+  <path d="M470,396 L470,212" stroke="#58a6ff" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#thr)"/>
+  <text x="512" y="310" text-anchor="middle" class="blue" font-size="11" transform="rotate(-90 512 310)">rollouts + rewards</text>
+
+  <!-- controller <-> policy (redis) -->
+  <path d="M760,212 L850,396" stroke="#58a6ff" stroke-width="1.8" marker-end="url(#th)"/>
+  <text x="716" y="306" class="blue" font-size="11">batches</text>
+
+  <!-- policy -> rollout NCCL weight sync (thick) -->
+  <path d="M698,475 L602,475" stroke="#76b900" stroke-width="5" marker-end="url(#nc)"/>
+  <text x="650" y="462" text-anchor="middle" class="t" font-size="12">weight sync</text>
+  <text x="650" y="538" text-anchor="middle" class="d" font-size="11">NCCL · IB / NVLink</text>
+
+  <!-- legend -->
+  <rect x="28" y="252" width="300" height="96" rx="10" fill="#0d1117" stroke="#2a2a2a"/>
+  <line x1="48" y1="284" x2="92" y2="284" stroke="#58a6ff" stroke-width="2"/>
+  <text x="104" y="288" class="d" font-size="12.5">Redis — control + rollout data queue</text>
+  <line x1="48" y1="318" x2="92" y2="318" stroke="#76b900" stroke-width="5"/>
+  <text x="104" y="322" class="d" font-size="12.5">NCCL — high-bandwidth weight sync</text>
+
+  <!-- modes callout -->
+  <a href="https://github.com/nvidia-cosmos/cosmos-rl/blob/main/cosmos_rl/launcher/launch_all.py" target="_blank">
+    <rect x="844" y="232" width="288" height="120" rx="11" fill="#161616" stroke="#bc8cff" stroke-width="1.5"/>
+  </a>
+  <text x="864" y="262" fill="#bc8cff" font-size="14" font-weight="700">Placement modes</text>
+  <text x="864" y="288" class="d" font-size="12.5"><tspan fill="#f0f0f0">disaggregated</tspan> — separate GPUs</text>
+  <text x="864" y="310" class="d" font-size="12.5"><tspan fill="#f0f0f0">colocated</tspan> — share GPUs</text>
+  <text x="864" y="336" class="d" font-size="12">AlpaGym runs <tspan class="m" font-size="11.5">colocated</tspan> (n_policy = n_rollout)</text>
+</svg>

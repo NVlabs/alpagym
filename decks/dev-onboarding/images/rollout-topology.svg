@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 600" font-family="Inter, sans-serif">
+  <defs>
+    <marker id="pu" markerWidth="9" markerHeight="9" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#bc8cff"/></marker>
+    <marker id="b" markerWidth="9" markerHeight="9" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#58a6ff"/></marker>
+    <marker id="am" markerWidth="9" markerHeight="9" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#fbbf24"/></marker>
+    <marker id="g" markerWidth="9" markerHeight="9" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#76b900"/></marker>
+  </defs>
+  <rect x="0" y="0" width="1160" height="600" fill="#111111"/>
+  <style>.t{fill:#f0f0f0;font-weight:700}.m{font-family:'JetBrains Mono',monospace;fill:#a3d44a}.d{fill:#a0a0a0}</style>
+  <text x="22" y="22" class="d" font-size="13.5">Example: one 8-GPU node split <tspan fill="#f0f0f0" font-weight="700">1 policy / 3 rollout / 4 AlpaSim</tspan> (<a href="https://github.com/NVlabs/alpagym/blob/main/packages/host/src/alpagym_host/conf/topology/slurm_full_node_1_3_4.yaml" target="_blank"><tspan class="m" font-size="12" text-decoration="underline">topology=slurm_full_node_1_3_4 ↗</tspan></a>)</text>
+  <!-- CPU coordination strip -->
+  <rect x="24" y="34" width="1112" height="28" rx="8" fill="#191919" stroke="#7a7a7a" stroke-width="1.2"/>
+  <text x="580" y="52" text-anchor="middle" class="d" font-size="11"><tspan fill="#cfcfcf" font-weight="700">CPU only — coordination, no GPU:</tspan>   Cosmos-RL controller · Redis bus · AlpaSim controller procs · the StreamingRolloutWorker queue + threads</text>
+  <!-- ZONE A: policy / training -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/cosmos/trainer.py" target="_blank"><rect x="24" y="78" width="290" height="444" rx="12" fill="#1a1413" stroke="#f85149" stroke-width="1.8"/><text x="40" y="104" class="t" font-size="14">Policy</text></a>
+  <text x="40" y="120" class="d" font-size="10.5">Cosmos role: the <tspan fill="#f0f0f0" font-weight="700">trainer</tspan> · GPU 0 · ×1</text>
+  <rect x="40" y="132" width="110" height="24" rx="6" fill="#2a1414" stroke="#f85149"/><text x="95" y="148" text-anchor="middle" class="m" font-size="10.5" fill="#ff9a93">GPU 0</text>
+  <text x="40" y="184" class="t" font-size="12" fill="#ff9a93">GRPO training step</text>
+  <text x="40" y="206" class="d" font-size="11">• backprop — the heaviest</text>
+  <text x="40" y="222" class="d" font-size="11">  GPU compute in the loop</text>
+  <text x="40" y="248" class="d" font-size="11">• holds the master weights</text>
+  <text x="40" y="270" class="d" font-size="11">• scales out: DP shards</text>
+  <text x="40" y="286" class="d" font-size="10.5">  (<tspan class="m" font-size="10">n_init × dp_shard_size</tspan>)</text>
+  <rect x="40" y="482" width="200" height="26" rx="7" fill="#2a1414" stroke="#f85149"/><text x="52" y="499" class="t" font-size="10.5" fill="#ff9a93">⚙ compute: TRAINING</text>
+  <!-- ZONE B: rollout / inference -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/cosmos/rollout_backend.py" target="_blank"><rect x="336" y="78" width="462" height="444" rx="12" fill="#121512" stroke="#76b900" stroke-width="2"/><text x="352" y="104" class="t" font-size="14">Rollout</text></a>
+  <text x="352" y="120" class="d" font-size="10.5">Cosmos role: the <tspan fill="#f0f0f0" font-weight="700">actors</tspan> · GPUs 1-3 · ×3 (example)</text>
+  <rect x="352" y="132" width="124" height="24" rx="6" fill="#16200f" stroke="#76b900"/><text x="414" y="148" text-anchor="middle" class="m" font-size="10.5">GPU 1 · replica</text>
+  <rect x="484" y="132" width="124" height="24" rx="6" fill="#16200f" stroke="#76b900"/><text x="546" y="148" text-anchor="middle" class="m" font-size="10.5">GPU 2 · replica</text>
+  <rect x="616" y="132" width="124" height="24" rx="6" fill="#16200f" stroke="#76b900"/><text x="678" y="148" text-anchor="middle" class="m" font-size="10.5">GPU 3 · replica</text>
+  <rect x="352" y="166" width="438" height="174" rx="9" fill="#161616" stroke="#3a5a1a"/>
+  <text x="366" y="185" class="t" font-size="11.5">inside ONE rollout replica — its N threads share ONE model:</text>
+  <text x="366" y="200" class="d" font-size="9">StreamingRolloutWorker: a fixed pool of N=12 CPU threads (N = AlpaSim capacity; 3 shown)</text>
+  <rect x="366" y="208" width="170" height="38" rx="7" fill="#1b1712" stroke="#f0883e"/><text x="376" y="224" class="t" font-size="10">thread 0 · scene A</text><text x="376" y="238" class="d" font-size="9">waiting on AlpaSim (gRPC)</text>
+  <rect x="366" y="250" width="170" height="38" rx="7" fill="#1b1712" stroke="#f0883e"/><text x="376" y="266" class="t" font-size="10">thread 1 · scene B</text><text x="376" y="280" class="d" font-size="9">waiting on the model</text>
+  <rect x="366" y="292" width="170" height="38" rx="7" fill="#1b1712" stroke="#f0883e"/><text x="376" y="308" class="t" font-size="10">thread 2 · scene C</text><text x="376" y="322" class="d" font-size="9">building the ModelInput</text>
+  <path d="M536,227 L558,250" stroke="#76b900" stroke-width="1.6" marker-end="url(#g)"/>
+  <path d="M536,269 L558,269" stroke="#76b900" stroke-width="1.6" marker-end="url(#g)"/>
+  <path d="M536,311 L558,288" stroke="#76b900" stroke-width="1.6" marker-end="url(#g)"/>
+  <text x="540" y="243" class="d" font-size="8" fill="#a3d44a">infer()</text>
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/inference/inference_engine.py" target="_blank"><rect x="560" y="224" width="222" height="88" rx="7" fill="#16200f" stroke="#76b900" stroke-width="2"/><text x="671" y="242" text-anchor="middle" class="t" font-size="11" fill="#cfe3a0">shared model — 1 copy</text><text x="671" y="258" text-anchor="middle" class="d" font-size="9">the only GPU worker here:</text><text x="671" y="272" text-anchor="middle" class="d" font-size="9">stacks the threads' requests</text><text x="671" y="286" text-anchor="middle" class="d" font-size="9">into ONE forward pass, then</text><text x="671" y="300" text-anchor="middle" class="d" font-size="9">resolves each thread's Future</text></a>
+  <text x="366" y="360" class="d" font-size="9.5"><tspan fill="#f0f0f0" font-weight="700">What a thread does</tspan> — a thin controller, not a compute unit:</text>
+  <text x="366" y="376" class="d" font-size="9.5">pull a scene (from Cosmos) → <tspan class="m" font-size="9">simulate()</tspan> starts the session → then <tspan fill="#f0f0f0" font-weight="700">every</tspan></text>
+  <text x="366" y="390" class="d" font-size="9.5"><tspan fill="#f0f0f0" font-weight="700">tick</tspan>: AlpaSim asks for an action → build input → <tspan class="m" font-size="9">infer()</tspan> on the shared model</text>
+  <text x="366" y="404" class="d" font-size="9.5">(block on Future) → return trajectory. Between ticks it just <tspan fill="#f0f0f0" font-weight="700">waits</tspan> on AlpaSim.</text>
+  <text x="366" y="418" class="d" font-size="9.5">The shared model batches all active rollouts' <tspan class="m" font-size="9">infer()</tspan> into 1 GPU forward.</text>
+  <text x="366" y="434" class="d" font-size="9.5">(Each replica keeps its <tspan fill="#ff9a93" font-weight="700">OWN</tspan> weights, synced from policy via <tspan class="m" font-size="9">NCCL</tspan>.)</text>
+  <text x="366" y="452" class="d" font-size="9.5"><tspan fill="#f0883e" font-weight="700">Why 36 threads (3×12) for 12 slots?</tspan> Deliberate over-provisioning:</text>
+  <text x="366" y="466" class="d" font-size="9.5">threads are cheap (I/O-blocked), so AlpaSim's 12 slots are always kept full.</text>
+  <rect x="352" y="482" width="278" height="26" rx="7" fill="#16200f" stroke="#76b900"/><text x="364" y="499" class="t" font-size="10.5" fill="#cfe3a0">⚙ compute: INFERENCE (batched forward)</text>
+  <!-- ZONE C: AlpaSim / render+physics -->
+  <a href="https://github.com/NVlabs/alpasim" target="_blank"><rect x="820" y="78" width="316" height="444" rx="12" fill="#10161f" stroke="#58a6ff" stroke-width="1.8"/><text x="836" y="104" class="t" font-size="14">AlpaSim</text></a>
+  <text x="836" y="120" class="d" font-size="10">the environment · <tspan fill="#f0f0f0" font-weight="700">not a Cosmos replica</tspan> · GPUs 4-7</text>
+  <rect x="836" y="132" width="68" height="24" rx="6" fill="#11202f" stroke="#58a6ff"/><text x="870" y="148" text-anchor="middle" class="m" font-size="10">GPU 4</text>
+  <rect x="912" y="132" width="68" height="24" rx="6" fill="#11202f" stroke="#58a6ff"/><text x="946" y="148" text-anchor="middle" class="m" font-size="10">GPU 5</text>
+  <rect x="988" y="132" width="68" height="24" rx="6" fill="#11202f" stroke="#58a6ff"/><text x="1022" y="148" text-anchor="middle" class="m" font-size="10">GPU 6</text>
+  <rect x="1064" y="132" width="60" height="24" rx="6" fill="#11202f" stroke="#58a6ff"/><text x="1094" y="148" text-anchor="middle" class="m" font-size="10">GPU 7</text>
+  <text x="836" y="167" class="d" font-size="9">every rollout flows through all of these each tick (instances × each):</text>
+  <rect x="836" y="172" width="288" height="38" rx="7" fill="#11202f" stroke="#3a4a5a"/><text x="848" y="188" class="t" font-size="10.5" fill="#cfe3ff">sensorsim / NRE — render cameras (GPU)</text><text x="848" y="202" class="d" font-size="9">4 GPU instances handling 3 rollouts each = 12</text>
+  <rect x="836" y="214" width="288" height="38" rx="7" fill="#11202f" stroke="#3a4a5a"/><text x="848" y="230" class="t" font-size="10.5" fill="#cfe3ff">physics — vehicle dynamics (GPU)</text><text x="848" y="244" class="d" font-size="9">4 GPU instances handling 3 rollouts each = 12</text>
+  <rect x="836" y="256" width="288" height="38" rx="7" fill="#11202f" stroke="#3a4a5a"/><text x="848" y="272" class="t" font-size="10.5">controller — per-rollout control (CPU)</text><text x="848" y="286" class="d" font-size="9">6 CPU procs handling 2 rollouts each = 12</text>
+  <text x="836" y="312" class="d" font-size="9">a rollout needs all 3 at once, so the tightest service</text>
+  <text x="836" y="325" class="d" font-size="9">caps the total (all three = 12 here) — the bottleneck:</text>
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/alpasim_configs/src/alpagym_alpasim_configs/configs/topology/alpagym_4gpu.yaml" target="_blank"><text x="836" y="341" class="t" font-size="10.5" fill="#cfe3ff" text-decoration="underline">12 concurrent rollouts ↗</text></a>
+  <text x="836" y="362" class="d" font-size="9">Rollouts arrive via <tspan class="m" font-size="8.5">simulate()</tspan> on this ONE endpoint;</text>
+  <text x="836" y="375" class="d" font-size="9">the 12 slots are shared first-come-first-served</text>
+  <text x="836" y="388" class="d" font-size="9">across all replicas. AlpaSim then drives each</text>
+  <text x="836" y="401" class="d" font-size="9">session back tick by tick, calling its egodriver.</text>
+  <rect x="836" y="482" width="288" height="26" rx="7" fill="#11202f" stroke="#58a6ff"/><text x="848" y="499" class="t" font-size="10.5" fill="#cfe3ff">⚙ compute: NEURAL RENDER + PHYSICS</text>
+  <!-- inter-zone arrows -->
+  <path d="M316,212 L334,212" stroke="#bc8cff" stroke-width="2" marker-end="url(#pu)"/>
+  <text x="300" y="200" class="d" font-size="9" fill="#cbb3ff" text-anchor="middle">weights</text>
+  <path d="M334,300 L316,300" stroke="#fbbf24" stroke-width="2" marker-end="url(#am)"/>
+  <text x="300" y="320" class="d" font-size="9" fill="#e8c98a" text-anchor="middle">.pt data</text>
+  <path d="M800,212 L818,212" stroke="#58a6ff" stroke-width="2" marker-end="url(#b)"/>
+  <path d="M818,300 L800,300" stroke="#58a6ff" stroke-width="2" marker-end="url(#b)"/>
+  <text x="809" y="195" class="d" font-size="9" fill="#9cc6ff" text-anchor="middle">gRPC</text>
+  <!-- footnote / legend -->
+  <text x="22" y="544" class="d" font-size="10.5"><tspan fill="#f85149">▮ training</tspan>   <tspan fill="#76b900">▮ inference</tspan>   <tspan fill="#58a6ff">▮ render + physics</tspan>   <tspan fill="#7a7a7a">▮ CPU coordination</tspan>   ·   arrows: <tspan fill="#bc8cff">weights/NCCL</tspan> · <tspan fill="#58a6ff">gRPC</tspan> · <tspan fill="#fbbf24">rollout .pt</tspan></text>
+  <text x="22" y="562" class="d" font-size="10.5">Only <tspan fill="#f0f0f0" font-weight="700">policy</tspan> + <tspan fill="#f0f0f0" font-weight="700">rollout</tspan> are Cosmos-RL replicas; <tspan fill="#f0f0f0" font-weight="700">AlpaSim</tspan> is the external environment they drive over gRPC.</text>
+  <text x="22" y="580" class="d" font-size="10.5">Rollout actors are forward-only copies of the policy, kept in sync via NCCL. "×3" is this example; the default colocates 1 policy + 1 rollout.</text>
+</svg>

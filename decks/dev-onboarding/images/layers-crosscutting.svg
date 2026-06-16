@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 600" font-family="Inter, sans-serif">
+  <defs>
+    <marker id="g" markerWidth="10" markerHeight="10" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#76b900"/></marker>
+    <marker id="b" markerWidth="10" markerHeight="10" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#58a6ff"/></marker>
+    <marker id="gy" markerWidth="10" markerHeight="10" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#888"/></marker>
+  </defs>
+  <rect x="0" y="0" width="1160" height="600" fill="#111111"/>
+  <style>.t{fill:#f0f0f0;font-weight:700}.m{font-family:'JetBrains Mono',monospace;fill:#a3d44a}.d{fill:#a0a0a0}.chip{fill:#1a1a1a;stroke:#2a2a2a}</style>
+
+  <text x="30" y="42" class="d" font-size="15">Zooming out: four orchestration layers wrap the per-tick layers. <tspan fill="#f0f0f0" font-weight="700">Only <tspan class="m" font-size="14">cosmos/</tspan> knows Cosmos-RL.</tspan></text>
+
+  <!-- Cosmos framework -->
+  <rect x="40" y="60" width="700" height="42" rx="9" fill="#1a1a1a" stroke="#bc8cff" stroke-width="1.5"/>
+  <text x="390" y="87" text-anchor="middle" class="t" font-size="15">Cosmos-RL framework</text>
+
+  <!-- adapter layer -->
+  <a href="https://github.com/NVlabs/alpagym/tree/main/packages/runtime/src/alpagym_runtime/cosmos" target="_blank">
+    <rect x="40" y="128" width="700" height="96" rx="11" fill="#161616" stroke="#76b900" stroke-width="1.8"/>
+  </a>
+  <text x="58" y="152" class="t" font-size="15">Cosmos-RL adapter layer <tspan class="m" font-size="12">cosmos/</tspan></text>
+  <g font-size="11.5">
+    <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/cosmos/entrypoint.py" target="_blank"><rect class="chip" x="58" y="166" width="100" height="24" rx="6"/><text x="108" y="182" text-anchor="middle" class="m" font-size="11">entrypoint</text></a>
+    <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/cosmos/dataset.py" target="_blank"><rect class="chip" x="166" y="166" width="84" height="24" rx="6"/><text x="208" y="182" text-anchor="middle" class="m" font-size="11">dataset</text></a>
+    <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/cosmos/packer.py" target="_blank"><rect class="chip" x="258" y="166" width="78" height="24" rx="6"/><text x="297" y="182" text-anchor="middle" class="m" font-size="11">packer</text></a>
+    <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/cosmos/trainer.py" target="_blank"><rect class="chip" x="344" y="166" width="80" height="24" rx="6"/><text x="384" y="182" text-anchor="middle" class="m" font-size="11">trainer</text></a>
+    <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/cosmos/reward_fn.py" target="_blank"><rect class="chip" x="432" y="166" width="96" height="24" rx="6"/><text x="480" y="182" text-anchor="middle" class="m" font-size="11">reward_fn</text></a>
+    <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/cosmos/rollout_backend.py" target="_blank"><rect class="chip" x="536" y="166" width="186" height="24" rx="6" stroke="#76b900"/><text x="629" y="182" text-anchor="middle" class="m" font-size="11" fill="#a3d44a">rollout_backend (build site)</text></a>
+  </g>
+  <text x="58" y="212" class="d" font-size="11.5">six pure adapters + one construction site that builds the engine, policy factory, driver server &amp; worker</text>
+
+  <!-- episode runner -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/episode_runner/streaming_worker.py" target="_blank">
+    <rect x="40" y="250" width="700" height="74" rx="11" fill="#161616" stroke="#76b900" stroke-width="1.8"/>
+  </a>
+  <text x="58" y="276" class="t" font-size="15">Episode runner layer <tspan class="m" font-size="12">episode_runner/</tspan></text>
+  <text x="58" y="298" class="d" font-size="12.5">orchestrates rollouts against AlpaSim — runs the drive ticks, then scores &amp; persists</text>
+  <text x="58" y="316" class="d" font-size="11.5">streaming <tspan class="m" font-size="11">simulate(1)</tspan> worker — one rollout per call (<tspan class="m" font-size="11">streaming_worker</tspan>)</text>
+
+  <!-- per-tick layers (collapsed) -->
+  <rect x="40" y="350" width="700" height="78" rx="11" fill="#0d1117" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="58" y="376" class="t" font-size="15" fill="#58a6ff">Per-tick rollout layers</text>
+  <text x="58" y="398" class="d" font-size="12.5">simulator · policy · inference engine · inference model · released model</text>
+  <text x="58" y="418" class="d" font-size="11.5">(the five per-tick layers — run once per drive tick; detailed later)</text>
+
+  <!-- reward + transfer (right column) -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/rewards/compute.py" target="_blank">
+    <rect x="772" y="250" width="348" height="74" rx="11" fill="#161616" stroke="#76b900" stroke-width="1.6"/>
+    <text x="792" y="276" class="t" font-size="15">Reward layer <tspan class="m" font-size="12">rewards/</tspan></text>
+    <text x="792" y="298" class="d" font-size="12.5">compute_reward — pure compute,</text>
+    <text x="792" y="316" class="d" font-size="12.5">no I/O, no model deps</text>
+  </a>
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/transport/base.py" target="_blank">
+    <rect x="772" y="350" width="348" height="78" rx="11" fill="#161616" stroke="#76b900" stroke-width="1.6"/>
+    <text x="792" y="376" class="t" font-size="15">Transport layer <tspan class="m" font-size="12">transport/</tspan></text>
+    <text x="792" y="398" class="d" font-size="12.5">persists EpisodeOutput rollout → trainer</text>
+    <text x="792" y="418" class="d" font-size="12.5">disk .pt (default) · NCCL (opt-in)</text>
+  </a>
+
+  <!-- arrows -->
+  <path d="M390,102 L390,126" stroke="#bc8cff" stroke-width="2" marker-end="url(#b)"/>
+  <text x="400" y="119" class="d" font-size="11">rollout_generation · prefetch</text>
+  <path d="M390,224 L390,248" stroke="#76b900" stroke-width="2" marker-end="url(#g)"/>
+  <text x="400" y="241" class="d" font-size="11">submit_payload</text>
+  <path d="M390,324 L390,348" stroke="#76b900" stroke-width="2" marker-end="url(#g)"/>
+  <text x="400" y="341" class="d" font-size="11">per drive tick</text>
+  <!-- runner -> reward & transfer -->
+  <path d="M740,287 L770,287" stroke="#76b900" stroke-width="2" marker-end="url(#g)"/>
+  <text x="744" y="278" class="d" font-size="10.5">score</text>
+  <path d="M740,300 C758,300 758,386 770,386" fill="none" stroke="#76b900" stroke-width="2" marker-end="url(#g)"/>
+  <text x="744" y="360" class="d" font-size="10.5">write</text>
+  <!-- transfer read back -> adapter -->
+  <path d="M946,348 C946,150 850,150 742,182" fill="none" stroke="#888" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#gy)"/>
+  <text x="788" y="132" class="d" font-size="12" fill="#cfcfcf">read back ↩</text>
+  <text x="788" y="150" font-size="11" fill="#cfcfcf">→ <tspan class="m" fill="#a3d44a">packer</tspan> / <tspan class="m" fill="#a3d44a">reward_fn</tspan></text>
+</svg>

@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 600" font-family="Inter, sans-serif">
+  <defs>
+    <marker id="ah" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto">
+      <path d="M0,0 L9,4 L0,8 z" fill="#76b900"/>
+    </marker>
+    <marker id="ahb" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto">
+      <path d="M0,0 L9,4 L0,8 z" fill="#58a6ff"/>
+    </marker>
+    <marker id="ahg" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto">
+      <path d="M0,0 L9,4 L0,8 z" fill="#666"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1160" height="600" fill="#111111"/>
+
+  <!-- Host control plane banner -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/host/src/alpagym_host/cli.py" target="_blank">
+    <rect x="80" y="30" width="1000" height="78" rx="12" fill="#1a1a1a" stroke="#76b900" stroke-width="1.5" stroke-dasharray="6 4"/>
+    <text x="580" y="62" text-anchor="middle" fill="#f0f0f0" font-size="22" font-weight="700">AlpaGym host — control plane <tspan fill="#58a6ff" font-size="15" font-weight="500">(Hydra CLI)</tspan></text>
+    <text x="580" y="88" text-anchor="middle" fill="#a0a0a0" font-size="15">resolves config · prepares AlpaSim checkout · starts the simulator · launches the Cosmos-RL runtime · wires gRPC endpoints</text>
+  </a>
+  <!-- launch arrows -->
+  <path d="M280,108 L280,168" fill="none" stroke="#666" stroke-width="2" marker-end="url(#ahg)"/>
+  <path d="M880,108 L880,168" fill="none" stroke="#666" stroke-width="2" marker-end="url(#ahg)"/>
+  <text x="268" y="142" text-anchor="end" fill="#888" font-size="13">launches Cosmos-RL runtime</text>
+  <text x="892" y="142" fill="#888" font-size="13">starts AlpaSim (Wizard)</text>
+
+  <!-- Policy (agent) -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/policies/alpamayo/policy.py" target="_blank">
+    <rect x="80" y="170" width="300" height="150" rx="14" fill="#1a1a1a" stroke="#76b900" stroke-width="2"/>
+    <text x="230" y="212" text-anchor="middle" fill="#f0f0f0" font-size="24" font-weight="700">Policy  <tspan fill="#76b900">&#960;&#952;</tspan></text>
+    <text x="230" y="242" text-anchor="middle" fill="#a3d44a" font-size="15" font-family="JetBrains Mono, monospace">AlpamayoPolicy.step()</text>
+    <text x="230" y="272" text-anchor="middle" fill="#a0a0a0" font-size="14">the agent — observations in,</text>
+    <text x="230" y="292" text-anchor="middle" fill="#a0a0a0" font-size="14">planned trajectory out</text>
+  </a>
+
+  <!-- AlpaSim (environment) -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/alpasim/driver_server.py" target="_blank">
+    <rect x="780" y="170" width="300" height="150" rx="14" fill="#1a1a1a" stroke="#76b900" stroke-width="2"/>
+    <text x="930" y="212" text-anchor="middle" fill="#f0f0f0" font-size="24" font-weight="700">AlpaSim</text>
+    <text x="930" y="242" text-anchor="middle" fill="#a3d44a" font-size="15" font-family="JetBrains Mono, monospace">closed-loop simulator</text>
+    <text x="930" y="272" text-anchor="middle" fill="#a0a0a0" font-size="14">the environment — drives the</text>
+    <text x="930" y="292" text-anchor="middle" fill="#a0a0a0" font-size="14">ego car, renders the world</text>
+  </a>
+
+  <!-- action arrow (top) Policy -> AlpaSim -->
+  <path d="M380,205 C540,172 620,172 780,205" fill="none" stroke="#76b900" stroke-width="2.5" marker-end="url(#ah)"/>
+  <text x="580" y="132" text-anchor="middle" fill="#f0f0f0" font-size="15" font-weight="600">action: planned trajectory</text>
+  <text x="580" y="152" text-anchor="middle" fill="#666" font-size="13" font-family="JetBrains Mono, monospace">DriveResponse</text>
+
+  <!-- observation arrow (bottom) AlpaSim -> Policy -->
+  <path d="M780,285 C620,340 540,340 380,285" fill="none" stroke="#58a6ff" stroke-width="2.5" marker-end="url(#ahb)"/>
+  <text x="580" y="332" text-anchor="middle" fill="#f0f0f0" font-size="15" font-weight="600">observation: cameras · ego history · route</text>
+  <text x="580" y="352" text-anchor="middle" fill="#666" font-size="13" font-family="JetBrains Mono, monospace">DriveRequest</text>
+
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/alpasim/proto_conversion.py" target="_blank">
+    <text x="580" y="247" text-anchor="middle" fill="#58a6ff" font-size="13">⇄ over gRPC (egodriver)</text>
+  </a>
+
+  <!-- Trainer -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/cosmos/trainer.py" target="_blank">
+    <rect x="410" y="438" width="340" height="120" rx="14" fill="#1a1a1a" stroke="#58a6ff" stroke-width="2"/>
+    <text x="580" y="478" text-anchor="middle" fill="#f0f0f0" font-size="22" font-weight="700">Cosmos-RL trainer</text>
+    <text x="580" y="506" text-anchor="middle" fill="#a3d44a" font-size="15" font-family="JetBrains Mono, monospace">GRPO · step_training()</text>
+    <text x="580" y="534" text-anchor="middle" fill="#a0a0a0" font-size="14">learns from rollout episodes &amp; rewards</text>
+  </a>
+
+  <!-- episodes+reward arrow AlpaSim -> trainer -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/episode_runner/streaming_worker.py" target="_blank">
+    <path d="M930,320 C930,420 820,440 752,470" fill="none" stroke="#76b900" stroke-width="2.5" marker-end="url(#ah)"/>
+    <text x="905" y="400" text-anchor="middle" fill="#f0f0f0" font-size="14" font-weight="600">episodes + reward</text>
+  </a>
+
+  <!-- weight update (dashed, future) trainer -> policy -->
+  <path d="M410,478 C250,460 230,420 230,322" fill="none" stroke="#666" stroke-width="2.5" stroke-dasharray="7 5" marker-end="url(#ahg)"/>
+  <text x="150" y="404" text-anchor="end" fill="#666" font-size="14" font-weight="600">weight update</text>
+  <text x="150" y="422" text-anchor="end" fill="#666" font-size="12">(roadmap)</text>
+</svg>

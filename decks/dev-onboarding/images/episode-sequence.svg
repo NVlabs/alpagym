@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 600" font-family="Inter, sans-serif">
+  <defs>
+    <marker id="c" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#76b900"/></marker>
+    <marker id="r" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#888"/></marker>
+    <marker id="b" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="1160" height="600" fill="#111111"/>
+  <style>.h{fill:#f0f0f0;font-weight:700}.m{font-family:'JetBrains Mono',monospace}.lbl{fill:#d8d8d8}.ret{fill:#888;font-style:italic}.d{fill:#a0a0a0}</style>
+
+  <!-- lifelines -->
+  <g stroke="#333" stroke-width="1.4" stroke-dasharray="4 4">
+    <line x1="110" y1="120" x2="110" y2="566"/>
+    <line x1="355" y1="120" x2="355" y2="566"/>
+    <line x1="600" y1="120" x2="600" y2="566"/>
+    <line x1="830" y1="120" x2="830" y2="566"/>
+    <line x1="1052" y1="120" x2="1052" y2="566"/>
+  </g>
+
+  <!-- headers -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/episode_runner/streaming_worker.py" target="_blank">
+    <rect x="14" y="74" width="192" height="44" rx="9" fill="#1a1a1a" stroke="#76b900" stroke-width="1.6"/>
+    <text x="110" y="95" text-anchor="middle" class="h" font-size="13">StreamingRolloutWorker</text>
+    <text x="110" y="111" text-anchor="middle" class="d m" font-size="10.5">alpagym-sim-i thread</text>
+  </a>
+  <rect x="267" y="74" width="176" height="44" rx="9" fill="#1a1a1a" stroke="#2a2a2a"/>
+  <text x="355" y="100" text-anchor="middle" class="h" font-size="14">AlpaSim</text>
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/alpasim/driver_server.py" target="_blank">
+    <rect x="512" y="74" width="176" height="44" rx="9" fill="#1a1a1a" stroke="#76b900" stroke-width="1.6"/>
+    <text x="600" y="95" text-anchor="middle" class="h" font-size="14">EgodriverServer</text>
+    <text x="600" y="111" text-anchor="middle" class="d m" font-size="10.5">driver_server.py</text>
+  </a>
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/policies/alpamayo/policy.py" target="_blank">
+    <rect x="742" y="74" width="176" height="44" rx="9" fill="#1a1a1a" stroke="#76b900" stroke-width="1.6"/>
+    <text x="830" y="95" text-anchor="middle" class="h" font-size="14">AlpamayoPolicy</text>
+    <text x="830" y="111" text-anchor="middle" class="d m" font-size="10.5">policy.py</text>
+  </a>
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/inference/inference_engine.py" target="_blank">
+    <rect x="964" y="74" width="184" height="44" rx="9" fill="#1a1a1a" stroke="#76b900" stroke-width="1.6"/>
+    <text x="1056" y="95" text-anchor="middle" class="h" font-size="14">InferenceEngine</text>
+    <text x="1056" y="111" text-anchor="middle" class="d m" font-size="10.5">inference_engine.py</text>
+  </a>
+
+  <!-- simulate() -->
+  <path d="M112,150 L353,150" stroke="#76b900" stroke-width="2" marker-end="url(#c)"/>
+  <text x="115" y="143" class="lbl m" font-size="12.5">simulate(1)  ·  one rollout per call, on a sim thread</text>
+
+  <!-- start_session -->
+  <path d="M357,182 L598,182" stroke="#76b900" stroke-width="2" marker-end="url(#c)"/>
+  <text x="360" y="175" class="lbl m" font-size="12.5">start_session() ⇒ policy_factory() builds a Policy</text>
+
+  <!-- loop box -->
+  <rect x="322" y="200" width="800" height="276" rx="10" fill="none" stroke="#58a6ff" stroke-width="1.3" stroke-dasharray="6 4"/>
+  <rect x="322" y="200" width="150" height="26" rx="0" fill="#58a6ff"/>
+  <text x="332" y="218" fill="#0a0a0a" font-size="13" font-weight="700">loop  per sim tick</text>
+
+  <!-- submit_* -->
+  <path d="M353,254 L598,254" stroke="#76b900" stroke-width="2" marker-end="url(#c)"/>
+  <text x="356" y="247" class="lbl m" font-size="12">submit_image / submit_egomotion / submit_route  →  TickBuffer</text>
+
+  <!-- drive -->
+  <path d="M353,294 L598,294" stroke="#76b900" stroke-width="2.4" marker-end="url(#c)"/>
+  <text x="356" y="287" class="lbl m" font-size="12.5" font-weight="700">drive(DriveRequest)</text>
+
+  <!-- step -->
+  <path d="M602,328 L828,328" stroke="#76b900" stroke-width="2" marker-end="url(#c)"/>
+  <text x="606" y="321" class="lbl m" font-size="12">step(PolicyInput)  ·  from tick snapshot</text>
+
+  <!-- infer -->
+  <path d="M832,362 L1050,362" stroke="#58a6ff" stroke-width="2" marker-end="url(#b)"/>
+  <text x="836" y="355" class="lbl m" font-size="12">infer(ModelInput) → Future</text>
+
+  <!-- model output return -->
+  <path d="M1050,396 L832,396" stroke="#888" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#r)"/>
+  <text x="1048" y="389" text-anchor="end" class="ret m" font-size="12">ModelOutput  (batched on GPU, unbound)</text>
+
+  <!-- policy output return -->
+  <path d="M828,430 L602,430" stroke="#888" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#r)"/>
+  <text x="824" y="423" text-anchor="end" class="ret m" font-size="12">PolicyOutput  (selector picks 1 trajectory)</text>
+
+  <!-- drive response return -->
+  <path d="M598,464 L357,464" stroke="#888" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#r)"/>
+  <text x="594" y="457" text-anchor="end" class="ret m" font-size="12">DriveResponse  ⇒ AlpaSim steps the car</text>
+
+  <!-- close_session -->
+  <path d="M353,506 L598,506" stroke="#76b900" stroke-width="2" marker-end="url(#c)"/>
+  <text x="356" y="499" class="lbl m" font-size="12">close_session() ⇒ freeze SessionRecord</text>
+
+  <!-- simulate returns -->
+  <path d="M353,540 L114,540" stroke="#888" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#r)"/>
+  <text x="350" y="533" text-anchor="end" class="ret m" font-size="12">simulate() returns — this rollout&#39;s SessionRecord</text>
+
+  <text x="110" y="566" class="d" font-size="11.5">then the worker: drain SessionRecord → EpisodeOutput → compute_reward → torch.save .pt → resolve Future</text>
+</svg>

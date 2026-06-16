@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 600" font-family="Inter, sans-serif">
+  <defs>
+    <marker id="g" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#888"/></marker>
+    <marker id="gr" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#76b900"/></marker>
+  </defs>
+  <rect x="0" y="0" width="1160" height="600" fill="#111111"/>
+  <style>.t{fill:#f0f0f0;font-weight:700}.m{font-family:'JetBrains Mono',monospace;fill:#a3d44a}.d{fill:#a0a0a0}.lnk{fill:#58a6ff}</style>
+
+  <text x="30" y="52" class="d" font-size="15"><tspan fill="#76b900" font-weight="700">On main · synchronous · filesystem-bound</tspan> — one <tspan fill="#f0f0f0" font-weight="700">torch.save .pt</tspan> blob per rollout, read back by the trainer.</text>
+
+  <!-- Rollout writer -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/transport/disk.py" target="_blank">
+    <rect x="34" y="210" width="250" height="150" rx="13" fill="#1a1a1a" stroke="#76b900" stroke-width="2"/>
+    <text x="159" y="250" text-anchor="middle" class="t" font-size="17">Rollout worker</text>
+    <text x="159" y="276" text-anchor="middle" class="m" font-size="12">write_rollout_artifact</text>
+    <text x="159" y="306" text-anchor="middle" class="d" font-size="13">torch.save(episode) → path</text>
+    <text x="159" y="330" text-anchor="middle" class="d" font-size="12.5">whole EpisodeOutput + reward</text>
+  </a>
+
+  <!-- disk cylinder -->
+  <g>
+    <ellipse cx="580" cy="206" rx="120" ry="26" fill="#0d1117" stroke="#2a2a2a"/>
+    <path d="M460,206 L460,360 A120,26 0 0 0 700,360 L700,206" fill="#0d1117" stroke="#2a2a2a"/>
+    <ellipse cx="580" cy="206" rx="120" ry="26" fill="#161616" stroke="#2a2a2a"/>
+    <text x="580" y="262" text-anchor="middle" class="t" font-size="16">episode artifact</text>
+    <text x="580" y="288" text-anchor="middle" class="m" font-size="11.5" fill="#a3d44a">{scene}-{uuid}.pt</text>
+    <text x="580" y="316" text-anchor="middle" class="d" font-size="12">on shared filesystem</text>
+    <text x="580" y="338" text-anchor="middle" class="d" font-size="12">.tmp + atomic rename</text>
+  </g>
+
+  <!-- Trainer -->
+  <a href="https://github.com/NVlabs/alpagym/blob/main/packages/runtime/src/alpagym_runtime/cosmos/packer.py" target="_blank">
+    <rect x="876" y="210" width="250" height="150" rx="13" fill="#1a1a1a" stroke="#58a6ff" stroke-width="2"/>
+    <text x="1001" y="250" text-anchor="middle" class="t" font-size="17">Trainer worker</text>
+    <text x="1001" y="276" text-anchor="middle" class="m" font-size="12">read_rollout_artifact</text>
+    <text x="1001" y="306" text-anchor="middle" class="d" font-size="13">torch.load(path)</text>
+    <text x="1001" y="330" text-anchor="middle" class="d" font-size="12.5">packer + reward_fn</text>
+  </a>
+
+  <!-- arrows -->
+  <path d="M286,272 C360,272 380,250 458,250" fill="none" stroke="#76b900" stroke-width="2.4" marker-end="url(#gr)"/>
+  <text x="372" y="240" text-anchor="middle" class="d" font-size="12">torch.save</text>
+  <path d="M702,250 C780,250 800,272 874,272" fill="none" stroke="#888" stroke-width="2.4" marker-end="url(#g)"/>
+  <text x="788" y="240" text-anchor="middle" class="d" font-size="12">torch.load ×2</text>
+  <!-- handle -->
+  <path d="M876,320 C800,330 740,330 702,330" fill="none" stroke="#888" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#g)"/>
+  <text x="788" y="352" text-anchor="middle" class="d" font-size="11">path string = the handle</text>
+
+  <!-- cost callout -->
+  <rect x="34" y="430" width="1092" height="120" rx="12" fill="#0d1117" stroke="#2a2a2a"/>
+  <text x="56" y="466" class="t" font-size="15">The cost</text>
+  <text x="56" y="496" class="d" font-size="13.5">• One <tspan fill="#f0f0f0">torch.save</tspan> of the entire <tspan class="m" font-size="12.5">EpisodeOutput</tspan> per rollout (reward + replay payload: camera frames, trace, tokens).</text>
+  <text x="56" y="522" class="d" font-size="13.5">• The trainer <tspan fill="#f0f0f0">torch.loads it twice</tspan> — once in the data packer (replay + log-probs), once in the reward fn (<tspan class="m" font-size="12">reward.total</tspan>).</text>
+  <text x="56" y="544" class="d" font-size="12.5">The <tspan fill="#f0f0f0">path string is the handle</tspan> Cosmos carries back; reward is computed once (rollout), only re-read on the trainer. NCCL would remove this disk hop →</text>
+</svg>
