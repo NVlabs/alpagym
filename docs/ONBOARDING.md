@@ -13,15 +13,16 @@ getting a model bundle, and launching a run. For the system overview, see the
 - [Hugging Face](#hugging-face)
 - [Weights and Biases](#weights-and-biases)
 - [Check the Workspace](#check-the-workspace)
-- [Get the Model](#get-the-model)
+- [Get the Alpamayo 1.5 Model](#get-the-alpamayo-15-model)
 - [Check GPU Peer-to-Peer](#check-gpu-peer-to-peer)
 - [Run Locally](#run-locally)
+- [Evaluate a Checkpoint in AlpaSim (optional)](#evaluate-a-checkpoint-in-alpasim-optional)
 - [Cleaning Up After a Crash](#cleaning-up-after-a-crash)
 
 ## Hardware and Disk Budget
 
-To comfortably run AlpaGym locally with the AR1.5 policy, we recommend two (with smaller 
-models, colocated on one GPU is also feasible)CUDA GPU with at least 40 GBof VRAM 
+To comfortably run AlpaGym locally with the AR1.5 policy, we recommend two (with smaller
+models, colocated on one GPU is also feasible)CUDA GPU with at least 40 GBof VRAM
 (e.g. A6000) and ~100–150 GB of free diskfor the `uv` environment,
 container images, and model weights (Alpamayo-R1-10B ~21 GB), plus ~1.5 GB for
 each NuRec scene you download (the full `public_2601` NuRec suite is ~1.5 TB).
@@ -187,6 +188,36 @@ Outputs are written under `outputs/` and run artifacts under `tmp/alpagym-runs/`
 In the future, we are planning to release a distillation script that can
 convert the 10B Alpamyo model to a smaller checkpoint (e.g. 2B) that can run on a single
 GPU.
+
+## Evaluate a Checkpoint in AlpaSim (optional)
+
+Optionally, evaluate a post-trained checkpoint in AlpaSim.
+
+**1. Convert the export to inference format.** Each run writes a safetensors export
+at its final step under `tmp/alpagym-runs/<run>/cosmos/<timestamp>/safetensors/step_<N>/`.
+The AlpaSim driver can't load it directly, so convert it (the inverse of the
+model-conversion step above):
+
+```bash
+uv run --no-sync --package alpagym-alpamayo-r1 python \
+  packages/policies/alpamayo_r1/scripts/convert_alpagym_checkpoint_to_inference.py \
+  --input tmp/alpagym-runs/<run>/cosmos/<timestamp>/safetensors/step_<N> \
+  --output ./tmp/checkpoints/alpamayo-1.5-10B_clrl_inference --overwrite
+```
+
+**2. Run AlpaSim eval** from the cached AlpaSim checkout:
+
+```bash
+cd "$(ls -d ~/.cache/alpagym/alpasim/*/ | head -n1)"
+uv run alpasim_wizard \
+  deploy=local topology=1gpu \
+  driver=alpamayo1_5 \
+  defines.drivers=/ABS/PATH/TO/alpagym_public/tmp/checkpoints \
+  driver.model.checkpoint_path=/mnt/drivers/alpamayo-1.5-10B_clrl_inference \
+  scenes.scene_ids=[clipgt-9ea70552-6dcb-4ee8-a368-9a906a333f6e]
+```
+
+For more about AlpaSim, see the [AlpaSim repo](https://github.com/NVlabs/alpasim).
 
 ## Cleaning Up After a Crash
 
