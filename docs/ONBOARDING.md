@@ -3,7 +3,7 @@
 This guide walks through running AlpaGym locally on one or two GPUs: installing
 host dependencies, authenticating with Hugging Face and Weights & Biases,
 getting a model bundle, and launching a run. For the system overview, see the
-[README](../README.md) and the [Design Overview](DESIGN.md).
+[README](../README.md).
 
 ## Table of Contents
 
