@@ -117,3 +117,19 @@ cluster.
 
 - [Onboarding Guide](docs/ONBOARDING.md) — host setup, auth, getting a model, and running locally.
 - [Contributing](CONTRIBUTING.md) — code style and review process.
+
+## Project Contributors:
+
+Contributors in each topic in alphabetical order
+
+**Project Lead:** Yuxiao Chen, Maximilian Igl
+
+**Core contributors:** Bertrand Douillard, Peter Karkus, Alex Nauman, Jef Packer, Thomas Tian
+
+**Contributors:** Jesse Archer​, William Lew​, Jack Shi, Michael Watson
+
+**Senior Mgmt:** Nat Duca, Boris Ivanovic, Marco Pavone
+
+**Production support:** Matt Cragun, Aditya Mahajan, Selena Williams
+
+**Acknowledgements for additional contributions:** Liang Feng, Aaron Smith
