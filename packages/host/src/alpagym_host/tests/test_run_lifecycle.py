@@ -184,6 +184,7 @@ def test_execute_run_runs_distributed_slurm_topology(
                 f"alpasim.repo_path={tmp_path / 'alpasim'}",
                 "alpasim.repo_url=null",
                 "alpasim.repo_ref=null",
+                "alpasim.simulation_domain=humanoid",
             ],
         )
     artifact_paths = build_artifact_paths(cfg)
@@ -281,6 +282,7 @@ def test_execute_run_runs_distributed_slurm_topology(
     cosmos_command = commands[1]
     assert "--nodelist=cosmos-0,cosmos-1" in cosmos_command
     assert "alpasim-0" not in " ".join(cosmos_command)
+    assert str(tmp_path / "alpasim" / "src" / "grpc") in cosmos_command[-1]
     assert all("CUDA_VISIBLE_DEVICES" not in " ".join(command) for command in commands)
 
 

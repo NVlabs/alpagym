@@ -3,6 +3,7 @@
 
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 from contextlib import nullcontext
@@ -198,6 +199,7 @@ def execute_run(config: RunConfig) -> None:
             execution_backend=execution_backend,
             topology=topology,
             container_image=container_image,
+            alpasim_checkout_root=alpasim_checkout_root,
         )
         logging.info(
             "Starting Cosmos launcher: backend=%s cosmos_hosts=%s log_dir=%s",
@@ -302,6 +304,7 @@ def _build_cosmos_command(
     execution_backend: ExecutionBackend,
     topology: RunTopologyPlan,
     container_image: str | None,
+    alpasim_checkout_root: Path,
 ) -> list[str]:
     """Build the Cosmos launcher command for the selected execution backend."""
     if not execution_backend.is_slurm_run:
@@ -332,11 +335,8 @@ def _build_cosmos_command(
                 worker_index=worker_index,
             )
         )
-    return build_cosmos_srun_command(
-        cosmos_hosts=cosmos_hosts,
-        slurm=config.execution.slurm,
-        container_image=cast(str, container_image),
-        workspace_sync_command=[
+    workspace_setup_commands = [
+        [
             "uv",
             "sync",
             "--frozen",
@@ -344,6 +344,29 @@ def _build_cosmos_command(
             "--all-packages",
             "--project",
             str(config.execution.slurm.container_workdir),
+        ]
+    ]
+    if config.alpasim.simulation_domain == "humanoid":
+        workspace_setup_commands.append(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                "/opt/venv/bin/python",
+                "--reinstall",
+                "--no-deps",
+                str(alpasim_checkout_root / "src" / "grpc"),
+            ]
+        )
+    return build_cosmos_srun_command(
+        cosmos_hosts=cosmos_hosts,
+        slurm=config.execution.slurm,
+        container_image=cast(str, container_image),
+        workspace_sync_command=[
+            "bash",
+            "-lc",
+            " && ".join(shlex.join(command) for command in workspace_setup_commands),
         ],
         worker_commands=tuple(worker_commands),
         log_dir=config.artifact_paths.log_dir,
