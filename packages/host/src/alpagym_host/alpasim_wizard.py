@@ -52,6 +52,7 @@ def _build_wizard_command(
         "wizard.debug_flags.use_localhost=true",
         "runtime.simulation_config.send_recording_ground_truth=true",
         "runtime.simulation_config.skip_driver_during_force_gt=true",
+        f"runtime.simulation_domain={config.simulation_domain}",
         f"runtime.simulation_config.force_gt_duration_us={wizard_args.force_gt_duration_us}",
         f"runtime.simulation_config.control_timestep_us={wizard_args.control_timestep_us}",
         f"runtime.simulation_config.n_sim_steps={wizard_args.n_sim_steps}",

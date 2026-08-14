@@ -88,6 +88,59 @@ def test_replay_packer_collates_padding_and_old_logprobs(
     assert torch.equal(batch.weight_versions, torch.zeros(6, dtype=torch.int64))
 
 
+def test_replay_packer_extracts_transition_signal_and_zero_pads_it(
+    tmp_path: Path,
+    cosmos_stubs: None,
+) -> None:
+    """Raw transition terms travel through the existing payload path and pad to zero."""
+    del cosmos_stubs
+    packer_module = importlib.import_module("alpagym_runtime.cosmos.packer")
+    packer = packer_module.AlpagymDataPacker(
+        config=DataPackerConfig(expected_valid_steps=3),
+        build_model_inputs=_generic_build_model_inputs(),
+    )
+    outputs = []
+    for output, reward, terminated, old_value in zip(
+        _generic_outputs([-1.0, -2.0]),
+        [0.5, -1.5],
+        [False, True],
+        [0.25, 0.75],
+    ):
+        assert output.replay_data is not None
+        payload = dict(output.replay_data.payload)
+        payload["transition"] = {
+            "reward": torch.tensor(reward),
+            "terminated": terminated,
+            "truncated": False,
+            "old_value": torch.tensor(old_value),
+        }
+        replay_data = replace(output.replay_data, payload=payload)
+        outputs.append(replace(output, replay_data=replay_data))
+    artifact = _write_episode(tmp_path / "transition.json", "rollout-transition", outputs)
+
+    batch = packer.policy_collate_fn(packer.get_policy_input(0, artifact.handle))
+
+    assert batch.training_signal.advantages is None
+    assert batch.training_signal.returns is None
+    torch.testing.assert_close(
+        batch.training_signal.rewards,
+        torch.tensor([0.5, -1.5, 0.0], dtype=torch.float32),
+    )
+    assert torch.equal(
+        batch.training_signal.terminateds,
+        torch.tensor([False, True, False], dtype=torch.bool),
+    )
+    assert torch.equal(
+        batch.training_signal.truncateds,
+        torch.tensor([False, False, False], dtype=torch.bool),
+    )
+    torch.testing.assert_close(
+        batch.training_signal.old_values,
+        torch.tensor([0.25, 0.75, 0.0], dtype=torch.float32),
+    )
+    assert bool(batch.training_signal.is_padding[-1].item())
+
+
 def test_replay_packer_exact_t_pack_has_no_padding(
     tmp_path: Path,
     cosmos_stubs: None,

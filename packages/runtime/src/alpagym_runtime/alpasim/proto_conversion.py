@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E402
 
 from alpasim_grpc.v0.common_pb2 import Pose as ProtoPose, PoseAtTime, Trajectory as ProtoTrajectory
 from alpasim_grpc.v0.egodriver_pb2 import (
@@ -34,20 +35,21 @@ from alpagym_runtime.types import (
 def build_simulation_request_proto(
     scene_ids: tuple[str, ...],
     n_generation: int,
-    driver_host: str,
-    driver_port: int,
-    n_concurrent_per_driver: int,
+    driver_host: str | None = None,
+    driver_port: int | None = None,
+    n_concurrent_per_driver: int = 0,
     session_uuid: str | None = None,
+    humanoid_policy_host: str | None = None,
+    humanoid_policy_port: int | None = None,
+    n_concurrent_per_humanoid_policy: int = 0,
 ) -> SimulationRequest:
     """Build one RuntimeService simulate request."""
     if not scene_ids:
         raise ValueError("scene_ids must not be empty")
     if n_generation < 1:
         raise ValueError("n_generation must be at least 1")
-    if n_concurrent_per_driver < 1:
-        raise ValueError("n_concurrent_per_driver must be at least 1")
     # When `session_uuid` is set, the streaming worker is dispatching a
-    # single rollout of a single scene and wants AlpaSim to open the drive
+    # single rollout of a single scene and wants AlpaSim to open the policy
     # session with our predetermined uuid instead of allocating one.
     if session_uuid is not None and (n_generation != 1 or len(scene_ids) != 1):
         raise ValueError(
@@ -55,11 +57,42 @@ def build_simulation_request_proto(
             f"(n_generation={n_generation}, scene_ids={scene_ids})"
         )
 
+    uses_driver = (
+        driver_host is not None or driver_port is not None or n_concurrent_per_driver > 0
+    )
+    uses_humanoid_policy = (
+        humanoid_policy_host is not None
+        or humanoid_policy_port is not None
+        or n_concurrent_per_humanoid_policy > 0
+    )
+    if uses_driver == uses_humanoid_policy:
+        raise ValueError(
+            "build_simulation_request_proto requires exactly one policy endpoint kind: "
+            "driver or humanoid_policy"
+        )
+
     simulation_request = SimulationRequest()
-    driver = simulation_request.available_drivers.add()
-    driver.ip = driver_host
-    driver.port = driver_port
-    simulation_request.n_concurrent_per_driver = n_concurrent_per_driver
+    if uses_driver:
+        if driver_host is None or driver_port is None:
+            raise ValueError("driver_host and driver_port are required for driver requests")
+        if n_concurrent_per_driver < 1:
+            raise ValueError("n_concurrent_per_driver must be at least 1")
+        driver = simulation_request.available_drivers.add()
+        driver.ip = driver_host
+        driver.port = driver_port
+        simulation_request.n_concurrent_per_driver = n_concurrent_per_driver
+    else:
+        if humanoid_policy_host is None or humanoid_policy_port is None:
+            raise ValueError(
+                "humanoid_policy_host and humanoid_policy_port are required for humanoid requests"
+            )
+        if n_concurrent_per_humanoid_policy < 1:
+            raise ValueError("n_concurrent_per_humanoid_policy must be at least 1")
+        humanoid_policy = simulation_request.available_humanoid_policies.add()
+        humanoid_policy.ip = humanoid_policy_host
+        humanoid_policy.port = humanoid_policy_port
+        simulation_request.n_concurrent_per_humanoid_policy = n_concurrent_per_humanoid_policy
+
     for scene_id in scene_ids:
         rollout_spec = simulation_request.rollout_specs.add()
         rollout_spec.scenario_id = scene_id

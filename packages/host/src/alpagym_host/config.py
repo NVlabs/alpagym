@@ -209,6 +209,12 @@ class CosmosRLTrainPolicyConfig:
     grpo_optimization_iterations: int
     kl_beta: float
     reference_reset_interval: int
+    trainer_type: str = "alpagym_grpo"
+    ppo_value_loss_coef: float = 0.5
+    ppo_value_clip_range: float | None = None
+    ppo_normalize_advantages: bool = True
+    ppo_gamma: float = 0.99
+    ppo_gae_lambda: float = 0.95
 
 
 @dataclass
@@ -396,6 +402,7 @@ class AlpaSimConfig:
     startup_timeout_s: float
     simulation_timeout_s: float
     wizard_args: AlpaSimWizardArgs
+    simulation_domain: str = "av"
     repo_url: str | None = None
     repo_ref: str | None = None
     repo_path: str | None = None

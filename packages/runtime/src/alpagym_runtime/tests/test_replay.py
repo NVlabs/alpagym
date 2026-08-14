@@ -8,6 +8,8 @@ import torch
 from alpagym_runtime.replay import (
     ActionSelection,
     PolicyReplayData,
+    TrainerReplayData,
+    TrainerReplayDataBatch,
     TrainingSignal,
     parse_policy_replay_data,
 )
@@ -202,3 +204,56 @@ def test_replay_payload_round_trips_scalar_old_logprob() -> None:
 
     assert parsed.payload == {}
     assert torch.as_tensor(parsed.old_logprob).shape == ()
+
+
+def test_trainer_replay_batch_stacks_optional_ppo_signals() -> None:
+    """Optional PPO signals stay row-aligned through minibatch stacking."""
+    samples = [
+        TrainerReplayData(
+            model_inputs={"x": torch.tensor(float(index))},
+            training_signal=TrainingSignal(
+                old_logprobs=torch.tensor([float(index)]),
+                is_padding=torch.tensor([False]),
+                advantages=torch.tensor([float(index + 1)]),
+                returns=torch.tensor([float(index + 2)]),
+                old_values=torch.tensor([float(index + 3)]),
+            ),
+            rollout_id=f"rollout-{index}",
+            weight_version=torch.tensor(index, dtype=torch.int64),
+        )
+        for index in range(2)
+    ]
+
+    batch = TrainerReplayDataBatch.stack(samples)
+
+    torch.testing.assert_close(batch.training_signal.advantages, torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(batch.training_signal.returns, torch.tensor([2.0, 3.0]))
+    torch.testing.assert_close(batch.training_signal.old_values, torch.tensor([3.0, 4.0]))
+
+
+def test_trainer_replay_batch_rejects_mixed_optional_ppo_signals() -> None:
+    """A minibatch cannot silently mix PPO and non-PPO replay rows."""
+    samples = [
+        TrainerReplayData(
+            model_inputs={"x": torch.tensor(0.0)},
+            training_signal=TrainingSignal(
+                old_logprobs=torch.tensor([0.0]),
+                is_padding=torch.tensor([False]),
+                advantages=torch.tensor([1.0]),
+            ),
+            rollout_id="rollout-a",
+            weight_version=torch.tensor(0, dtype=torch.int64),
+        ),
+        TrainerReplayData(
+            model_inputs={"x": torch.tensor(1.0)},
+            training_signal=TrainingSignal(
+                old_logprobs=torch.tensor([0.0]),
+                is_padding=torch.tensor([False]),
+            ),
+            rollout_id="rollout-b",
+            weight_version=torch.tensor(0, dtype=torch.int64),
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="advantages mixes present and missing"):
+        TrainerReplayDataBatch.stack(samples)

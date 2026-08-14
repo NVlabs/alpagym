@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E402
 
 """Cosmos-RL rollout backend driving AlpaSim simulator sessions."""
 
@@ -14,6 +15,9 @@ from typing import Any
 import grpc
 import torch
 import yaml
+from alpagym_runtime.alpasim.grpc_import import ensure_alpasim_grpc_source
+
+ensure_alpasim_grpc_source()
 from alpagym_host.config import ExecutionBackend, load_run_config
 from alpagym_host.endpoint_registry import (
     FileTopologyRegistry,
@@ -26,12 +30,17 @@ from cosmos_rl.rollout.rollout_base import RolloutBase, RolloutRegistry
 from cosmos_rl.rollout.schema import RolloutResult
 
 from alpagym_runtime.alpasim.driver_server import EgodriverServer
+from alpagym_runtime.alpasim.humanoid_policy_server import HumanoidPolicyServer
 from alpagym_runtime.episode_runner.streaming_worker import StreamingRolloutWorker
 from alpagym_runtime.inference.inference_engine import InferenceEngine
 from alpagym_runtime.perf.instrument.lifecycle import initialize_perf
 from alpagym_runtime.perf.instrument.marker import record_perf_marker
 from alpagym_runtime.perf.instrument.scope import measure_perf
-from alpagym_runtime.policies.factory import build_inference_engine, build_policy_factory
+from alpagym_runtime.policies.factory import (
+    build_humanoid_policy_factory,
+    build_inference_engine,
+    build_policy_factory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +69,7 @@ class AlpagymRollout(RolloutBase):
         # `shutdown` no-ops cleanly on a partial init failure.
         self._inference_engine: InferenceEngine | None = None
         self._driver_server: EgodriverServer | None = None
+        self._humanoid_policy_server: HumanoidPolicyServer | None = None
         self._alpasim_runtime_stub: RuntimeServiceStub | None = None
         self._worker: StreamingRolloutWorker | None = None
         self._engine_thread: threading.Thread | None = None
@@ -89,26 +99,46 @@ class AlpagymRollout(RolloutBase):
         self._inference_engine = build_inference_engine(self._run_config)
         self._model = self._inference_engine.get_model()
         record_perf_marker("rollout/model_ready", cpu_snapshot=True, gpu_snapshot=True)
-        policy_factory = build_policy_factory(self._run_config, self._inference_engine)
         distributed = ExecutionBackend(self._run_config.execution.backend).is_slurm_run
+        simulation_domain = str(getattr(self._run_config.alpasim, "simulation_domain", "av"))
 
-        driver_id = f"driver-{socket.gethostname()}-pid-{os.getpid()}"
+        if simulation_domain == "av":
+            policy_endpoint_id = f"driver-{socket.gethostname()}-pid-{os.getpid()}"
+        else:
+            policy_endpoint_id = f"{simulation_domain}-policy-{socket.gethostname()}-pid-{os.getpid()}"
         alpasim_runtime_endpoint: TopologyEndpoint = (
-            self._topology_registry.acquire_alpasim_runtime(driver_id=driver_id)
+            self._topology_registry.acquire_alpasim_runtime(driver_id=policy_endpoint_id)
         )
         max_concurrent_rollouts = rollout_worker_capacity(
             runtime_capacity=int(alpasim_runtime_endpoint.capacity),
             rollout_replicas=int(self._run_config.cosmos.launch.rollout_replicas),
             alpasim_runtime_count=len(self._topology_registry.list_alpasim_runtimes()),
         )
-        self._driver_server = EgodriverServer(
-            name=driver_id,
-            max_concurrent_rollouts=max_concurrent_rollouts,
-            policy_factory=policy_factory,
-            publish_host=socket.gethostname() if distributed else "localhost",
-        )
-        self._driver_server.start()
-        self._topology_registry.publish_driver(self._driver_server.topology_endpoint)
+        publish_host = socket.gethostname() if distributed else "localhost"
+        if simulation_domain == "humanoid":
+            humanoid_policy_factory = build_humanoid_policy_factory(
+                self._run_config,
+                self._inference_engine,
+            )
+            self._humanoid_policy_server = HumanoidPolicyServer(
+                name=policy_endpoint_id,
+                max_concurrent_rollouts=max_concurrent_rollouts,
+                policy_factory=humanoid_policy_factory,
+                publish_host=publish_host,
+            )
+            self._humanoid_policy_server.start()
+        elif simulation_domain == "av":
+            policy_factory = build_policy_factory(self._run_config, self._inference_engine)
+            self._driver_server = EgodriverServer(
+                name=policy_endpoint_id,
+                max_concurrent_rollouts=max_concurrent_rollouts,
+                policy_factory=policy_factory,
+                publish_host=publish_host,
+            )
+            self._driver_server.start()
+            self._topology_registry.publish_driver(self._driver_server.topology_endpoint)
+        else:
+            raise ValueError(f"unsupported alpasim.simulation_domain={simulation_domain!r}")
 
         channel = grpc.insecure_channel(
             alpasim_runtime_endpoint.to_grpc_target(),
@@ -133,15 +163,21 @@ class AlpagymRollout(RolloutBase):
 
         # The worker produces in-memory EpisodeOutputs; egress to the transport
         # happens later in the packer's get_rollout_output, after reward + DAPO.
-        self._worker = StreamingRolloutWorker(
-            alpasim_runtime_stub=self._alpasim_runtime_stub,
-            driver_server=self._driver_server,
-            simulation_timeout_s=float(self._run_config.alpasim.simulation_timeout_s),
-            reward_config=self._run_config.reward,
-            max_concurrent_rollouts=max_concurrent_rollouts,
-            rollouts_per_payload=rollouts_per_payload,
-            scene_id_resolver=_scene_id_for,
-        )
+        worker_kwargs: dict[str, Any] = {
+            "alpasim_runtime_stub": self._alpasim_runtime_stub,
+            "driver_server": self._driver_server,
+            "simulation_timeout_s": float(self._run_config.alpasim.simulation_timeout_s),
+            "reward_config": self._run_config.reward,
+            "max_concurrent_rollouts": max_concurrent_rollouts,
+            "rollouts_per_payload": rollouts_per_payload,
+            "scene_id_resolver": _scene_id_for,
+        }
+        if simulation_domain == "humanoid":
+            worker_kwargs.update(
+                humanoid_policy_server=self._humanoid_policy_server,
+                simulation_domain=simulation_domain,
+            )
+        self._worker = StreamingRolloutWorker(**worker_kwargs)
 
         # daemon=True so the engine thread does not block Python exit on a
         # clean cosmos shutdown. Cosmos-RL's colocated mode does not call
@@ -162,10 +198,15 @@ class AlpagymRollout(RolloutBase):
         self._engine_initialized = True
         record_perf_marker("rollout/backend_ready", cpu_snapshot=True, gpu_snapshot=True)
         logger.info(
-            "[alpagym] Streaming rollout backend ready: runtime=%s driver=%s "
-            "max_concurrent_rollouts=%d",
+            "[alpagym] Streaming rollout backend ready: runtime=%s domain=%s "
+            "policy_endpoint=%s max_concurrent_rollouts=%d",
             alpasim_runtime_endpoint,
-            self._driver_server.topology_endpoint,
+            simulation_domain,
+            (
+                self._humanoid_policy_server.topology_endpoint
+                if self._humanoid_policy_server is not None
+                else self._driver_server.topology_endpoint
+            ),
             max_concurrent_rollouts,
         )
 
@@ -261,6 +302,8 @@ class AlpagymRollout(RolloutBase):
             self._worker.shutdown()
         if self._driver_server is not None:
             self._driver_server.stop()
+        if self._humanoid_policy_server is not None:
+            self._humanoid_policy_server.stop()
         if self._inference_engine is not None:
             self._inference_engine.shutdown()
         if self._engine_thread is not None:

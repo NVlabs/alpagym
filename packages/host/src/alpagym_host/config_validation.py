@@ -96,8 +96,10 @@ def _validate_wizard_startup_config(
         raise ValueError("config.wizard_args.topology must be non-empty")
     if not config.wizard_args.driver_source:
         raise ValueError("config.wizard_args.driver_source must be non-empty")
-    if config.wizard_args.force_gt_duration_us <= 0:
-        raise ValueError("config.wizard_args.force_gt_duration_us must be positive")
+    min_force_gt_duration_us = 0 if config.simulation_domain == "humanoid" else 1
+    if config.wizard_args.force_gt_duration_us < min_force_gt_duration_us:
+        expectation = "non-negative" if config.simulation_domain == "humanoid" else "positive"
+        raise ValueError(f"config.wizard_args.force_gt_duration_us must be {expectation}")
     if config.wizard_args.driver is not None and not config.wizard_args.driver:
         raise ValueError("config.wizard_args.driver must be non-empty when set")
     if config.wizard_args.renderer is not None and not config.wizard_args.renderer:

@@ -13,6 +13,9 @@ def assert_replay_shapes(
     old_logprobs: torch.Tensor,
     advantages: torch.Tensor,
     kl_div: torch.Tensor | None,
+    values: torch.Tensor | None = None,
+    returns: torch.Tensor | None = None,
+    old_values: torch.Tensor | None = None,
 ) -> None:
     """Raise if model outputs and trainer signals disagree on row count."""
     if new_logprobs.shape != old_logprobs.shape:
@@ -29,6 +32,16 @@ def assert_replay_shapes(
         raise ValueError(
             f"kl_div shape {tuple(kl_div.shape)} != old_logprobs shape {tuple(old_logprobs.shape)}"
         )
+    for name, tensor in (
+        ("values", values),
+        ("returns", returns),
+        ("old_values", old_values),
+    ):
+        if tensor is not None and tensor.shape != old_logprobs.shape:
+            raise ValueError(
+                f"{name} shape {tuple(tensor.shape)} != old_logprobs "
+                f"shape {tuple(old_logprobs.shape)}"
+            )
     # Every forwarded row (padding included) must score finite; padding rows clone
     # a valid step's inputs, so non-finite values here signal a real bug.
     if not torch.isfinite(new_logprobs).all():
@@ -37,6 +50,13 @@ def assert_replay_shapes(
         raise FloatingPointError("rollout payload contains non-finite old_logprobs")
     if kl_div is not None and not torch.isfinite(kl_div).all():
         raise FloatingPointError("model returned non-finite kl_div")
+    for name, tensor in (
+        ("values", values),
+        ("returns", returns),
+        ("old_values", old_values),
+    ):
+        if tensor is not None and not torch.isfinite(tensor).all():
+            raise FloatingPointError(f"PPO replay contains non-finite {name}")
 
 
 def compute_ppo_surrogate(
@@ -78,3 +98,35 @@ def compute_kl_penalty(
     if valid_kl.numel() == 0:
         return torch.tensor(0.0, device=device)
     return valid_kl.mean() * kl_beta
+
+
+def compute_value_loss(
+    values: torch.Tensor,
+    returns: torch.Tensor,
+    is_padding: torch.Tensor,
+    old_values: torch.Tensor | None = None,
+    value_clip_range: float | None = None,
+) -> torch.Tensor:
+    """Compute PPO value-function loss over valid rows.
+
+    The unclipped path is ``0.5 * (V(s) - R)^2``. When ``old_values`` and a
+    positive clip range are supplied, this uses the standard PPO clipped value
+    loss and takes the max of clipped vs. unclipped squared error per row.
+    Padding rows are masked and an all-padding minibatch returns a graph-connected
+    zero so distributed workers stay in lockstep.
+    """
+    if value_clip_range is not None and value_clip_range <= 0.0:
+        raise ValueError(f"value_clip_range must be positive when set, got {value_clip_range}")
+
+    value_error = values - returns
+    value_losses = value_error.square()
+    if old_values is not None and value_clip_range is not None:
+        clipped_values = old_values + (values - old_values).clamp(
+            min=-value_clip_range,
+            max=value_clip_range,
+        )
+        clipped_losses = (clipped_values - returns).square()
+        value_losses = torch.maximum(value_losses, clipped_losses)
+
+    valid = (~is_padding).to(values.dtype)
+    return 0.5 * (value_losses * valid).sum() / valid.sum().clamp_min(1.0)

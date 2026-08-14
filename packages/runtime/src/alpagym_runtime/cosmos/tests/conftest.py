@@ -307,21 +307,91 @@ def _install_cosmos_stubs() -> None:
 
     model_base: Any = types.ModuleType("cosmos_rl.policy.model.base")
 
+    import torch
+
     class WeightMapper:
         """Tiny stand-in for the Cosmos WeightMapper base class."""
+
+        _MODEL_WEIGHT_MAPPER_REGISTRY: dict[str, type] = {}
 
         def __init__(self, *args: object, **kwargs: object):
             """Accept Cosmos weight-mapper construction arguments."""
             del args, kwargs
 
+        @classmethod
+        def register_class(
+            cls,
+            reg_key: str | list[str],
+            default_weight_mapper_cls: type,
+            *,
+            allow_override: bool = False,
+        ) -> None:
+            """Register one or more model types to a weight mapper."""
+            del allow_override
+            keys = [reg_key] if isinstance(reg_key, str) else reg_key
+            for key in keys:
+                cls._MODEL_WEIGHT_MAPPER_REGISTRY[str(key)] = default_weight_mapper_cls
+
+        @classmethod
+        def get_weight_mapper(cls, model_type: str) -> type:
+            """Return the registered mapper for ``model_type``."""
+            return cls._MODEL_WEIGHT_MAPPER_REGISTRY.get(model_type, IdentityWeightMapper)
+
+        def policy_map_local_key_to_hf_key(self, param_name: str) -> str:
+            """Return the unchanged policy parameter name."""
+            return param_name
+
         def rollout_map_local_key_to_hf_key(self, param_name: str) -> str:
             """Return the unchanged rollout parameter name."""
             return param_name
 
+    class IdentityWeightMapper(WeightMapper):
+        """Identity mapper used by small non-HF test models."""
+
+    class BaseModel(torch.nn.Module):
+        """Tiny stand-in for Cosmos BaseModel."""
+
+        def __init__(self, hf_config: object | None = None) -> None:
+            super().__init__()
+            model_type = getattr(self, "supported_model_types")()[0]
+            self.weight_mapper = WeightMapper.get_weight_mapper(model_type)(hf_config)
+
+        @staticmethod
+        def supported_model_types() -> list[str]:
+            return []
+
+        @property
+        def trainable_params(self) -> list[str]:
+            return [name for name, param in self.named_parameters() if param.requires_grad]
+
+        @property
+        def weight_sync_transforms(self) -> list[tuple[str, object]]:
+            return [(name, param) for name, param in self.named_parameters()]
+
+        def set_gradient_checkpointing_enabled(self, enabled: bool) -> None:
+            del enabled
+
+        def current_device(self):
+            return next(self.parameters()).device
+
     class ModelRegistry:
         """Tiny stand-in for the Cosmos model registry."""
 
-        _registry: dict[str, type] = {}
+        _MODEL_REGISTRY: dict[str, type] = {}
+        _registry = _MODEL_REGISTRY
+
+        @classmethod
+        def register_model(
+            cls,
+            model_cls: type,
+            weight_mapper_cls: type,
+            data_packer_cls: type | None = None,
+        ) -> None:
+            """Register a model and its weight mapper."""
+            del data_packer_cls
+            for model_type in getattr(model_cls, "supported_model_types")():
+                cls._MODEL_REGISTRY[model_type] = model_cls
+                WeightMapper.register_class(model_type, weight_mapper_cls)
 
         @classmethod
         def register(cls, weight_mapper_cls: type, allow_override: bool = False):
@@ -330,13 +400,13 @@ def _install_cosmos_stubs() -> None:
 
             def decorator(model_cls: type) -> type:
                 """Store and return the decorated model class."""
-                for model_type in getattr(model_cls, "supported_model_types")():
-                    cls._registry[model_type] = model_cls
+                cls.register_model(model_cls, weight_mapper_cls)
                 return model_cls
 
-            del weight_mapper_cls
             return decorator
 
+    model_base.BaseModel = BaseModel
+    model_base.IdentityWeightMapper = IdentityWeightMapper
     model_base.ModelRegistry = ModelRegistry
     model_base.WeightMapper = WeightMapper
     sys.modules["cosmos_rl.policy.model"] = types.ModuleType("cosmos_rl.policy.model")

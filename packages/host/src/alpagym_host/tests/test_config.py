@@ -108,6 +108,51 @@ def test_host_writes_and_loads_handoff_artifacts(
     }
 
 
+def test_host_writes_alpagym_ppo_trainer_config(
+    tmp_path: Path,
+) -> None:
+    """Host artifacts can select the actor-critic PPO trainer and custom value knobs."""
+    register_config_schema()
+    model_path = tmp_path / "model_bundle"
+    with initialize_config_module(version_base=None, config_module="alpagym_host.conf"):
+        cfg = compose(
+            config_name="default",
+            overrides=[
+                f"run_root={tmp_path.as_posix()}",
+                "deploy=local",
+                "topology=local_colocated_1gpu",
+                "policy.model.kind=alpamayo_r1",
+                f"policy.model.path={model_path.as_posix()}",
+                "cosmos.train.train_policy.trainer_type=alpagym_ppo",
+                "cosmos.train.train_policy.ppo_value_loss_coef=0.75",
+                "cosmos.train.train_policy.ppo_value_clip_range=0.2",
+                "cosmos.train.train_policy.ppo_normalize_advantages=false",
+                "cosmos.train.train_policy.ppo_gamma=0.97",
+                "cosmos.train.train_policy.ppo_gae_lambda=0.9",
+            ],
+        )
+
+    artifact_paths = build_artifact_paths(cfg)
+    run_config = build_run_config(cfg, artifact_paths)
+    write_run_artifacts(run_config)
+    cosmos_config = tomllib.loads(artifact_paths.cosmos_config_path.read_text())
+
+    train_policy = cosmos_config["train"]["train_policy"]
+    assert train_policy["trainer_type"] == "alpagym_ppo"
+    assert "ppo_value_loss_coef" not in train_policy
+    assert "ppo_value_clip_range" not in train_policy
+    assert "ppo_normalize_advantages" not in train_policy
+    assert "ppo_gamma" not in train_policy
+    assert "ppo_gae_lambda" not in train_policy
+    assert cosmos_config["custom"]["ppo"] == {
+        "value_loss_coef": 0.75,
+        "value_clip_range": 0.2,
+        "normalize_advantages": False,
+        "gamma": 0.97,
+        "gae_lambda": 0.9,
+    }
+
+
 def test_model_config_accepts_arbitrary_kind_and_round_trips_bundle_config(
     tmp_path: Path,
 ) -> None:
@@ -536,6 +581,34 @@ def test_training_policy_config_rejects_disabled_replay_trace(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="return_trace_for_rl"):
         validate_run_config(run_config, "run")
+
+
+def test_run_config_rejects_zero_force_gt_for_av_domain(tmp_path: Path) -> None:
+    """AV runs still require a positive force-GT warmup."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        "policy.model.kind=alpamayo_r1",
+        f"policy.model.path={model_path.as_posix()}",
+        "alpasim.wizard_args.force_gt_duration_us=0",
+    )
+
+    with pytest.raises(ValueError, match="force_gt_duration_us must be positive"):
+        validate_run_config(run_config, "run")
+
+
+def test_run_config_allows_zero_force_gt_for_humanoid_domain(tmp_path: Path) -> None:
+    """Humanoid dynamics-only rollouts do not use AV force-GT warmup."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        "policy.model.kind=alpamayo_r1",
+        f"policy.model.path={model_path.as_posix()}",
+        "alpasim.simulation_domain=humanoid",
+        "alpasim.wizard_args.force_gt_duration_us=0",
+    )
+
+    validate_run_config(run_config, "run")
 
 
 @pytest.mark.parametrize(

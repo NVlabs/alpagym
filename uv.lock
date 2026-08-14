@@ -9,13 +9,14 @@ supported-markers = [
 ]
 
 [options]
-exclude-newer = "2026-06-13T06:41:33.974527102Z"
+exclude-newer = "2026-08-11T20:20:44.692242792Z"
 exclude-newer-span = "P3D"
 
 [manifest]
 members = [
     "alpagym-alpamayo-r1",
     "alpagym-alpasim-configs",
+    "alpagym-g1-mjlab",
     "alpagym-host",
     "alpagym-plugins",
     "alpagym-runtime",
@@ -116,6 +117,21 @@ requires-dist = [
 name = "alpagym-alpasim-configs"
 version = "0.1.0"
 source = { editable = "packages/alpasim_configs" }
+
+[[package]]
+name = "alpagym-g1-mjlab"
+version = "0.1.0"
+source = { editable = "packages/policies/g1_mjlab" }
+dependencies = [
+    { name = "alpagym-runtime", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "transformers", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "alpagym-runtime", editable = "packages/runtime" },
+    { name = "transformers" },
+]
 
 [[package]]
 name = "alpagym-host"

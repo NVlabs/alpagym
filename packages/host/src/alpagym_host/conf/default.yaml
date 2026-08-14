@@ -56,6 +56,9 @@ dataset:
     # - clipgt-2f474f6d-509a-483e-ad4d-43fee7b4fb06
 
 alpasim:
+  # Selects the AlpaSim runtime domain: av uses EgodriverService; humanoid uses
+  # HumanoidPolicyService + HumanoidDynamicsService.
+  simulation_domain: av
   # Set repo_path to use an existing checkout directly. When set, AlpaGym skips
   # clone/fetch/checkout/sync and starts Wizard from this path.
   repo_path: null
@@ -124,6 +127,9 @@ cosmos:
       export_safetensors: true
       max_keep: 5
     train_policy:
+      # AlpaGym trainer registered with Cosmos-RL. Use alpagym_ppo for
+      # per-step actor-critic PPO over replay payloads.
+      trainer_type: alpagym_grpo
       allowed_outdated_steps: 4
       on_policy: false
       mini_batch: 1
@@ -139,6 +145,12 @@ cosmos:
       # Trainer steps between reference-model refreshes when KL is enabled.
       # 0 means the reference model is not refreshed.
       reference_reset_interval: 0
+      # PPO-only value-function settings. Ignored by alpagym_grpo.
+      ppo_value_loss_coef: 0.5
+      ppo_value_clip_range: null
+      ppo_normalize_advantages: true
+      ppo_gamma: 0.99
+      ppo_gae_lambda: 0.95
   policy:
     parallelism:
       tp_size: 1

@@ -51,10 +51,11 @@ def main(cfg: DictConfig) -> object:
     )
 
     run_config = load_or_create_run_config(cfg)
-    # Validate HuggingFace access before dispatching either command, so submit
-    # fails before queuing a Slurm allocation and run fails before resolving the
-    # AlpaSim checkout. The check is scene-agnostic, so it needs no checkout.
-    validate_huggingface_access()
+    # Validate HuggingFace access before AV/NuRec dispatch, so submit fails before
+    # queuing a Slurm allocation and run fails before resolving the AlpaSim
+    # checkout. Humanoid dynamics-only runs do not consume HuggingFace NuRec assets.
+    if getattr(getattr(run_config, "alpasim", None), "simulation_domain", "av") != "humanoid":
+        validate_huggingface_access()
     if cfg.command == "run":
         execute_run(run_config)
         return run_config

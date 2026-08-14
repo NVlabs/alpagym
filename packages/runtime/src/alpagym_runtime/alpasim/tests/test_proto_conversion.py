@@ -18,7 +18,9 @@ def install_alpasim_grpc_stubs() -> None:
     egodriver_pb2: Any = types.ModuleType("alpasim_grpc.v0.egodriver_pb2")
     runtime_pb2: Any = types.ModuleType("alpasim_grpc.v0.runtime_pb2")
     sensorsim_pb2: Any = types.ModuleType("alpasim_grpc.v0.sensorsim_pb2")
+    humanoid_pb2: Any = types.ModuleType("alpasim_grpc.v0.humanoid_pb2")
     egodriver_pb2_grpc: Any = types.ModuleType("alpasim_grpc.v0.egodriver_pb2_grpc")
+    humanoid_pb2_grpc: Any = types.ModuleType("alpasim_grpc.v0.humanoid_pb2_grpc")
     runtime_pb2_grpc: Any = types.ModuleType("alpasim_grpc.v0.runtime_pb2_grpc")
 
     class Empty:
@@ -121,6 +123,55 @@ def install_alpasim_grpc_stubs() -> None:
     class CameraSpec:
         """Tiny stand-in for sensorsim.CameraSpec."""
 
+    class HumanoidAction:
+        """Tiny stand-in for humanoid.HumanoidAction."""
+
+        def __init__(self, env_id: int = 0, values=None) -> None:
+            self.env_id = env_id
+            self.values = list(values or [])
+
+    class HumanoidEnvState:
+        """Tiny stand-in for humanoid.HumanoidEnvState."""
+
+        def __init__(
+            self,
+            env_id: int = 0,
+            timestamp_us: int = 0,
+            qpos=None,
+            qvel=None,
+            observation=None,
+            scalars=None,
+        ) -> None:
+            self.env_id = env_id
+            self.timestamp_us = timestamp_us
+            self.qpos = list(qpos or [])
+            self.qvel = list(qvel or [])
+            self.observation = list(observation or [])
+            self.scalars = dict(scalars or {})
+
+    class HumanoidPolicyRequest:
+        """Tiny stand-in for humanoid.HumanoidPolicyRequest."""
+
+    class HumanoidPolicyResponse:
+        """Tiny stand-in for humanoid.HumanoidPolicyResponse."""
+
+        def __init__(self, actions=None, terminate_session: bool = False) -> None:
+            self.actions = list(actions or [])
+            self.terminate_session = terminate_session
+
+    class HumanoidPolicySessionRequest:
+        """Tiny stand-in for humanoid.HumanoidPolicySessionRequest."""
+
+    class HumanoidSessionCloseRequest:
+        """Tiny stand-in for humanoid.HumanoidSessionCloseRequest."""
+
+    class HumanoidPolicyServiceServicer:
+        """Tiny stand-in for generated humanoid policy servicer base."""
+
+    def add_HumanoidPolicyServiceServicer_to_server(servicer: object, server: Any) -> None:
+        """Attach a humanoid policy servicer to a fake server."""
+        server.servicer = servicer
+
     class _Repeated(list):
         """List with protobuf-style add()."""
 
@@ -134,6 +185,14 @@ def install_alpasim_grpc_stubs() -> None:
             item = self._item_type()
             self.append(item)
             return item
+
+    class _ServiceAddress:
+        """Tiny stand-in for SimulationRequest.ServiceAddress."""
+
+        def __init__(self) -> None:
+            """Initialize address fields."""
+            self.ip = ""
+            self.port = 0
 
     class _DriverAddress:
         """Tiny stand-in for SimulationRequest.DriverAddress."""
@@ -160,6 +219,8 @@ def install_alpasim_grpc_stubs() -> None:
             self.available_drivers = _Repeated(_DriverAddress)
             self.rollout_specs = _Repeated(_RolloutSpec)
             self.n_concurrent_per_driver = 0
+            self.available_humanoid_policies = _Repeated(_ServiceAddress)
+            self.n_concurrent_per_humanoid_policy = 0
 
     class SimulationReturn:
         """Tiny stand-in for runtime.SimulationReturn."""
@@ -199,6 +260,16 @@ def install_alpasim_grpc_stubs() -> None:
     egodriver_pb2.Route = Route
     egodriver_pb2.RouteRequest = RouteRequest
     egodriver_pb2_grpc.EgodriverServiceServicer = EgodriverServiceServicer
+    humanoid_pb2.HumanoidAction = HumanoidAction
+    humanoid_pb2.HumanoidEnvState = HumanoidEnvState
+    humanoid_pb2.HumanoidPolicyRequest = HumanoidPolicyRequest
+    humanoid_pb2.HumanoidPolicyResponse = HumanoidPolicyResponse
+    humanoid_pb2.HumanoidPolicySessionRequest = HumanoidPolicySessionRequest
+    humanoid_pb2.HumanoidSessionCloseRequest = HumanoidSessionCloseRequest
+    humanoid_pb2_grpc.HumanoidPolicyServiceServicer = HumanoidPolicyServiceServicer
+    humanoid_pb2_grpc.add_HumanoidPolicyServiceServicer_to_server = (
+        add_HumanoidPolicyServiceServicer_to_server
+    )
     egodriver_pb2_grpc.add_EgodriverServiceServicer_to_server = (
         add_EgodriverServiceServicer_to_server
     )
@@ -212,6 +283,8 @@ def install_alpasim_grpc_stubs() -> None:
     sys.modules["alpasim_grpc.v0.common_pb2"] = common_pb2
     sys.modules["alpasim_grpc.v0.egodriver_pb2"] = egodriver_pb2
     sys.modules["alpasim_grpc.v0.egodriver_pb2_grpc"] = egodriver_pb2_grpc
+    sys.modules["alpasim_grpc.v0.humanoid_pb2"] = humanoid_pb2
+    sys.modules["alpasim_grpc.v0.humanoid_pb2_grpc"] = humanoid_pb2_grpc
     sys.modules["alpasim_grpc.v0.runtime_pb2"] = runtime_pb2
     sys.modules["alpasim_grpc.v0.runtime_pb2_grpc"] = runtime_pb2_grpc
     sys.modules["alpasim_grpc.v0.sensorsim_pb2"] = sensorsim_pb2
@@ -249,6 +322,25 @@ def test_simulation_request_carries_batch_scenes_generation_and_driver() -> None
     assert request.available_drivers[0].ip == "localhost"
     assert request.available_drivers[0].port == 50052
     assert request.n_concurrent_per_driver == 3
+
+
+def test_simulation_request_carries_humanoid_policy_endpoint() -> None:
+    """Humanoid runtime requests use available_humanoid_policies, not egodriver."""
+    request = build_simulation_request_proto(
+        scene_ids=("stairs_scene",),
+        n_generation=1,
+        humanoid_policy_host="localhost",
+        humanoid_policy_port=50057,
+        n_concurrent_per_humanoid_policy=2,
+        session_uuid="humanoid-session",
+    )
+
+    assert len(request.available_drivers) == 0
+    assert request.available_humanoid_policies[0].ip == "localhost"
+    assert request.available_humanoid_policies[0].port == 50057
+    assert request.n_concurrent_per_humanoid_policy == 2
+    assert request.rollout_specs[0].scenario_id == "stairs_scene"
+    assert list(request.rollout_specs[0].session_uuids) == ["humanoid-session"]
 
 
 def test_simulation_request_threads_session_uuid_for_per_rollout_dispatch() -> None:

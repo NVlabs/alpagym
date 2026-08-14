@@ -301,6 +301,28 @@ def test_main_validates_huggingface_access_before_dispatch(
     assert call_order == ["huggingface", "execute_run"]
 
 
+def test_main_skips_huggingface_validation_for_humanoid_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Humanoid dynamics-only runs do not require AV/NuRec HuggingFace assets."""
+    from types import SimpleNamespace
+
+    from alpagym_host import cli
+
+    call_order: list[str] = []
+    run_config = SimpleNamespace(alpasim=SimpleNamespace(simulation_domain="humanoid"))
+
+    monkeypatch.setattr(cli, "load_or_create_run_config", lambda cfg: run_config)
+    monkeypatch.setattr(
+        cli, "validate_huggingface_access", lambda: call_order.append("huggingface")
+    )
+    monkeypatch.setattr(cli, "execute_run", lambda cfg: call_order.append("execute_run"))
+
+    cli.main.__wrapped__(SimpleNamespace(command="run", logging_level="INFO"))
+
+    assert call_order == ["execute_run"]
+
+
 def test_main_configures_logging_from_hydra_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

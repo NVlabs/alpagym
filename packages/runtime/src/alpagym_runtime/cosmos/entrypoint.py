@@ -50,6 +50,35 @@ def _build_dataset(config: Any) -> AlpagymSceneDataset:
     return AlpagymSceneDataset(scene_ids=scene_ids)
 
 
+def _install_policy_bundle_runtime_hooks(policy_bundle: Any, run_config: Any) -> None:
+    """Install policy-owned Cosmos hooks before Cosmos constructs workers."""
+    install_bridge = getattr(policy_bundle, "install_runtime_bridge", None)
+    if callable(install_bridge):
+        install_bridge()
+
+    setup_bundle_tokenizer = getattr(policy_bundle, "setup_tokenizer", None)
+    if not callable(setup_bundle_tokenizer):
+        return
+
+    from cosmos_rl.utils import util as cosmos_util
+
+    original_setup_tokenizer = cosmos_util.setup_tokenizer
+
+    def setup_tokenizer_with_policy_bundle(model_name_or_path: str) -> Any:
+        bundle_tokenizer = setup_bundle_tokenizer(run_config)
+        if bundle_tokenizer is not None:
+            return bundle_tokenizer
+        return original_setup_tokenizer(model_name_or_path)
+
+    cosmos_util.setup_tokenizer = setup_tokenizer_with_policy_bundle
+
+    try:
+        from cosmos_rl.policy.trainer.llm_trainer import grpo_trainer
+    except Exception:
+        return
+    grpo_trainer.setup_tokenizer = setup_tokenizer_with_policy_bundle
+
+
 def _install_alpagym_rollout_teardown() -> None:
     """Close AlpaGym rollout resources before Cosmos destroys torch distributed."""
     from cosmos_rl.rollout.worker.llm_worker import LLMRolloutWorker
@@ -161,6 +190,7 @@ def main(argv: list[str] | None = None) -> None:
         _install_alpagym_rollout_teardown()
 
     policy_bundle = get_policy_bundle(run_config.policy.model.kind)
+    _install_policy_bundle_runtime_hooks(policy_bundle, run_config)
     data_packer = policy_bundle.build_data_packer(run_config, cosmos_role)
     # Registered before launch_worker so close runs after the rollout backend's
     # own atexit shutdown (LIFO): the worker stops producing before the writer closes.

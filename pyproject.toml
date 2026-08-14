@@ -36,6 +36,7 @@ members = [
   "packages/runtime",
   "packages/alpasim_configs",
   "packages/policies/alpamayo_r1",
+  "packages/policies/g1_mjlab",
 ]
 
 [tool.ty.environment]
@@ -46,6 +47,7 @@ root = [
   "packages/runtime/src",
   "packages/alpasim_configs/src",
   "packages/policies/alpamayo_r1/src",
+  "packages/policies/g1_mjlab/src",
 ]
 
 [tool.ty.src]
@@ -62,6 +64,7 @@ grouped-gemm = ["torch"]
 
 [tool.uv.sources]
 alpagym-alpamayo-r1 = { workspace = true }
+alpagym-g1-mjlab = { workspace = true }
 alpagym-alpasim-configs = { workspace = true }
 alpagym-host = { workspace = true }
 alpagym-plugins = { workspace = true }
@@ -85,6 +88,7 @@ testpaths = [
   "packages/runtime",
   "packages/alpasim_configs",
   "packages/policies/alpamayo_r1",
+  "packages/policies/g1_mjlab",
   "tests",
 ]
 # Real AlpaSim and NCCL e2e tests require local infrastructure and are opt-in.

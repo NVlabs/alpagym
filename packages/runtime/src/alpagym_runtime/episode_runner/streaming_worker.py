@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E402
 
 """Streaming AlpaSim rollout worker with per-rollout retry and queue-driven dispatch."""
 
@@ -10,17 +11,22 @@ import threading
 import uuid
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
-from typing import Callable
+from typing import Any, Callable, Mapping
 
+import torch
+from alpagym_runtime.alpasim.grpc_import import ensure_alpasim_grpc_source
+
+ensure_alpasim_grpc_source()
 from alpagym_host.config import RewardConfig
 from alpasim_grpc.v0.runtime_pb2_grpc import RuntimeServiceStub
 from cosmos_rl.dispatcher.data.schema import RLPayload
 
 from alpagym_runtime.alpasim.driver_server import EgodriverServer
+from alpagym_runtime.alpasim.humanoid_policy_server import HumanoidPolicyServer
 from alpagym_runtime.alpasim.proto_conversion import build_simulation_request_proto
 from alpagym_runtime.perf.instrument.scope import measure_perf, timed_scope
 from alpagym_runtime.rewards.compute import compute_reward
-from alpagym_runtime.types import EpisodeMetrics, EpisodeOutput
+from alpagym_runtime.types import EpisodeMetrics, EpisodeOutput, PolicyOutput, RewardResult
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +59,118 @@ class _RolloutJob:
     attempts: int = 0
 
 
+def _dense_metrics_from_rollout_return(rollout_return: object) -> dict[str, Any]:
+    """Convert RuntimeService timestep metrics into an artifact-friendly mapping."""
+    dense: dict[str, Any] = {}
+    for metric in getattr(rollout_return, "timestep_metrics", []):
+        dense[str(metric.name)] = {
+            "timestamps_us": [int(value) for value in metric.timestamps_us],
+            "values": [float(value) for value in metric.values],
+            "valid": [bool(value) for value in metric.valid],
+        }
+    return dense
+
+
+def _metric_values_by_name(rollout_return: object) -> dict[str, list[float]]:
+    return {
+        str(metric.name): [float(value) for value in metric.values]
+        for metric in getattr(rollout_return, "timestep_metrics", [])
+    }
+
+
+def _payload_humanoid_meta(output: PolicyOutput) -> Mapping[str, Any]:
+    replay_data = output.replay_data
+    if replay_data is None:
+        return {}
+    meta = replay_data.payload.get("humanoid", {})
+    return meta if isinstance(meta, Mapping) else {}
+
+
+def _output_env_id(output: PolicyOutput) -> int:
+    if output.model_extra and "humanoid_env_id" in output.model_extra:
+        return int(output.model_extra["humanoid_env_id"])
+    meta = _payload_humanoid_meta(output)
+    return int(meta.get("env_id", 0))
+
+
+def _output_step_index(output: PolicyOutput, fallback: int) -> int:
+    if output.model_extra and "humanoid_step_index" in output.model_extra:
+        return int(output.model_extra["humanoid_step_index"])
+    meta = _payload_humanoid_meta(output)
+    return int(meta.get("step_index", fallback))
+
+
+def _output_value(output: PolicyOutput) -> float:
+    if output.model_extra and "humanoid_value" in output.model_extra:
+        return float(output.model_extra["humanoid_value"])
+    meta = _payload_humanoid_meta(output)
+    if "value" in meta:
+        value = meta["value"]
+        if isinstance(value, torch.Tensor):
+            return float(value.reshape(()).item())
+        return float(value)
+    return 0.0
+
+
+def _metric_value(
+    metrics: Mapping[str, list[float]],
+    name: str,
+    step_index: int,
+    default: float,
+) -> float:
+    values = metrics.get(name)
+    if values is None or step_index < 0 or step_index >= len(values):
+        return default
+    return float(values[step_index])
+
+
+def _attach_humanoid_transition_payloads(
+    outputs: tuple[PolicyOutput, ...],
+    rollout_return: object,
+) -> tuple[PolicyOutput, ...]:
+    """Attach PPO transition facts from AlpaSim metrics to humanoid replay rows."""
+    metrics = _metric_values_by_name(rollout_return)
+    next_step_by_env: dict[int, int] = {}
+    patched_outputs: list[PolicyOutput] = []
+
+    for output in outputs:
+        replay_data = output.replay_data
+        if replay_data is None:
+            patched_outputs.append(output)
+            continue
+
+        env_id = _output_env_id(output)
+        fallback_step_index = next_step_by_env.get(env_id, 0)
+        step_index = _output_step_index(output, fallback=fallback_step_index)
+        next_step_by_env[env_id] = max(fallback_step_index, step_index) + 1
+        env_suffix = f"env{env_id}"
+
+        reward = _metric_value(metrics, f"humanoid_reward_{env_suffix}", step_index, 0.0)
+        terminated = bool(
+            _metric_value(metrics, f"humanoid_terminated_{env_suffix}", step_index, 0.0)
+        )
+        truncated = bool(
+            _metric_value(metrics, f"humanoid_truncated_{env_suffix}", step_index, 0.0)
+        )
+
+        payload = dict(replay_data.payload)
+        transition = dict(payload.get("transition", {}))
+        transition.setdefault("reward", reward)
+        transition.setdefault("terminated", terminated)
+        transition.setdefault("truncated", truncated)
+        transition.setdefault("old_value", _output_value(output))
+        # A value-only final-state query is not part of the service contract yet.
+        # Use zero bootstrap for now; the policy/value at each sampled state is
+        # still trained from the rollout values and realized rewards.
+        transition.setdefault("bootstrap_value", 0.0)
+        payload["transition"] = transition
+        patched_outputs.append(
+            replace(output, replay_data=replace(replay_data, payload=payload))
+        )
+
+    return tuple(patched_outputs)
+
+
 class StreamingRolloutWorker:
     """Per-rollout dispatcher driving one AlpaSim runtime endpoint.
 
@@ -76,13 +194,15 @@ class StreamingRolloutWorker:
         self,
         *,
         alpasim_runtime_stub: RuntimeServiceStub,
-        driver_server: EgodriverServer,
+        driver_server: EgodriverServer | None,
         simulation_timeout_s: float,
         reward_config: RewardConfig,
         max_concurrent_rollouts: int,
         rollouts_per_payload: int,
         scene_id_resolver: Callable[[RLPayload], str],
         max_scene_retries: int = 3,
+        humanoid_policy_server: HumanoidPolicyServer | None = None,
+        simulation_domain: str = "av",
     ) -> None:
         """Wire the worker and start `max_concurrent_rollouts` simulate-pool threads."""
         if max_concurrent_rollouts < 1:
@@ -92,8 +212,19 @@ class StreamingRolloutWorker:
         if max_scene_retries < 0:
             raise ValueError("max_scene_retries must be non-negative")
         self._alpasim_runtime_stub = alpasim_runtime_stub
+        self._simulation_domain = str(simulation_domain)
         self._driver_server = driver_server
-        self._driver_endpoint = driver_server.topology_endpoint
+        self._humanoid_policy_server = humanoid_policy_server
+        if self._simulation_domain == "humanoid":
+            if humanoid_policy_server is None:
+                raise ValueError("humanoid simulation requires humanoid_policy_server")
+            self._policy_endpoint = humanoid_policy_server.topology_endpoint
+        elif self._simulation_domain == "av":
+            if driver_server is None:
+                raise ValueError("av simulation requires driver_server")
+            self._policy_endpoint = driver_server.topology_endpoint
+        else:
+            raise ValueError(f"unsupported simulation_domain={simulation_domain!r}")
         self._simulation_timeout_s = simulation_timeout_s
         self._reward_config = reward_config
         self._rollouts_per_payload = rollouts_per_payload
@@ -216,14 +347,7 @@ class StreamingRolloutWorker:
         """Run one simulate(1) end-to-end and finalize on success or failure."""
         try:
             with timed_scope("rollout/sim_request_build", category="orchestration"):
-                request = build_simulation_request_proto(
-                    scene_ids=(rollout_job.scene_id,),
-                    n_generation=1,
-                    driver_host=self._driver_endpoint.host,
-                    driver_port=int(self._driver_endpoint.port),
-                    n_concurrent_per_driver=1,
-                    session_uuid=rollout_job.session_uuid,
-                )
+                request = self._build_simulation_request(rollout_job)
             with timed_scope("rollout/sim_step_rpc", category="external_rpc"):
                 sim_return = self._alpasim_runtime_stub.simulate(
                     request,
@@ -236,24 +360,78 @@ class StreamingRolloutWorker:
                     RuntimeError(rollout_return.error or "AlpaSim rollout failed"),
                 )
                 return
-            record = self._driver_server.servicer.pop_session_record(rollout_job.session_uuid)
-            aggregated = dict(rollout_return.aggregated_metrics)
-            base = EpisodeOutput(
-                scene_id=rollout_job.scene_id,
-                session_uuid=rollout_job.session_uuid,
-                num_steps=len(record.outputs),
-                policy_outputs=record.outputs,
-                executed_ego_trajectory=record.executed_ego_trajectory,
-                route_waypoints=(),
-                metrics=EpisodeMetrics(aggregated=aggregated, dense={}) if aggregated else None,
-                reward=None,
-            )
-            with timed_scope("rollout/reward_compute", category="compute_cpu", cpu_snapshot=True):
-                reward = compute_reward(base, record.ground_truth, self._reward_config)
-            episode = replace(base, reward=reward)
+            if self._simulation_domain == "humanoid":
+                episode = self._build_humanoid_episode(rollout_job, rollout_return)
+            else:
+                episode = self._build_av_episode(rollout_job, rollout_return)
             self._on_rollout_succeeded(rollout_job, episode)
         except Exception as exc:
             self._on_rollout_failed(rollout_job, exc)
+
+    def _build_simulation_request(self, rollout_job: _RolloutJob):
+        """Build the RuntimeService request for this worker's simulation domain."""
+        endpoint = self._policy_endpoint
+        if self._simulation_domain == "humanoid":
+            return build_simulation_request_proto(
+                scene_ids=(rollout_job.scene_id,),
+                n_generation=1,
+                humanoid_policy_host=endpoint.host,
+                humanoid_policy_port=int(endpoint.port),
+                n_concurrent_per_humanoid_policy=1,
+                session_uuid=rollout_job.session_uuid,
+            )
+        return build_simulation_request_proto(
+            scene_ids=(rollout_job.scene_id,),
+            n_generation=1,
+            driver_host=endpoint.host,
+            driver_port=int(endpoint.port),
+            n_concurrent_per_driver=1,
+            session_uuid=rollout_job.session_uuid,
+        )
+
+    def _build_av_episode(self, rollout_job: _RolloutJob, rollout_return: object) -> EpisodeOutput:
+        """Build an EpisodeOutput for the existing AV egodriver path."""
+        if self._driver_server is None:
+            raise RuntimeError("AV rollout completed without a driver server")
+        record = self._driver_server.servicer.pop_session_record(rollout_job.session_uuid)
+        aggregated = dict(rollout_return.aggregated_metrics)
+        base = EpisodeOutput(
+            scene_id=rollout_job.scene_id,
+            session_uuid=rollout_job.session_uuid,
+            num_steps=len(record.outputs),
+            policy_outputs=record.outputs,
+            executed_ego_trajectory=record.executed_ego_trajectory,
+            route_waypoints=(),
+            metrics=EpisodeMetrics(aggregated=aggregated, dense={}) if aggregated else None,
+            reward=None,
+        )
+        with timed_scope("rollout/reward_compute", category="compute_cpu", cpu_snapshot=True):
+            reward = compute_reward(base, record.ground_truth, self._reward_config)
+        return replace(base, reward=reward)
+
+    def _build_humanoid_episode(
+        self,
+        rollout_job: _RolloutJob,
+        rollout_return: object,
+    ) -> EpisodeOutput:
+        """Build an EpisodeOutput for humanoid PPO replay."""
+        if self._humanoid_policy_server is None:
+            raise RuntimeError("Humanoid rollout completed without a policy server")
+        record = self._humanoid_policy_server.servicer.pop_session_record(
+            rollout_job.session_uuid
+        )
+        aggregated = dict(rollout_return.aggregated_metrics)
+        dense = _dense_metrics_from_rollout_return(rollout_return)
+        outputs = _attach_humanoid_transition_payloads(record.outputs, rollout_return)
+        reward_total = float(aggregated.get("humanoid_total_return", 0.0))
+        return EpisodeOutput(
+            scene_id=rollout_job.scene_id,
+            session_uuid=rollout_job.session_uuid,
+            num_steps=len(outputs),
+            policy_outputs=outputs,
+            metrics=EpisodeMetrics(aggregated=aggregated, dense=dense),
+            reward=RewardResult(total=reward_total, report_metrics=aggregated),
+        )
 
     def _on_rollout_succeeded(self, rollout_job: _RolloutJob, episode: EpisodeOutput) -> None:
         """Append the episode; resolve the future when `n_target` siblings land."""

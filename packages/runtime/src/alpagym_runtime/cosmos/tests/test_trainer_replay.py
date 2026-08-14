@@ -15,6 +15,7 @@ from alpagym_runtime.cosmos.replay_objective import (
     assert_replay_shapes,
     compute_kl_penalty,
     compute_ppo_surrogate,
+    compute_value_loss,
 )
 from alpagym_runtime.cosmos.rollout_filter import filter_trainable_rollouts
 from alpagym_runtime.replay import TrainerReplayData, TrainerReplayDataBatch, TrainingSignal
@@ -157,6 +158,102 @@ def test_train_minibatch_forwards_all_rows_including_padding(cosmos_stubs: None)
     assert torch.isfinite(torch.tensor(loss))
 
 
+def test_ppo_prepare_training_data_computes_gae_inside_trainer(
+    cosmos_stubs: None,
+) -> None:
+    """PPO ignores Cosmos rollout advantages and derives GAE from transition signals."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer.data_packer = _PpoPerStepPacker({"a": [(1.0, 0.0, False, False), (1.0, 0.0, True, False)]})
+    trainer._normalize_advantages = False
+    trainer._gamma = 1.0
+    trainer._gae_lambda = 1.0
+    rollouts = [
+        SimpleNamespace(prompt="a", completion="a", n_ignore_prefix_tokens=0, advantage=99.0)
+    ]
+
+    samples, advantages = trainer._prepare_training_data(rollouts)
+
+    assert len(samples) == 2
+    torch.testing.assert_close(advantages, torch.tensor([2.0, 1.0], dtype=torch.float32))
+    torch.testing.assert_close(
+        samples[0].training_signal.returns,
+        torch.tensor([2.0], dtype=torch.float32),
+    )
+    torch.testing.assert_close(
+        samples[1].training_signal.returns,
+        torch.tensor([1.0], dtype=torch.float32),
+    )
+
+
+def test_ppo_smoke_rl_training_step_with_mlp_actor_and_value_network(
+    cosmos_stubs: None,
+) -> None:
+    """Smoke one trainer-owned PPO update through MLP actor and value networks."""
+    del cosmos_stubs
+    torch.manual_seed(7)
+    model = _GaussianMlpActorCritic(obs_dim=3, action_dim=2, hidden_dim=16)
+    trainer = _trainer_for_ppo_replay_test(model)
+    trainer.data_packer = _PpoSmokePacker()
+    trainer._gamma = 1.0
+    trainer._gae_lambda = 1.0
+    trainer._normalize_advantages = False
+    trainer._value_loss_coef = 0.5
+    trainer.optimizers = torch.optim.SGD(trainer.model.parameters(), lr=0.05)
+    rollouts = [
+        SimpleNamespace(prompt="smoke", completion="smoke", n_ignore_prefix_tokens=0, advantage=0.0)
+    ]
+
+    samples, advantages = trainer._prepare_training_data(rollouts)
+    actor_before = _clone_parameters(model.actor)
+    value_before = _clone_parameters(model.value_net)
+    log_std_before = model.log_std.detach().clone()
+
+    loss, kl, ratio_max, ratio_min, clip_fraction, _grad_norm = trainer._train_minibatch(
+        minibatch_samples=samples,
+        minibatch_advantages=advantages,
+        inter_policy_nccl=object(),
+    )
+
+    assert len(samples) == 3
+    torch.testing.assert_close(advantages, torch.tensor([3.0, 2.0, 1.0], dtype=torch.float32))
+    torch.testing.assert_close(
+        torch.cat([sample.training_signal.returns for sample in samples]),
+        torch.tensor([3.0, 2.0, 1.0], dtype=torch.float32),
+    )
+    assert torch.isfinite(torch.tensor(loss))
+    assert kl == 0.0
+    assert ratio_max > 0.0
+    assert ratio_min > 0.0
+    assert clip_fraction >= 0.0
+    assert _parameters_changed(model.actor, actor_before) or not torch.equal(
+        model.log_std.detach(),
+        log_std_before,
+    )
+    assert _parameters_changed(model.value_net, value_before)
+
+
+def test_ppo_minibatch_trains_value_head(cosmos_stubs: None) -> None:
+    """The PPO trainer backprops value loss through model forward key ``values``."""
+    del cosmos_stubs
+    trainer = _trainer_for_ppo_replay_test(_ActorCriticValueModel())
+
+    loss, kl, ratio_max, ratio_min, clip_fraction, _grad_norm = trainer._train_minibatch(
+        minibatch_samples=[object(), object(), object(), object()],
+        minibatch_advantages=torch.zeros(4, dtype=torch.float32),
+        inter_policy_nccl=object(),
+    )
+
+    assert loss == pytest.approx(2.0)
+    assert kl == 0.0
+    assert ratio_max == 1.0
+    assert ratio_min == 1.0
+    assert clip_fraction == 0.0
+    assert trainer.model.value_bias.item() > 0.0
+    assert trainer.model.logprob_bias.item() == pytest.approx(0.0)
+
+
 # ---------------------------------------------------------------------------
 # Direct math-method tests: no fake model, no fake packer.
 # ---------------------------------------------------------------------------
@@ -217,6 +314,32 @@ def test_compute_ppo_surrogate_normalizes_over_valid_rows(cosmos_stubs: None) ->
         is_padding=torch.tensor([False, False, True, True]),
     )
     torch.testing.assert_close(loss_no_pad, loss_padded)
+
+
+def test_compute_value_loss_masks_padding(cosmos_stubs: None) -> None:
+    """Value loss normalizes over valid rows only."""
+    del cosmos_stubs
+    loss = compute_value_loss(
+        values=torch.tensor([1.0, 10.0, 3.0], dtype=torch.float32),
+        returns=torch.tensor([2.0, 0.0, 1.0], dtype=torch.float32),
+        is_padding=torch.tensor([False, True, False]),
+    )
+
+    assert float(loss.item()) == pytest.approx(1.25)
+
+
+def test_compute_value_loss_supports_ppo_clipping(cosmos_stubs: None) -> None:
+    """Clipped value loss uses the larger clipped/unclipped squared error."""
+    del cosmos_stubs
+    loss = compute_value_loss(
+        values=torch.tensor([2.0], dtype=torch.float32),
+        returns=torch.tensor([0.0], dtype=torch.float32),
+        is_padding=torch.tensor([False]),
+        old_values=torch.tensor([0.0], dtype=torch.float32),
+        value_clip_range=0.2,
+    )
+
+    assert float(loss.item()) == pytest.approx(2.0)
 
 
 def test_compute_kl_penalty_zero_when_disabled(cosmos_stubs: None) -> None:
@@ -794,3 +917,187 @@ class _PaddingCapturingPacker:
             rollout_ids=("rollout-a", "rollout-b", "rollout-c", "rollout-d"),
             weight_versions=torch.zeros(4, dtype=torch.int64),
         )
+
+
+def _trainer_for_ppo_replay_test(model: torch.nn.Module) -> Any:
+    """Build a minimal PPO trainer instance around a fake actor-critic model."""
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer.device = torch.device("cpu")
+    trainer._reference_model = None
+    trainer._grpo_ratio_clip_low = 0.2
+    trainer._grpo_ratio_clip_high = 0.2
+    trainer._kl_beta = 0.0
+    trainer._value_loss_coef = 1.0
+    trainer._value_clip_range = None
+    trainer.model = model
+    trainer.optimizers = torch.optim.SGD(trainer.model.parameters(), lr=0.1)
+    trainer.data_packer = _PpoSignalCapturingPacker()
+    trainer.all_reduce_states = MethodType(_step_without_distributed, trainer)
+    return trainer
+
+
+class _ActorCriticValueModel(torch.nn.Module):
+    """Tiny actor-critic surface returning log probabilities and values."""
+
+    def __init__(self) -> None:
+        """Create independent actor and critic scalars."""
+        super().__init__()
+        self.logprob_bias = torch.nn.Parameter(torch.tensor(0.0))
+        self.value_bias = torch.nn.Parameter(torch.tensor(0.0))
+
+    def forward(
+        self,
+        ego_history_xyz: torch.Tensor,
+        teacher_model: Any = None,
+    ) -> dict[str, torch.Tensor | None]:
+        """Return one actor logprob and one critic value per row."""
+        del teacher_model
+        rows = ego_history_xyz.shape[0]
+        return {
+            "log_probs": self.logprob_bias.expand(rows),
+            "values": self.value_bias.expand(rows),
+            "kl_div": None,
+        }
+
+
+class _PpoPerStepPacker:
+    """Packer returning configured raw-transition samples for flattening tests."""
+
+    def __init__(self, rows_by_prompt: dict[str, list[tuple[float, float, bool, bool]]]) -> None:
+        """Map prompt to ``(reward, old_value, terminated, is_padding)`` rows."""
+        self._rows_by_prompt = rows_by_prompt
+
+    def get_policy_input(
+        self,
+        prompt: str,
+        completion: str,
+        n_ignore_prefix_tokens: int = 0,
+    ) -> list[TrainerReplayData]:
+        """Return one raw-transition sample per configured step for ``prompt``."""
+        del completion, n_ignore_prefix_tokens
+        return [
+            TrainerReplayData(
+                model_inputs={"x": torch.zeros(1, dtype=torch.float32)},
+                training_signal=TrainingSignal(
+                    old_logprobs=torch.zeros(1, dtype=torch.float32),
+                    is_padding=torch.tensor([is_padding], dtype=torch.bool),
+                    rewards=torch.tensor([reward], dtype=torch.float32),
+                    terminateds=torch.tensor([terminated], dtype=torch.bool),
+                    old_values=torch.tensor([old_value], dtype=torch.float32),
+                ),
+                rollout_id=prompt,
+                weight_version=torch.zeros((), dtype=torch.int64),
+            )
+            for reward, old_value, terminated, is_padding in self._rows_by_prompt[prompt]
+        ]
+
+
+class _PpoSignalCapturingPacker:
+    """Tiny packer exposing the PPO trainer's expected collate method."""
+
+    def policy_collate_fn(self, samples: list[Any]) -> TrainerReplayDataBatch:
+        """Return a 4-row PPO batch with one padding row."""
+        del samples
+        return TrainerReplayDataBatch(
+            model_inputs={"ego_history_xyz": torch.arange(4, dtype=torch.float32).reshape(4, 1)},
+            training_signal=TrainingSignal(
+                old_logprobs=torch.zeros(4, dtype=torch.float32),
+                is_padding=torch.tensor([False, True, False, False]),
+                advantages=torch.zeros(4, dtype=torch.float32),
+                returns=torch.tensor([2.0, 0.0, 2.0, 2.0], dtype=torch.float32),
+                old_values=torch.zeros(4, dtype=torch.float32),
+            ),
+            rollout_ids=("rollout-a", "rollout-b", "rollout-c", "rollout-d"),
+            weight_versions=torch.zeros(4, dtype=torch.int64),
+        )
+
+
+class _GaussianMlpActorCritic(torch.nn.Module):
+    """Small continuous-control actor plus a parallel MLP value network."""
+
+    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int) -> None:
+        """Build actor and value MLPs with matching hidden width."""
+        super().__init__()
+        self.actor = torch.nn.Sequential(
+            torch.nn.Linear(obs_dim, hidden_dim),
+            torch.nn.Tanh(),
+            torch.nn.Linear(hidden_dim, action_dim),
+        )
+        self.value_net = torch.nn.Sequential(
+            torch.nn.Linear(obs_dim, hidden_dim),
+            torch.nn.Tanh(),
+            torch.nn.Linear(hidden_dim, 1),
+        )
+        self.log_std = torch.nn.Parameter(torch.full((action_dim,), -0.5))
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        actions: torch.Tensor,
+        return_log_prob: bool = True,
+        teacher_model: Any = None,
+    ) -> dict[str, torch.Tensor | None]:
+        """Score replay actions and predict values for PPO."""
+        del return_log_prob, teacher_model
+        mean = self.actor(features.float())
+        std = self.log_std.exp().expand_as(mean)
+        dist = torch.distributions.Normal(mean, std)
+        log_probs = dist.log_prob(actions.float()).sum(dim=-1)
+        values = self.value_net(features.float()).squeeze(-1)
+        return {"log_probs": log_probs, "values": values, "kl_div": None}
+
+
+class _PpoSmokePacker:
+    """Packer with one tiny rollout of raw transition replay rows."""
+
+    def get_policy_input(
+        self,
+        prompt: str,
+        completion: str,
+        n_ignore_prefix_tokens: int = 0,
+    ) -> list[TrainerReplayData]:
+        """Return one three-step terminal rollout for PPO smoke training."""
+        del prompt, completion, n_ignore_prefix_tokens
+        features = torch.tensor(
+            [[1.0, 0.0, 0.5], [0.5, 1.0, -0.25], [-0.5, 0.25, 1.0]],
+            dtype=torch.float32,
+        )
+        actions = torch.tensor(
+            [[0.5, -0.25], [0.25, 0.75], [-0.75, 0.5]],
+            dtype=torch.float32,
+        )
+        rewards = torch.ones(3, dtype=torch.float32)
+        terminateds = torch.tensor([False, False, True], dtype=torch.bool)
+        return [
+            TrainerReplayData(
+                model_inputs={"features": features[index], "actions": actions[index]},
+                training_signal=TrainingSignal(
+                    old_logprobs=torch.zeros(1, dtype=torch.float32),
+                    is_padding=torch.zeros(1, dtype=torch.bool),
+                    rewards=rewards[index].reshape(1),
+                    terminateds=terminateds[index].reshape(1),
+                    old_values=torch.zeros(1, dtype=torch.float32),
+                ),
+                rollout_id="smoke",
+                weight_version=torch.zeros((), dtype=torch.int64),
+            )
+            for index in range(3)
+        ]
+
+    def policy_collate_fn(self, samples: list[Any]) -> TrainerReplayDataBatch:
+        """Use the production replay-batch stacker."""
+        return TrainerReplayDataBatch.stack(samples)
+
+
+def _clone_parameters(module: torch.nn.Module) -> list[torch.Tensor]:
+    """Clone detached parameters for change detection."""
+    return [parameter.detach().clone() for parameter in module.parameters()]
+
+
+def _parameters_changed(module: torch.nn.Module, before: list[torch.Tensor]) -> bool:
+    """Return whether any parameter differs from its saved value."""
+    return any(
+        not torch.equal(parameter.detach(), old)
+        for parameter, old in zip(module.parameters(), before, strict=True)
+    )

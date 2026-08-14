@@ -102,6 +102,14 @@ def _build_cosmos_config(config: RunConfig) -> dict[str, Any]:
     logging = dict(cosmos["logging"])
     logging["log_interval"] = logging.pop("log_training_metrics_every_n_steps")
     train_policy = dict(train["train_policy"])
+    trainer_type = str(train_policy.pop("trainer_type", "alpagym_grpo"))
+    ppo_config = {
+        "value_loss_coef": train_policy.pop("ppo_value_loss_coef", 0.5),
+        "value_clip_range": train_policy.pop("ppo_value_clip_range", None),
+        "normalize_advantages": train_policy.pop("ppo_normalize_advantages", True),
+        "gamma": train_policy.pop("ppo_gamma", 0.99),
+        "gae_lambda": train_policy.pop("ppo_gae_lambda", 0.95),
+    }
     train_policy["epsilon_low"] = train_policy.pop("grpo_ratio_clip_low")
     train_policy["epsilon_high"] = train_policy.pop("grpo_ratio_clip_high")
     train_policy["mu_iterations"] = train_policy.pop("grpo_optimization_iterations")
@@ -113,11 +121,17 @@ def _build_cosmos_config(config: RunConfig) -> dict[str, Any]:
     train["train_policy"] = {
         # Cosmos uses GRPO to select the RL policy and rollout worker path.
         "type": "grpo",
-        "trainer_type": "alpagym_grpo",
+        "trainer_type": trainer_type,
         # Need to set this value, otherwise CosmosRL overwrites `type` with `sft`
         "use_remote_reward": False,
         **train_policy,
     }
+    custom_config: dict[str, Any] = {
+        "resolved_config_path": str(artifact_paths.resolved_config_path),
+    }
+    if trainer_type == "alpagym_ppo":
+        custom_config["ppo"] = ppo_config
+
     cosmos_config = {
         "mode": cosmos["mode"],
         "train": train,
@@ -130,9 +144,7 @@ def _build_cosmos_config(config: RunConfig) -> dict[str, Any]:
             **dict(cosmos["rollout"]),
         },
         "logging": logging,
-        "custom": {
-            "resolved_config_path": str(artifact_paths.resolved_config_path),
-        },
+        "custom": custom_config,
     }
     return cast(dict[str, Any], _drop_none_mapping_values(cosmos_config))
 

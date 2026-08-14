@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 from alpagym_runtime.alpasim.tests.test_proto_conversion import install_alpasim_grpc_stubs
 
 install_alpasim_grpc_stubs()
@@ -24,7 +25,8 @@ from alpagym_runtime.episode_runner.streaming_worker import (  # noqa: E402
     StreamingRolloutWorker,
     _RolloutJob,
 )
-from alpagym_runtime.types import EpisodeOutput, Trajectory  # noqa: E402
+from alpagym_runtime.replay import ActionSelection, PolicyReplayData  # noqa: E402
+from alpagym_runtime.types import EpisodeOutput, PolicyOutput, Trajectory  # noqa: E402
 
 
 def _payload(prompt_idx: int) -> SimpleNamespace:
@@ -124,6 +126,118 @@ def _drain_pool(worker: StreamingRolloutWorker) -> None:
     for rollout_worker in worker._rollout_workers:
         rollout_worker.join(timeout=5.0)
 
+
+
+def test_humanoid_worker_request_and_transition_payloads(tmp_path: Path) -> None:
+    """Humanoid rollouts use the humanoid endpoint and carry PPO transition facts."""
+
+    class _Servicer:
+        def __init__(self) -> None:
+            self.records: dict[str, object] = {}
+
+        def pop_session_record(self, session_uuid: str) -> object:
+            return self.records.pop(session_uuid)
+
+    class _HumanoidPolicyServer:
+        def __init__(self) -> None:
+            self.topology_endpoint = SimpleNamespace(host="policy-host", port=5057)
+            self.servicer = _Servicer()
+
+    del tmp_path
+    humanoid_policy_server = _HumanoidPolicyServer()
+    worker = StreamingRolloutWorker(
+        alpasim_runtime_stub=SimpleNamespace(),
+        driver_server=None,
+        humanoid_policy_server=humanoid_policy_server,
+        simulation_domain="humanoid",
+        simulation_timeout_s=10.0,
+        reward_config=SimpleNamespace(),
+        max_concurrent_rollouts=1,
+        rollouts_per_payload=1,
+        scene_id_resolver=_resolve_scene,
+    )
+    try:
+        rollout_job = _RolloutJob(
+            shared_payload_state=SharedPayloadState(
+                payload=_payload(0),
+                n_target=1,
+                future=Future(),
+                retries_left=0,
+            ),
+            session_uuid="humanoid-session",
+            scene_id="stairs-scene",
+        )
+        request = worker._build_simulation_request(rollout_job)
+        assert len(request.available_drivers) == 0
+        assert request.available_humanoid_policies[0].ip == "policy-host"
+        assert request.available_humanoid_policies[0].port == 5057
+        assert list(request.rollout_specs[0].session_uuids) == ["humanoid-session"]
+
+        replay_data = PolicyReplayData(
+            replay_schema_version=1,
+            payload_schema="test.g1",
+            payload_schema_version=1,
+            model_family="g1",
+            action_selection=ActionSelection(set_ix=0, sample_ix=0),
+            old_logprob=torch.tensor(-0.25),
+            payload={"observation": {"x": torch.zeros(1)}, "action": torch.zeros(23)},
+        )
+        humanoid_policy_server.servicer.records["humanoid-session"] = SimpleNamespace(
+            outputs=(
+                PolicyOutput(
+                    chosen_xyz=torch.zeros(1, 23),
+                    chosen_quat=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+                    chosen_dt_us=torch.zeros(1, dtype=torch.int64),
+                    chosen_logprob=torch.tensor(-0.25),
+                    replay_data=replay_data,
+                    model_extra={
+                        "humanoid_env_id": 2,
+                        "humanoid_step_index": 1,
+                        "humanoid_value": 0.75,
+                    },
+                ),
+            )
+        )
+        rollout_return = SimpleNamespace(
+            aggregated_metrics={"humanoid_total_return": 3.0, "humanoid_return_env2": 3.0},
+            timestep_metrics=[
+                SimpleNamespace(
+                    name="humanoid_reward_env2",
+                    timestamps_us=[100, 200],
+                    values=[1.0, 2.0],
+                    valid=[True, True],
+                ),
+                SimpleNamespace(
+                    name="humanoid_terminated_env2",
+                    timestamps_us=[100, 200],
+                    values=[0.0, 1.0],
+                    valid=[True, True],
+                ),
+                SimpleNamespace(
+                    name="humanoid_truncated_env2",
+                    timestamps_us=[100, 200],
+                    values=[0.0, 0.0],
+                    valid=[True, True],
+                ),
+            ],
+        )
+
+        episode = worker._build_humanoid_episode(rollout_job, rollout_return)
+
+        assert episode.reward is not None
+        assert episode.reward.total == pytest.approx(3.0)
+        assert episode.metrics is not None
+        assert episode.metrics.dense["humanoid_reward_env2"]["values"] == [1.0, 2.0]
+        transition = episode.policy_outputs[0].replay_data.payload["transition"]
+        assert transition == {
+            "reward": 2.0,
+            "terminated": True,
+            "truncated": False,
+            "old_value": 0.75,
+            "bootstrap_value": 0.0,
+        }
+    finally:
+        worker.shutdown()
 
 # ---------- 1. Slot budget respected ----------
 

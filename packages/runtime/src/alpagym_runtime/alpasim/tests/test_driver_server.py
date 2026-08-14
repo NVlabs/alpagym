@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,6 +16,10 @@ from alpagym_runtime.alpasim.driver_server import (  # noqa: E402
     EgodriverServer,
     SessionRecord,
     _Session,
+)
+from alpagym_runtime.alpasim.humanoid_policy_server import (  # noqa: E402
+    HumanoidPolicyGrpcServicer,
+    ZeroHumanoidPolicy,
 )
 from alpagym_runtime.types import (  # noqa: E402
     EgoPose,
@@ -461,6 +466,59 @@ def _policy_output(value: float) -> PolicyOutput:
         chosen_quat=torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
         chosen_dt_us=torch.tensor([0, 100], dtype=torch.int64),
     )
+
+
+def test_humanoid_policy_server_saves_camera_images_from_policy_options(
+    tmp_path: Path,
+) -> None:
+    servicer = HumanoidPolicyGrpcServicer(
+        policy_factory=lambda session_uuid, request: ZeroHumanoidPolicy(
+            int(request.action_size)
+        )
+    )
+    servicer.start_session(
+        SimpleNamespace(
+            session_uuid="session/1",
+            action_size=1,
+            policy_options={"save_camera_dir": str(tmp_path)},
+        ),
+        context=None,
+    )
+
+    response = servicer.act(
+        SimpleNamespace(
+            session_uuid="session/1",
+            observation=SimpleNamespace(
+                env_states=[
+                    SimpleNamespace(
+                        env_id=0,
+                        timestamp_us=20_000,
+                        qpos=[],
+                        qvel=[],
+                        observation=[0.0],
+                        scalars={},
+                    )
+                ],
+                camera_images=[
+                    SimpleNamespace(
+                        frame_start_us=20_000,
+                        frame_end_us=40_000,
+                        env_id=0,
+                        logical_id="front/camera",
+                        image_bytes=b"\xff\xd8fake-jpeg",
+                    )
+                ],
+            ),
+        ),
+        context=None,
+    )
+
+    assert len(response.actions) == 1
+    saved = list((tmp_path / "session_1").glob("*.jpg"))
+    assert [path.name for path in saved] == [
+        "frame_000000020000_env000_00_front_camera.jpg"
+    ]
+    assert saved[0].read_bytes() == b"\xff\xd8fake-jpeg"
 
 
 def test_session_record_step_appends_outputs_and_dedupes_executed_poses() -> None:

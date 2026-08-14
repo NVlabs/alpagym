@@ -63,15 +63,27 @@ class PolicyReplayData:
 
 @dataclass(frozen=True)
 class TrainingSignal:
-    """Row-aligned trainer signal carrying rollout-time old logprobs.
+    """Row-aligned trainer signal carrying rollout-time training terms.
 
     Shape notes:
         ``old_logprobs`` is ``[BT]`` trajectory-level rollout-policy logprob.
         ``is_padding`` is ``[BT]`` and masks packer-added rows.
+        Transition fields are optional ``[BT]`` tensors used by actor-critic
+        trainers. ``rewards`` and terminal flags are rollout facts; ``old_values``
+        and ``bootstrap_values`` are rollout-policy value estimates.
+        ``advantages`` and ``returns`` are trainer-derived and are never required
+        in rollout replay payloads.
     """
 
     old_logprobs: torch.Tensor
     is_padding: torch.Tensor
+    advantages: torch.Tensor | None = None
+    returns: torch.Tensor | None = None
+    rewards: torch.Tensor | None = None
+    terminateds: torch.Tensor | None = None
+    truncateds: torch.Tensor | None = None
+    old_values: torch.Tensor | None = None
+    bootstrap_values: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         """Require aligned flattened trainer rows."""
@@ -93,6 +105,21 @@ class TrainingSignal:
             raise ValueError(
                 f"TrainingSignal is_padding dtype must be bool, got {self.is_padding.dtype}"
             )
+        for field_name in (
+            "advantages",
+            "returns",
+            "rewards",
+            "old_values",
+            "bootstrap_values",
+        ):
+            _validate_optional_signal_tensor(field_name, getattr(self, field_name), expected)
+        for field_name in ("terminateds", "truncateds"):
+            tensor = getattr(self, field_name)
+            _validate_optional_signal_tensor(field_name, tensor, expected)
+            if tensor is not None and tensor.dtype != torch.bool:
+                raise ValueError(
+                    f"TrainingSignal {field_name} dtype must be bool, got {tensor.dtype}"
+                )
 
 
 @dataclass(frozen=True)
@@ -154,7 +181,17 @@ class TrainerReplayDataBatch:
         }
         return cls(
             model_inputs=model_inputs,
-            training_signal=TrainingSignal(old_logprobs=old_logprobs, is_padding=is_padding),
+            training_signal=TrainingSignal(
+                old_logprobs=old_logprobs,
+                is_padding=is_padding,
+                advantages=_cat_optional_signal(samples, "advantages"),
+                returns=_cat_optional_signal(samples, "returns"),
+                rewards=_cat_optional_signal(samples, "rewards"),
+                terminateds=_cat_optional_signal(samples, "terminateds"),
+                truncateds=_cat_optional_signal(samples, "truncateds"),
+                old_values=_cat_optional_signal(samples, "old_values"),
+                bootstrap_values=_cat_optional_signal(samples, "bootstrap_values"),
+            ),
             rollout_ids=tuple(sample.rollout_id for sample in samples),
             weight_versions=torch.stack(
                 [sample.weight_version.to(dtype=torch.int64).reshape(()) for sample in samples],
@@ -216,6 +253,38 @@ def parse_policy_replay_data(raw: Mapping[str, Any]) -> PolicyReplayData:
         old_logprob=old_logprob,
         payload=dict(payload),
     )
+
+
+def _validate_optional_signal_tensor(
+    field_name: str,
+    tensor: torch.Tensor | None,
+    expected: int,
+) -> None:
+    """Validate one optional flattened trainer signal."""
+    if tensor is None:
+        return
+    if tensor.ndim != 1:
+        raise ValueError(
+            f"TrainingSignal {field_name} must be [BT], got {tuple(tensor.shape)}"
+        )
+    if tensor.shape[0] != expected:
+        raise ValueError(
+            f"TrainingSignal {field_name} length {tensor.shape[0]} "
+            f"!= old_logprobs length {expected}"
+        )
+
+
+def _cat_optional_signal(
+    samples: list[TrainerReplayData],
+    field_name: str,
+) -> torch.Tensor | None:
+    """Concatenate an optional signal field, rejecting mixed presence."""
+    values = [getattr(sample.training_signal, field_name) for sample in samples]
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise ValueError(f"TrainingSignal {field_name} mixes present and missing rows")
+    return torch.cat(values, dim=0)
 
 
 def require_payload_keys(

@@ -257,6 +257,52 @@ def test_entrypoint_configures_logging_from_resolved_config_yaml(
     assert basic_config_calls[0]["level"] == logging.DEBUG
 
 
+def test_entrypoint_installs_policy_bundle_tokenizer_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cosmos_stubs: None,
+) -> None:
+    """Policy bundles can replace Cosmos AutoTokenizer setup before controller startup."""
+    del cosmos_stubs
+    entrypoint_module = importlib.import_module("alpagym_runtime.cosmos.entrypoint")
+    resolved_config_path = _write_resolved_config(
+        tmp_path,
+        scene_ids=["hq_stairs"],
+        policy_overrides={"model": {"kind": "g1_mjlab"}},
+        max_concurrent_rollouts=1,
+        simulation_timeout_s=30.0,
+        experiment_name="bundle_tokenizer",
+    )
+    cosmos_config_path = tmp_path / "cosmos_config.toml"
+    cosmos_config_path.write_text(
+        f"[custom]\nresolved_config_path = {json.dumps(str(resolved_config_path))}\n",
+        encoding="utf-8",
+    )
+    from cosmos_rl.policy.trainer.llm_trainer import grpo_trainer
+    from cosmos_rl.utils import util as cosmos_util
+
+    fallback_tokenizer = object()
+    bundle_tokenizer = object()
+    calls: list[str] = []
+    monkeypatch.setattr(cosmos_util, "setup_tokenizer", lambda path: fallback_tokenizer)
+    monkeypatch.setattr(
+        entrypoint_module,
+        "get_policy_bundle",
+        lambda model_kind: SimpleNamespace(
+            install_runtime_bridge=lambda: calls.append("bridge"),
+            setup_tokenizer=lambda config: bundle_tokenizer,
+            build_data_packer=lambda config, cosmos_role: SimpleNamespace(close=lambda: None),
+        ),
+    )
+    monkeypatch.setattr(entrypoint_module, "launch_worker", lambda **kwargs: None)
+
+    entrypoint_module.main(["--config", str(cosmos_config_path)])
+
+    assert calls == ["bridge"]
+    assert cosmos_util.setup_tokenizer("unused") is bundle_tokenizer
+    assert grpo_trainer.setup_tokenizer("unused") is bundle_tokenizer
+
+
 def test_entrypoint_dataset_uses_discovered_runtime_scenes(
     tmp_path: Path,
     cosmos_stubs: None,

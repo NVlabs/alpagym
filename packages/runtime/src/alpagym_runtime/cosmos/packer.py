@@ -15,8 +15,9 @@ calls the per-role hook, so the role is implied by which hook runs:
 
 ``get_policy_input`` rejects artifacts that exceed the fixed ``T_pack`` row
 budget, pads shorter rollouts, and emits the rollout-time old logprobs the
-trainer needs to recompute the policy ratio. Advantage broadcast happens inside
-the trainer, not here.
+trainer needs to recompute the policy ratio. When a replay payload carries a
+``payload["transition"]`` block, the packer also emits environment rewards,
+terminal flags, and rollout-time value estimates for trainer-side GAE.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import logging
 import os
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 import redis
 import torch
@@ -52,6 +53,17 @@ if TYPE_CHECKING:
     from alpagym_runtime.transport.nccl.receiver import NcclReceiver
 
 logger = logging.getLogger(__name__)
+
+_TRANSITION_PAYLOAD_KEY = "transition"
+_FLOAT_TRANSITION_SIGNAL_ALIASES = {
+    "rewards": ("reward", "rewards"),
+    "old_values": ("old_value", "value", "old_values"),
+    "bootstrap_values": ("bootstrap_value", "bootstrap_values"),
+}
+_BOOL_TRANSITION_SIGNAL_ALIASES = {
+    "terminateds": ("terminated", "terminateds"),
+    "truncateds": ("truncated", "truncateds"),
+}
 
 
 class AlpagymDataPacker(DataPacker):
@@ -208,6 +220,7 @@ class AlpagymDataPacker(DataPacker):
                     training_signal=TrainingSignal(
                         old_logprobs=old_logprob.reshape(1).to(dtype=torch.float32),
                         is_padding=torch.zeros(1, dtype=torch.bool),
+                        **_extract_transition_training_signal(replay_data),
                     ),
                     rollout_id=episode.session_uuid,
                     weight_version=torch.zeros((), dtype=torch.int64),
@@ -232,6 +245,7 @@ class AlpagymDataPacker(DataPacker):
                     training_signal=TrainingSignal(
                         old_logprobs=torch.zeros(1, dtype=torch.float32),
                         is_padding=torch.ones(1, dtype=torch.bool),
+                        **_zero_padding_transition_signal(step_samples[0].training_signal),
                     ),
                     rollout_id=episode.session_uuid,
                     weight_version=torch.zeros((), dtype=torch.int64),
@@ -275,6 +289,48 @@ class AlpagymDataPacker(DataPacker):
             int(batch.training_signal.is_padding.sum().item()),
         )
         return batch
+
+
+def _extract_transition_training_signal(replay_data: PolicyReplayData) -> dict[str, torch.Tensor]:
+    """Extract optional scalar transition facts from one replay payload.
+
+    Policy bundles own the observation/action dialect in ``payload``. This
+    runtime-level convention carries rollout facts needed by actor-critic
+    trainers; algorithm-derived PPO advantages and returns are computed later by
+    ``AlpagymPPOTrainer``.
+    """
+    transition_payload = replay_data.payload.get(_TRANSITION_PAYLOAD_KEY)
+    if transition_payload is None:
+        return {}
+    if not isinstance(transition_payload, Mapping):
+        raise TypeError("PolicyReplayData payload['transition'] must be a mapping")
+
+    signals: dict[str, torch.Tensor] = {}
+    for field_name, aliases in _FLOAT_TRANSITION_SIGNAL_ALIASES.items():
+        for alias in aliases:
+            if alias in transition_payload:
+                value = transition_payload[alias]
+                if value is not None:
+                    signals[field_name] = torch.as_tensor(value, dtype=torch.float32).reshape(1)
+                break
+    for field_name, aliases in _BOOL_TRANSITION_SIGNAL_ALIASES.items():
+        for alias in aliases:
+            if alias in transition_payload:
+                value = transition_payload[alias]
+                if value is not None:
+                    signals[field_name] = torch.as_tensor(value, dtype=torch.bool).reshape(1)
+                break
+    return signals
+
+
+def _zero_padding_transition_signal(template: TrainingSignal) -> dict[str, torch.Tensor]:
+    """Return neutral transition signals for a padding row when transition data is active."""
+    signals: dict[str, torch.Tensor] = {}
+    for field_name in (*_FLOAT_TRANSITION_SIGNAL_ALIASES, *_BOOL_TRANSITION_SIGNAL_ALIASES):
+        value = getattr(template, field_name)
+        if value is not None:
+            signals[field_name] = torch.zeros_like(value)
+    return signals
 
 
 def build_alpagym_data_packer(

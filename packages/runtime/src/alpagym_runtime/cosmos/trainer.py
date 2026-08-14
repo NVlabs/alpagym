@@ -12,6 +12,7 @@ policy kind string. The cosmos entrypoint dispatches the data packer the same wa
 import copy
 import logging
 import os
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -26,6 +27,7 @@ from alpagym_runtime.cosmos.replay_objective import (
     assert_replay_shapes,
     compute_kl_penalty,
     compute_ppo_surrogate,
+    compute_value_loss,
 )
 from alpagym_runtime.cosmos.rollout_filter import filter_trainable_rollouts
 from alpagym_runtime.perf.instrument.lifecycle import initialize_perf
@@ -626,3 +628,308 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         self._reference_model = copy.deepcopy(self.model).eval()
         for param in self._reference_model.parameters():
             param.requires_grad_(False)
+
+
+def _custom_config_section(config: _cosmos_config.Config, key: str) -> dict[str, Any]:
+    """Return one mapping from Cosmos ``config.custom`` without assuming its concrete type."""
+    custom = getattr(config, "custom", None) or {}
+    section = custom.get(key, {}) if hasattr(custom, "get") else {}
+    return dict(section) if isinstance(section, dict) else {}
+
+
+def _require_ppo_signal(tensor: torch.Tensor | None, field_name: str) -> torch.Tensor:
+    """Return a required PPO training-signal tensor or raise a targeted error."""
+    if tensor is None:
+        raise ValueError(f"PPO trainer requires TrainingSignal.{field_name}")
+    return tensor
+
+
+def _with_ppo_targets(sample: Any, *, advantage: float, ret: float) -> Any:
+    """Attach trainer-computed PPO targets to one replay sample."""
+    signal = sample.training_signal
+    return replace(
+        sample,
+        training_signal=replace(
+            signal,
+            advantages=torch.tensor([advantage], dtype=torch.float32),
+            returns=torch.tensor([ret], dtype=torch.float32),
+        ),
+    )
+
+
+def _replace_advantages(
+    samples: list[Any],
+    advantages: torch.Tensor,
+    per_rollout_ranges: list[tuple[int, int]],
+) -> list[Any]:
+    """Mirror normalized advantages into each sample's internal training signal."""
+    del per_rollout_ranges
+    return [
+        _with_ppo_targets(
+            sample,
+            advantage=float(advantages[index].item()),
+            ret=float(_require_ppo_signal(sample.training_signal.returns, "returns").item()),
+        )
+        for index, sample in enumerate(samples)
+    ]
+
+
+@_trainer_base.TrainerRegistry.register(trainer_type="alpagym_ppo")
+class AlpagymPPOTrainer(AlpagymGRPOTrainer):
+    """Actor-critic PPO trainer over AlpaGym replay payloads.
+
+    This trainer keeps the AlpaGym rollout transport exactly the same as GRPO:
+    completed rollouts still arrive as ``EpisodeOutput`` artifacts and each
+    ``PolicyOutput.replay_data`` still owns the per-step model replay payload.
+    The difference is the training signal source: PPO computes per-step
+    ``advantages`` and ``returns`` inside the trainer from replayed transition
+    rewards, terminal flags, and rollout-time values, then trains a value head
+    from model forward key ``values``.
+    """
+
+    def __init__(
+        self,
+        config: _cosmos_config.Config,
+        parallel_dims: _parallelism.ParallelDims,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize PPO-specific hyperparameters after the shared GRPO setup."""
+        super().__init__(config=config, parallel_dims=parallel_dims, **kwargs)
+        ppo_config = _custom_config_section(config, "ppo")
+        self._value_loss_coef = float(ppo_config.get("value_loss_coef", 0.5))
+        if self._value_loss_coef < 0.0:
+            raise ValueError(f"PPO value_loss_coef must be non-negative, got {self._value_loss_coef}")
+        value_clip_range = ppo_config.get("value_clip_range")
+        self._value_clip_range = None if value_clip_range is None else float(value_clip_range)
+        if self._value_clip_range is not None and self._value_clip_range <= 0.0:
+            raise ValueError(
+                f"PPO value_clip_range must be positive when set, got {self._value_clip_range}"
+            )
+        self._normalize_advantages = bool(ppo_config.get("normalize_advantages", True))
+        self._gamma = float(ppo_config.get("gamma", 0.99))
+        self._gae_lambda = float(ppo_config.get("gae_lambda", 0.95))
+        if not 0.0 <= self._gamma <= 1.0:
+            raise ValueError(f"PPO gamma must be in [0, 1], got {self._gamma}")
+        if not 0.0 <= self._gae_lambda <= 1.0:
+            raise ValueError(f"PPO gae_lambda must be in [0, 1], got {self._gae_lambda}")
+
+    def _prepare_training_data(
+        self,
+        rollouts: list[_rollout_schema.Rollout],
+    ) -> tuple[list[Any], torch.Tensor]:
+        """Flatten rollouts and compute PPO advantages/returns inside the trainer."""
+        samples: list[Any] = []
+        advantages: list[float] = []
+        padding: list[bool] = []
+        per_rollout_ranges: list[tuple[int, int]] = []
+        for rollout in rollouts:
+            start = len(samples)
+            step_samples = self.data_packer.get_policy_input(
+                rollout.prompt,
+                rollout.completion,
+                n_ignore_prefix_tokens=rollout.n_ignore_prefix_tokens,
+            )
+            rollout_advantages, rollout_returns = self._compute_gae(step_samples)
+            for step, advantage, ret in zip(step_samples, rollout_advantages, rollout_returns):
+                is_padding = bool(step.training_signal.is_padding.item())
+                samples.append(_with_ppo_targets(step, advantage=advantage, ret=ret))
+                advantages.append(0.0 if is_padding else advantage)
+                padding.append(is_padding)
+            per_rollout_ranges.append((start, len(samples)))
+
+        advantage_tensor = torch.tensor(advantages, dtype=torch.float32)
+        if self._normalize_advantages and advantage_tensor.numel() > 0:
+            valid_mask = ~torch.tensor(padding, dtype=torch.bool)
+            if int(valid_mask.sum().item()) > 1:
+                valid_advantages = advantage_tensor[valid_mask]
+                std = valid_advantages.std(unbiased=False)
+                if float(std.item()) > 0.0:
+                    advantage_tensor[valid_mask] = (
+                        valid_advantages - valid_advantages.mean()
+                    ) / (std + 1.0e-8)
+            advantage_tensor[~valid_mask] = 0.0
+            samples = _replace_advantages(samples, advantage_tensor, per_rollout_ranges)
+        return samples, advantage_tensor
+
+    def _compute_gae(self, step_samples: list[Any]) -> tuple[list[float], list[float]]:
+        """Compute per-step GAE/returns from raw transition signals for one rollout."""
+        rewards: list[float] = []
+        terminateds: list[bool] = []
+        values: list[float] = []
+        valid_indices: list[int] = []
+        bootstrap_value = 0.0
+        for index, step in enumerate(step_samples):
+            signal = step.training_signal
+            if bool(signal.is_padding.item()):
+                continue
+            reward = _require_ppo_signal(signal.rewards, "rewards")
+            terminated = _require_ppo_signal(signal.terminateds, "terminateds")
+            value = _require_ppo_signal(signal.old_values, "old_values")
+            if signal.bootstrap_values is not None:
+                bootstrap_value = float(signal.bootstrap_values.item())
+            rewards.append(float(reward.item()))
+            terminateds.append(bool(terminated.item()))
+            values.append(float(value.item()))
+            valid_indices.append(index)
+
+        advantages = [0.0 for _ in step_samples]
+        returns = [0.0 for _ in step_samples]
+        last_gae = 0.0
+        for valid_pos in reversed(range(len(valid_indices))):
+            sample_index = valid_indices[valid_pos]
+            next_value = bootstrap_value if valid_pos == len(valid_indices) - 1 else values[valid_pos + 1]
+            nonterminal = 0.0 if terminateds[valid_pos] else 1.0
+            delta = rewards[valid_pos] + self._gamma * next_value * nonterminal - values[valid_pos]
+            last_gae = delta + self._gamma * self._gae_lambda * nonterminal * last_gae
+            advantages[sample_index] = float(last_gae)
+            returns[sample_index] = float(last_gae + values[valid_pos])
+        return advantages, returns
+
+    def _train_minibatch(
+        self,
+        minibatch_samples: list[Any],
+        minibatch_advantages: torch.Tensor,
+        inter_policy_nccl: dist_util.HighAvailabilitylNccl,
+    ) -> tuple[float, float, float, float, float, float]:
+        """Train actor and value head on one step-level PPO minibatch."""
+        minibatch = self.data_packer.policy_collate_fn(minibatch_samples)
+        signal = minibatch.training_signal
+        is_padding = signal.is_padding.to(self.device)
+        old_logprobs = signal.old_logprobs.to(self.device)
+        advantages = minibatch_advantages.to(device=self.device, dtype=torch.float32)
+        returns = _require_ppo_signal(signal.returns, "returns").to(self.device)
+        old_values_tensor = signal.old_values
+        old_values = None if old_values_tensor is None else old_values_tensor.to(self.device)
+        if self._value_clip_range is not None and old_values is None:
+            raise ValueError("PPO value clipping requires TrainingSignal.old_values")
+
+        new_logprobs, kl_div, values = self._forward_with_reference_and_value(minibatch.model_inputs)
+        assert_replay_shapes(
+            new_logprobs,
+            old_logprobs,
+            advantages,
+            kl_div,
+            values=values,
+            returns=returns,
+            old_values=old_values,
+        )
+        policy_loss, ratio = compute_ppo_surrogate(
+            new_logprobs,
+            old_logprobs,
+            advantages,
+            ratio_clip_low=self._grpo_ratio_clip_low,
+            ratio_clip_high=self._grpo_ratio_clip_high,
+            is_padding=is_padding,
+        )
+        kl_loss = compute_kl_penalty(
+            kl_div,
+            is_padding,
+            kl_beta=self._kl_beta,
+            device=self.device,
+        )
+        value_loss = compute_value_loss(
+            values,
+            returns,
+            is_padding,
+            old_values=old_values,
+            value_clip_range=self._value_clip_range,
+        )
+        loss = policy_loss + kl_loss + self._value_loss_coef * value_loss
+
+        self.optimizers.zero_grad()
+        loss.backward()
+        grad_norm = self.all_reduce_states(inter_policy_nccl)
+
+        return self._ppo_minibatch_metrics(
+            loss=loss,
+            policy_loss=policy_loss,
+            value_loss=value_loss,
+            kl_loss=kl_loss,
+            ratio=ratio,
+            is_padding=is_padding,
+            advantages=advantages,
+            returns=returns,
+            values=values,
+            old_logprobs=old_logprobs,
+            new_logprobs=new_logprobs,
+            grad_norm=grad_norm,
+        )
+
+    def _forward_with_reference_and_value(
+        self,
+        model_inputs: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """Run actor-critic forward with optional reference model for KL."""
+        forward_kwargs = to_device_recursive(model_inputs, self.device)
+        if self._reference_model is not None:
+            forward_kwargs["teacher_model"] = self._reference_model
+        result = self.model(**forward_kwargs)
+        return result["log_probs"], result.get("kl_div"), result["values"].reshape(-1)
+
+    def _ppo_minibatch_metrics(
+        self,
+        loss: torch.Tensor,
+        policy_loss: torch.Tensor,
+        value_loss: torch.Tensor,
+        kl_loss: torch.Tensor,
+        ratio: torch.Tensor,
+        is_padding: torch.Tensor,
+        advantages: torch.Tensor,
+        returns: torch.Tensor,
+        values: torch.Tensor,
+        old_logprobs: torch.Tensor,
+        new_logprobs: torch.Tensor,
+        grad_norm: float,
+    ) -> tuple[float, float, float, float, float, float]:
+        """Compute PPO diagnostics over valid rows and return trainer-loop metrics."""
+        valid_mask = ~is_padding
+        loss_value = float(loss.item())
+        with torch.no_grad():
+            valid_ratio = ratio[valid_mask]
+            if valid_ratio.numel() == 0:
+                clip_fraction = 0.0
+                batch_ratio_max = 1.0
+                batch_ratio_min = 1.0
+                advantage_mean = 0.0
+                return_mean = 0.0
+                value_mean = 0.0
+            else:
+                clipped = (valid_ratio < 1.0 - self._grpo_ratio_clip_low) | (
+                    valid_ratio > 1.0 + self._grpo_ratio_clip_high
+                )
+                clip_fraction = float(clipped.float().mean().item())
+                batch_ratio_max = float(valid_ratio.max().item())
+                batch_ratio_min = float(valid_ratio.min().item())
+                advantage_mean = float(advantages[valid_mask].mean().item())
+                return_mean = float(returns[valid_mask].mean().item())
+                value_mean = float(values[valid_mask].mean().item())
+        logger.info(
+            "AlpaGym PPO minibatch rows=%d valid_rows=%d loss=%.6f "
+            "policy_loss=%.6f value_loss=%.6f kl_loss=%.6f ratio_min=%.6f "
+            "ratio_max=%.6f clip_fraction=%.6f advantage_mean=%.6f "
+            "return_mean=%.6f value_mean=%.6f old_logprob_mean=%.6f "
+            "new_logprob_mean=%.6f grad_norm=%.6f",
+            int(old_logprobs.numel()),
+            int(valid_mask.sum().item()),
+            loss_value,
+            float(policy_loss.item()),
+            float(value_loss.item()),
+            float(kl_loss.item()),
+            batch_ratio_min,
+            batch_ratio_max,
+            clip_fraction,
+            advantage_mean,
+            return_mean,
+            value_mean,
+            float(old_logprobs.mean().item()),
+            float(new_logprobs.mean().item()),
+            grad_norm,
+        )
+        return (
+            loss_value,
+            float(kl_loss.item()),
+            batch_ratio_max,
+            batch_ratio_min,
+            clip_fraction,
+            grad_norm,
+        )
