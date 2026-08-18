@@ -1,0 +1,13 @@
+# @package _global_
+
+defaults:
+  - g1_mjlab_hq_stairs_local_1gpu_smoke
+  - _self_
+
+# One complete 15-second MJLab episode at the 50 Hz policy rate.
+expected_valid_steps: 750
+
+alpasim:
+  wizard_args:
+    n_sim_steps: 750
+

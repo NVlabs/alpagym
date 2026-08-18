@@ -170,7 +170,13 @@ def test_ppo_prepare_training_data_computes_gae_inside_trainer(
     trainer._gamma = 1.0
     trainer._gae_lambda = 1.0
     rollouts = [
-        SimpleNamespace(prompt="a", completion="a", n_ignore_prefix_tokens=0, advantage=99.0)
+        SimpleNamespace(
+            prompt="a",
+            completion="a",
+            n_ignore_prefix_tokens=0,
+            advantage=99.0,
+            weight_version=0,
+        )
     ]
 
     samples, advantages = trainer._prepare_training_data(rollouts)
@@ -185,6 +191,78 @@ def test_ppo_prepare_training_data_computes_gae_inside_trainer(
         samples[1].training_signal.returns,
         torch.tensor([1.0], dtype=torch.float32),
     )
+
+
+def test_ppo_rejects_behavior_version_mismatch(cosmos_stubs: None) -> None:
+    """The Cosmos envelope and every real/padded replay row must agree."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer.data_packer = _PpoPerStepPacker(
+        {"a": [(1.0, 0.0, True, False)]}
+    )
+    trainer._normalize_advantages = False
+    trainer._gamma = 1.0
+    trainer._gae_lambda = 1.0
+    with pytest.raises(ValueError, match="behavior version"):
+        trainer._prepare_training_data(
+            [
+                SimpleNamespace(
+                    prompt="a",
+                    completion="a",
+                    n_ignore_prefix_tokens=0,
+                    weight_version=1,
+                )
+            ]
+        )
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    ((None, 3), (64, 64)),
+)
+def test_ppo_transition_minibatch_is_independent_from_cosmos_rollout_batch(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: int | None,
+    expected: int,
+) -> None:
+    """A 750-row replay can use bounded updates without changing shard geometry."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+
+    def initialize_base(trainer: Any, **kwargs: Any) -> None:
+        del kwargs
+        trainer._mini_batch = 3
+
+    monkeypatch.setattr(trainer_module.AlpagymGRPOTrainer, "__init__", initialize_base)
+    ppo: dict[str, object] = {}
+    if configured is not None:
+        ppo["step_mini_batch"] = configured
+    trainer = trainer_module.AlpagymPPOTrainer(
+        config=SimpleNamespace(custom={"ppo": ppo}),
+        parallel_dims=object(),
+    )
+    assert trainer._mini_batch == expected
+
+
+@pytest.mark.parametrize("configured", (0, -1, True, 1.5, "64"))
+def test_ppo_transition_minibatch_must_be_a_positive_integer(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: object,
+) -> None:
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+
+    def initialize_base(trainer: Any, **kwargs: Any) -> None:
+        del kwargs
+        trainer._mini_batch = 1
+
+    monkeypatch.setattr(trainer_module.AlpagymGRPOTrainer, "__init__", initialize_base)
+    with pytest.raises(ValueError, match="step_mini_batch must be a positive integer"):
+        trainer_module.AlpagymPPOTrainer(
+            config=SimpleNamespace(custom={"ppo": {"step_mini_batch": configured}}),
+            parallel_dims=object(),
+        )
 
 
 def test_ppo_smoke_rl_training_step_with_mlp_actor_and_value_network(
@@ -202,7 +280,13 @@ def test_ppo_smoke_rl_training_step_with_mlp_actor_and_value_network(
     trainer._value_loss_coef = 0.5
     trainer.optimizers = torch.optim.SGD(trainer.model.parameters(), lr=0.05)
     rollouts = [
-        SimpleNamespace(prompt="smoke", completion="smoke", n_ignore_prefix_tokens=0, advantage=0.0)
+        SimpleNamespace(
+            prompt="smoke",
+            completion="smoke",
+            n_ignore_prefix_tokens=0,
+            advantage=0.0,
+            weight_version=0,
+        )
     ]
 
     samples, advantages = trainer._prepare_training_data(rollouts)

@@ -110,6 +110,9 @@ def _build_cosmos_config(config: RunConfig) -> dict[str, Any]:
         "gamma": train_policy.pop("ppo_gamma", 0.99),
         "gae_lambda": train_policy.pop("ppo_gae_lambda", 0.95),
     }
+    step_mini_batch = train_policy.pop("step_mini_batch", None)
+    if step_mini_batch is not None:
+        ppo_config["step_mini_batch"] = step_mini_batch
     train_policy["epsilon_low"] = train_policy.pop("grpo_ratio_clip_low")
     train_policy["epsilon_high"] = train_policy.pop("grpo_ratio_clip_high")
     train_policy["mu_iterations"] = train_policy.pop("grpo_optimization_iterations")

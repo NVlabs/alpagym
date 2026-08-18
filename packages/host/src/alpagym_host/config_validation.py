@@ -41,6 +41,7 @@ def validate_run_config(
         config=config.alpasim,
         dataset=config.dataset,
     )
+    _validate_humanoid_config(config)
     _validate_training_policy_config(config)
     _validate_cosmos_grpo_batch_geometry(config.cosmos)
     _validate_transport_config(config)
@@ -114,6 +115,36 @@ def _validate_wizard_startup_config(
         raise ValueError("dataset.scene_ids must be non-empty when set")
     if dataset.test_suite_id is not None and not dataset.test_suite_id:
         raise ValueError("dataset.test_suite_id must be non-empty when set")
+
+
+def _validate_humanoid_config(config: RunConfig) -> None:
+    """Fail closed on humanoid routing and version-unsafe prefetch."""
+    if config.alpasim.simulation_domain != "humanoid":
+        return
+    humanoid = config.alpasim.humanoid
+    if humanoid is None:
+        raise ValueError("humanoid simulation requires alpasim.humanoid")
+    if config.dataset.scene_ids is None:
+        raise ValueError("humanoid simulation requires explicit dataset.scene_ids")
+    expected_scenes = set(config.dataset.scene_ids)
+    mapped_scenes = set(humanoid.scenario_ids_by_scene)
+    if mapped_scenes != expected_scenes:
+        raise ValueError(
+            "alpasim.humanoid.scenario_ids_by_scene must match dataset.scene_ids: "
+            f"missing={sorted(expected_scenes - mapped_scenes)}, "
+            f"unexpected={sorted(mapped_scenes - expected_scenes)}"
+        )
+    if config.cosmos.rollout.prefetch_rollout:
+        raise ValueError(
+            "humanoid rollouts require prefetch_rollout=false until Cosmos passes "
+            "current_weight_version to its prefetch hook"
+        )
+    if config.cosmos.mode is not CosmosRLMode.colocated:
+        raise ValueError(
+            "standalone humanoid rollouts currently support cosmos.mode=colocated only; "
+            "distributed async requires start-version reporting and session-boundary "
+            "weight synchronization"
+        )
 
 
 def _validate_cosmos_mode(config: RunConfig) -> None:

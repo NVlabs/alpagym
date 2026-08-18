@@ -155,6 +155,7 @@ def test_humanoid_worker_request_and_transition_payloads(tmp_path: Path) -> None
         max_concurrent_rollouts=1,
         rollouts_per_payload=1,
         scene_id_resolver=_resolve_scene,
+        scenario_id_resolver=lambda scene_id: "ascend",
     )
     try:
         rollout_job = _RolloutJob(
@@ -163,6 +164,7 @@ def test_humanoid_worker_request_and_transition_payloads(tmp_path: Path) -> None
                 n_target=1,
                 future=Future(),
                 retries_left=0,
+                behavior_policy_version=7,
             ),
             session_uuid="humanoid-session",
             scene_id="stairs-scene",
@@ -172,6 +174,8 @@ def test_humanoid_worker_request_and_transition_payloads(tmp_path: Path) -> None
         assert request.available_humanoid_policies[0].ip == "policy-host"
         assert request.available_humanoid_policies[0].port == 5057
         assert list(request.rollout_specs[0].session_uuids) == ["humanoid-session"]
+        assert request.rollout_specs[0].scene_id == "stairs-scene"
+        assert request.rollout_specs[0].scenario_id == "ascend"
 
         replay_data = PolicyReplayData(
             replay_schema_version=1,
@@ -191,33 +195,42 @@ def test_humanoid_worker_request_and_transition_payloads(tmp_path: Path) -> None
                     chosen_logprob=torch.tensor(-0.25),
                     replay_data=replay_data,
                     model_extra={
-                        "humanoid_env_id": 2,
-                        "humanoid_step_index": 1,
+                        "humanoid_env_id": 0,
+                        "humanoid_episode_id": 11,
+                        "humanoid_step_index": 0,
+                        "humanoid_timestamp_us": 100_000,
                         "humanoid_value": 0.75,
                     },
                 ),
-            )
+            ),
+            final_bootstrap_values={},
+            behavior_policy_version=7,
         )
         rollout_return = SimpleNamespace(
-            aggregated_metrics={"humanoid_total_return": 3.0, "humanoid_return_env2": 3.0},
+            aggregated_metrics={
+                "humanoid_total_return": 2.0,
+                "humanoid_return_env0": 2.0,
+                "humanoid_episode_length_env0": 1.0,
+            },
+            behavior_policy_version="7",
             timestep_metrics=[
                 SimpleNamespace(
-                    name="humanoid_reward_env2",
-                    timestamps_us=[100, 200],
-                    values=[1.0, 2.0],
-                    valid=[True, True],
+                    name="humanoid_reward_env0",
+                    timestamps_us=[120_000],
+                    values=[2.0],
+                    valid=[True],
                 ),
                 SimpleNamespace(
-                    name="humanoid_terminated_env2",
-                    timestamps_us=[100, 200],
-                    values=[0.0, 1.0],
-                    valid=[True, True],
+                    name="humanoid_terminated_env0",
+                    timestamps_us=[120_000],
+                    values=[1.0],
+                    valid=[True],
                 ),
                 SimpleNamespace(
-                    name="humanoid_truncated_env2",
-                    timestamps_us=[100, 200],
-                    values=[0.0, 0.0],
-                    valid=[True, True],
+                    name="humanoid_truncated_env0",
+                    timestamps_us=[120_000],
+                    values=[0.0],
+                    valid=[True],
                 ),
             ],
         )
@@ -225,16 +238,21 @@ def test_humanoid_worker_request_and_transition_payloads(tmp_path: Path) -> None
         episode = worker._build_humanoid_episode(rollout_job, rollout_return)
 
         assert episode.reward is not None
-        assert episode.reward.total == pytest.approx(3.0)
+        assert episode.reward.total == pytest.approx(2.0)
         assert episode.metrics is not None
-        assert episode.metrics.dense["humanoid_reward_env2"]["values"] == [1.0, 2.0]
+        assert episode.metrics.dense["humanoid_reward_env0"]["values"] == [2.0]
         transition = episode.policy_outputs[0].replay_data.payload["transition"]
         assert transition == {
+            "env_id": 0,
+            "episode_id": 11,
+            "step_index": 0,
+            "timestamp_us": 120_000,
             "reward": 2.0,
             "terminated": True,
             "truncated": False,
             "old_value": 0.75,
             "bootstrap_value": 0.0,
+            "behavior_policy_version": 7,
         }
     finally:
         worker.shutdown()

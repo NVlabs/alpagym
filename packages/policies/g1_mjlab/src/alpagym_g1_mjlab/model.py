@@ -15,6 +15,8 @@ from transformers import AutoConfig, PretrainedConfig
 
 G1_MJLAB_MODEL_TYPE = "g1_mjlab_actor_critic"
 G1_MJLAB_REPLAY_SCHEMA = "alpagym_humanoid.g1_mjlab.v1"
+OBSERVATION_SCHEMA = "videomimic_v9_direct.v1"
+ACTION_SCHEMA = "g1_joint_offset.v1"
 
 OBS_KEYS = (
     "history_torso_real",
@@ -33,6 +35,31 @@ OBS_DIMS = {
 }
 BASE_OBS_DIM = sum(OBS_DIMS[key] for key in BASE_OBS_KEYS)
 DEFAULT_ACTION_DIM = 23
+JOINT_NAMES = (
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+)
 
 
 class G1MjlabConfig(PretrainedConfig):
@@ -196,10 +223,20 @@ class G1MjlabActorCriticModel(BaseModel):
         obs: Mapping[str, torch.Tensor],
         *,
         deterministic: bool = False,
+        generator: torch.Generator | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         mean, value = self._forward_heads(obs)
         dist = self.distribution(mean)
-        action = mean if deterministic else dist.sample()
+        if deterministic:
+            action = mean
+        else:
+            noise = torch.randn(
+                mean.shape,
+                dtype=mean.dtype,
+                device=mean.device,
+                generator=generator,
+            )
+            action = mean + dist.scale * noise
         log_prob = dist.log_prob(action).sum(dim=-1)
         return action, log_prob, value.squeeze(-1), mean
 

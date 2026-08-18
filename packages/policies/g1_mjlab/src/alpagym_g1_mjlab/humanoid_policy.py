@@ -10,8 +10,12 @@ from typing import Any
 import torch
 
 from alpagym_g1_mjlab.model import (
+    ACTION_SCHEMA,
     G1MjlabActorCriticModel,
     G1_MJLAB_REPLAY_SCHEMA,
+    JOINT_NAMES,
+    OBSERVATION_SCHEMA,
+    OBS_DIMS,
     OBS_KEYS,
     split_flat_observation,
     stack_observations,
@@ -29,26 +33,35 @@ class G1MjlabHumanoidPolicy:
 
     def __init__(
         self,
-        model: G1MjlabActorCriticModel,
+        inference_engine: InferenceEngine,
         *,
         device: torch.device,
         deterministic: bool = False,
+        random_seed: int = 0,
     ) -> None:
-        self._model = model
+        self._inference_engine = inference_engine
         self._device = device
         self._deterministic = bool(deterministic)
+        self._generator = torch.Generator(device=device)
+        self._generator.manual_seed(int(random_seed))
 
     def step(
         self,
         policy_inputs: tuple[HumanoidPolicyInput, ...],
+        *,
+        sample_actions: bool = True,
     ) -> tuple[HumanoidPolicyStepOutput, ...]:
         observations = [split_flat_observation(item.observation) for item in policy_inputs]
         obs_batch = stack_observations(observations, self._device)
-        self._model.eval()
+        model = self._inference_engine.get_model()
+        if not isinstance(model, G1MjlabActorCriticModel):
+            raise TypeError(f"expected G1MjlabActorCriticModel, got {type(model).__name__}")
+        model.eval()
         with torch.no_grad():
-            actions, log_probs, values, _means = self._model.act(
+            actions, log_probs, values, _means = model.act(
                 obs_batch,
-                deterministic=self._deterministic,
+                deterministic=self._deterministic or not sample_actions,
+                generator=self._generator,
             )
         outputs: list[HumanoidPolicyStepOutput] = []
         for row, policy_input in enumerate(policy_inputs):
@@ -81,21 +94,50 @@ def build_humanoid_policy_factory(
     inference_engine: InferenceEngine,
 ):
     """Build the per-session factory consumed by ``HumanoidPolicyServer``."""
-    model = inference_engine.get_model()
-    if not isinstance(model, G1MjlabActorCriticModel):
-        raise TypeError(f"expected G1MjlabActorCriticModel, got {type(model).__name__}")
     device = torch.device(run_config.policy.model.device)
     deterministic = bool(run_config.policy.model.bundle_config.get("deterministic", False))
 
     def _factory(session_uuid: str, request: Any) -> G1MjlabHumanoidPolicy:
-        del session_uuid, request
+        del session_uuid
+        _validate_session_request(request)
         return G1MjlabHumanoidPolicy(
-            model,
+            inference_engine,
             device=device,
             deterministic=deterministic,
+            random_seed=int(request.random_seed),
         )
 
     return _factory
+
+
+def _validate_session_request(request: Any) -> None:
+    """Require the simulator session ABI to match this checkpoint exactly."""
+    scalar_fields = {
+        "action_size": (request.action_size, len(JOINT_NAMES)),
+        "observation_schema": (request.observation_schema, OBSERVATION_SCHEMA),
+        "action_schema": (request.action_schema, ACTION_SCHEMA),
+    }
+    for field, (actual, expected) in scalar_fields.items():
+        if actual != expected:
+            raise ValueError(f"Humanoid session {field} must be {expected!r}, got {actual!r}")
+    observation_terms = tuple(
+        (str(term.name), int(term.size)) for term in request.observation_terms
+    )
+    expected_terms = tuple((key, OBS_DIMS[key]) for key in OBS_KEYS)
+    if observation_terms != expected_terms:
+        raise ValueError(
+            "Humanoid session observation terms do not match the checkpoint ABI: "
+            f"expected={expected_terms}, actual={observation_terms}"
+        )
+    joint_names = tuple(str(name) for name in request.joint_names)
+    if joint_names != JOINT_NAMES:
+        raise ValueError(
+            "Humanoid session joint_names do not match the VideoMimic v9 wire order: "
+            f"expected={JOINT_NAMES}, actual={joint_names}"
+        )
+    for field in ("attempt_id", "scene_id", "scenario_id"):
+        if not str(getattr(request, field)):
+            raise ValueError(f"Humanoid session request requires non-empty {field}")
 
 
 def _build_replay_data(

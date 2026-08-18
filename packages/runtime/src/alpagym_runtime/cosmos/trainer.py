@@ -708,6 +708,19 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         self._normalize_advantages = bool(ppo_config.get("normalize_advantages", True))
         self._gamma = float(ppo_config.get("gamma", 0.99))
         self._gae_lambda = float(ppo_config.get("gae_lambda", 0.95))
+        step_mini_batch = ppo_config.get("step_mini_batch", self._mini_batch)
+        if (
+            isinstance(step_mini_batch, bool)
+            or not isinstance(step_mini_batch, int)
+            or step_mini_batch <= 0
+        ):
+            raise ValueError(
+                "PPO step_mini_batch must be a positive integer, "
+                f"got {step_mini_batch!r}"
+            )
+        # Cosmos's train_policy.mini_batch remains rollout/shard geometry;
+        # this loop batches flattened actor-critic transitions independently.
+        self._mini_batch = step_mini_batch
         if not 0.0 <= self._gamma <= 1.0:
             raise ValueError(f"PPO gamma must be in [0, 1], got {self._gamma}")
         if not 0.0 <= self._gae_lambda <= 1.0:
@@ -729,6 +742,15 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                 rollout.completion,
                 n_ignore_prefix_tokens=rollout.n_ignore_prefix_tokens,
             )
+            rollout_weight_version = int(rollout.weight_version)
+            for step in step_samples:
+                replay_weight_version = int(step.weight_version.item())
+                if replay_weight_version != rollout_weight_version:
+                    raise ValueError(
+                        "PPO replay behavior version does not match Cosmos rollout "
+                        f"version: replay={replay_weight_version}, "
+                        f"rollout={rollout_weight_version}"
+                    )
             rollout_advantages, rollout_returns = self._compute_gae(step_samples)
             for step, advantage, ret in zip(step_samples, rollout_advantages, rollout_returns):
                 is_padding = bool(step.training_signal.is_padding.item())

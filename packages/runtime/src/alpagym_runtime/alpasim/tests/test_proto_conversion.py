@@ -141,6 +141,7 @@ def install_alpasim_grpc_stubs() -> None:
             qvel=None,
             observation=None,
             scalars=None,
+            reset_id: int = 0,
         ) -> None:
             self.env_id = env_id
             self.timestamp_us = timestamp_us
@@ -148,6 +149,9 @@ def install_alpasim_grpc_stubs() -> None:
             self.qvel = list(qvel or [])
             self.observation = list(observation or [])
             self.scalars = dict(scalars or {})
+            self.reset_id = reset_id
+            self.named_observations = []
+            self.observation_schema = "videomimic_v9_direct.v1"
 
     class HumanoidPolicyRequest:
         """Tiny stand-in for humanoid.HumanoidPolicyRequest."""
@@ -155,9 +159,24 @@ def install_alpasim_grpc_stubs() -> None:
     class HumanoidPolicyResponse:
         """Tiny stand-in for humanoid.HumanoidPolicyResponse."""
 
-        def __init__(self, actions=None, terminate_session: bool = False) -> None:
+        def __init__(
+            self,
+            actions=None,
+            terminate_session: bool = False,
+            behavior_policy_version: str = "",
+            value_estimates=None,
+        ) -> None:
             self.actions = list(actions or [])
             self.terminate_session = terminate_session
+            self.behavior_policy_version = behavior_policy_version
+            self.value_estimates = list(value_estimates or [])
+
+    class HumanoidEnvValue:
+        """Tiny stand-in for humanoid.HumanoidEnvValue."""
+
+        def __init__(self, env_id: int = 0, value: float = 0.0) -> None:
+            self.env_id = env_id
+            self.value = value
 
     class HumanoidPolicySessionRequest:
         """Tiny stand-in for humanoid.HumanoidPolicySessionRequest."""
@@ -210,6 +229,9 @@ def install_alpasim_grpc_stubs() -> None:
             self.scenario_id = ""
             self.nr_rollouts = 0
             self.session_uuids: list[str] = []
+            self.attempt_ids: list[str] = []
+            self.scene_id = ""
+            self.random_seed = 0
 
     class SimulationRequest:
         """Tiny stand-in for runtime.SimulationRequest."""
@@ -262,6 +284,7 @@ def install_alpasim_grpc_stubs() -> None:
     egodriver_pb2_grpc.EgodriverServiceServicer = EgodriverServiceServicer
     humanoid_pb2.HumanoidAction = HumanoidAction
     humanoid_pb2.HumanoidEnvState = HumanoidEnvState
+    humanoid_pb2.HumanoidEnvValue = HumanoidEnvValue
     humanoid_pb2.HumanoidPolicyRequest = HumanoidPolicyRequest
     humanoid_pb2.HumanoidPolicyResponse = HumanoidPolicyResponse
     humanoid_pb2.HumanoidPolicySessionRequest = HumanoidPolicySessionRequest
@@ -277,6 +300,63 @@ def install_alpasim_grpc_stubs() -> None:
     runtime_pb2.SimulationReturn = SimulationReturn
     runtime_pb2_grpc.RuntimeServiceStub = RuntimeServiceStub
     sensorsim_pb2.CameraSpec = CameraSpec
+
+    def _descriptor_message(*fields: str, nested=None):
+        return SimpleNamespace(
+            fields_by_name={field: object() for field in fields},
+            nested_types_by_name=nested or {},
+        )
+
+    humanoid_pb2.DESCRIPTOR = SimpleNamespace(
+        message_types_by_name={
+            "HumanoidPolicySessionRequest": _descriptor_message(
+                "joint_names",
+                "observation_schema",
+                "action_schema",
+                "observation_terms",
+                "attempt_id",
+                "scene_id",
+                "scenario_id",
+                "random_seed",
+            ),
+            "HumanoidEnvState": _descriptor_message(
+                "timestamp_us",
+                "named_observations",
+                "observation_schema",
+                "reset_id",
+            ),
+            "HumanoidPolicyRequest": _descriptor_message(
+                "bootstrap_only", "bootstrap_env_ids"
+            ),
+            "HumanoidPolicyResponse": _descriptor_message(
+                "behavior_policy_version", "value_estimates"
+            ),
+            "HumanoidStepResult": _descriptor_message(
+                "state",
+                "reward",
+                "terminated",
+                "truncated",
+                "final_state",
+                "episode_step",
+            ),
+        }
+    )
+    runtime_pb2.DESCRIPTOR = SimpleNamespace(
+        message_types_by_name={
+            "RolloutSpec": _descriptor_message(
+                "scenario_id",
+                "session_uuids",
+                "random_seed",
+                "attempt_ids",
+                "scene_id",
+            ),
+            "SimulationReturn": _descriptor_message(
+                nested={
+                    "RolloutReturn": _descriptor_message("behavior_policy_version")
+                }
+            ),
+        }
+    )
 
     sys.modules["alpasim_grpc"] = alpasim_grpc
     sys.modules["alpasim_grpc.v0"] = alpasim_grpc_v0
@@ -333,13 +413,15 @@ def test_simulation_request_carries_humanoid_policy_endpoint() -> None:
         humanoid_policy_port=50057,
         n_concurrent_per_humanoid_policy=2,
         session_uuid="humanoid-session",
+        humanoid_scenario_ids=("ascend",),
     )
 
     assert len(request.available_drivers) == 0
     assert request.available_humanoid_policies[0].ip == "localhost"
     assert request.available_humanoid_policies[0].port == 50057
     assert request.n_concurrent_per_humanoid_policy == 2
-    assert request.rollout_specs[0].scenario_id == "stairs_scene"
+    assert request.rollout_specs[0].scene_id == "stairs_scene"
+    assert request.rollout_specs[0].scenario_id == "ascend"
     assert list(request.rollout_specs[0].session_uuids) == ["humanoid-session"]
 
 

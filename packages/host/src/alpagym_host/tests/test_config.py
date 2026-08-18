@@ -14,7 +14,9 @@ from alpagym_host.cli import load_or_create_run_config
 from alpagym_host.config import (
     AllInOneSlurmTopologyConfig,
     ArtifactPaths,
+    CosmosRLMode,
     ExecutionBackend,
+    HumanoidAlpaSimConfig,
     RunConfig,
     SeparateNodesSlurmTopologyConfig,
     TransportKind,
@@ -605,10 +607,51 @@ def test_run_config_allows_zero_force_gt_for_humanoid_domain(tmp_path: Path) -> 
         "policy.model.kind=alpamayo_r1",
         f"policy.model.path={model_path.as_posix()}",
         "alpasim.simulation_domain=humanoid",
+        "dataset.scene_ids=[stairs]",
         "alpasim.wizard_args.force_gt_duration_us=0",
+        "cosmos.rollout.prefetch_rollout=false",
+    )
+    run_config.alpasim.humanoid = HumanoidAlpaSimConfig(
+        repo_path="/tmp/alpasim-humanoid",
+        scene_store_path="/tmp/humanoid-scenes",
+        scenario_ids_by_scene={"stairs": "ascend"},
     )
 
     validate_run_config(run_config, "run")
+
+
+def test_humanoid_config_rejects_vector_env_until_lane_local_gae_exists() -> None:
+    with pytest.raises(ValueError, match="num_envs must be 1"):
+        HumanoidAlpaSimConfig(
+            repo_path="/tmp/alpasim-humanoid",
+            scene_store_path="/tmp/humanoid-scenes",
+            scenario_ids_by_scene={"stairs": "ascend"},
+            num_envs=2,
+        )
+
+
+def test_humanoid_config_rejects_unqualified_distributed_async_mode(
+    tmp_path: Path,
+) -> None:
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        "policy.model.kind=alpamayo_r1",
+        f"policy.model.path={model_path.as_posix()}",
+        "alpasim.simulation_domain=humanoid",
+        "dataset.scene_ids=[stairs]",
+        "alpasim.wizard_args.force_gt_duration_us=0",
+        "cosmos.rollout.prefetch_rollout=false",
+    )
+    run_config.alpasim.humanoid = HumanoidAlpaSimConfig(
+        repo_path="/tmp/alpasim-humanoid",
+        scene_store_path="/tmp/humanoid-scenes",
+        scenario_ids_by_scene={"stairs": "ascend"},
+    )
+    run_config.cosmos.mode = CosmosRLMode.disaggregated
+
+    with pytest.raises(ValueError, match="colocated only"):
+        validate_run_config(run_config, "run")
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,20 @@
+# @package _global_
+
+defaults:
+  - g1_mjlab_hq_stairs_full_episode
+  - _self_
+
+alpasim:
+  humanoid:
+    reward_profile_id: scene_route_center_stable.v1
+    route_center_soft_m: 0.10
+    route_progress_credit_m: 0.30
+    route_corridor_half_width_m: 0.45
+
+cosmos:
+  train:
+    optm_lr: 1.0e-5
+    train_policy:
+      # Keep Cosmos's rollout-level mini_batch=1. PPO independently flattens
+      # the 750 transitions into bounded update batches.
+      step_mini_batch: 64

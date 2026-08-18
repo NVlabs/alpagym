@@ -39,12 +39,17 @@ def _build_wizard_command(
     )
     # Launch Wizard with the checkout venv's interpreter directly, not `uv run`.
     # See `start_wizard` for why we avoid `uv run` and its env vars here.
+    wizard_deploy = (
+        "humanoid_local"
+        if config.humanoid is not None and wizard_args.deploy == "local"
+        else wizard_args.deploy
+    )
     argv = [
         str(checkout_root / ".venv" / "bin" / "python"),
         "-m",
         "alpasim_wizard",
         f"hydra.searchpath=[file://{configs_dir}]",
-        f"deploy={wizard_args.deploy}",
+        f"deploy={wizard_deploy}",
         f"topology={wizard_args.topology}",
         f"driver_source={wizard_args.driver_source}",
         f"wizard.run_method={execution_backend.wizard_run_method}",
@@ -61,6 +66,35 @@ def _build_wizard_command(
         argv.append(f"driver={wizard_args.driver}")
     if wizard_args.renderer is not None:
         argv.append(f"renderer={wizard_args.renderer}")
+    if config.humanoid is not None:
+        if dataset.scene_ids is None:
+            raise ValueError("humanoid Wizard launch requires explicit dataset.scene_ids")
+        missing_scenarios = set(dataset.scene_ids) - set(
+            config.humanoid.scenario_ids_by_scene
+        )
+        if missing_scenarios:
+            raise ValueError(
+                "alpasim.humanoid.scenario_ids_by_scene is missing dataset scenes: "
+                f"{sorted(missing_scenarios)}"
+            )
+        argv.extend(
+            (
+                "runtime_domain=humanoid",
+                f"defines.humanoid_repo={config.humanoid.repo_path}",
+                f"defines.humanoid_scene_store={config.humanoid.scene_store_path}",
+                f"defines.humanoid_image={config.humanoid.service_image}",
+                "defines.humanoid_dynamics_gpus=[0]",
+                f"runtime.humanoid.num_envs={config.humanoid.num_envs}",
+                "+runtime.humanoid.registration_options.reward_profile_id="
+                f"{json.dumps(config.humanoid.reward_profile_id)}",
+                "+runtime.humanoid.registration_options.route_center_soft_m="
+                f"{json.dumps(str(config.humanoid.route_center_soft_m))}",
+                "+runtime.humanoid.registration_options.route_progress_credit_m="
+                f"{json.dumps(str(config.humanoid.route_progress_credit_m))}",
+                "+runtime.humanoid.registration_options.route_corridor_half_width_m="
+                f"{json.dumps(str(config.humanoid.route_corridor_half_width_m))}",
+            )
+        )
     argv.extend(shlex.split(wizard_args.extra_overrides))
     argv.append(f"wizard.log_dir={alpasim_run_dir}")
     if dataset.scene_ids is not None:

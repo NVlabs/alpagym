@@ -214,6 +214,7 @@ class AlpagymDataPacker(DataPacker):
         step_samples: list[TrainerReplayData] = []
         for replay_data in replay_rows:
             model_inputs, old_logprob = self._build_model_inputs(replay_data)
+            weight_version = _transition_weight_version(replay_data)
             step_samples.append(
                 TrainerReplayData(
                     model_inputs=model_inputs,
@@ -223,7 +224,7 @@ class AlpagymDataPacker(DataPacker):
                         **_extract_transition_training_signal(replay_data),
                     ),
                     rollout_id=episode.session_uuid,
-                    weight_version=torch.zeros((), dtype=torch.int64),
+                    weight_version=torch.tensor(weight_version, dtype=torch.int64),
                 )
             )
 
@@ -248,7 +249,7 @@ class AlpagymDataPacker(DataPacker):
                         **_zero_padding_transition_signal(step_samples[0].training_signal),
                     ),
                     rollout_id=episode.session_uuid,
-                    weight_version=torch.zeros((), dtype=torch.int64),
+                    weight_version=step_samples[0].weight_version.clone(),
                 )
             )
 
@@ -321,6 +322,21 @@ def _extract_transition_training_signal(replay_data: PolicyReplayData) -> dict[s
                     signals[field_name] = torch.as_tensor(value, dtype=torch.bool).reshape(1)
                 break
     return signals
+
+
+def _transition_weight_version(replay_data: PolicyReplayData) -> int:
+    """Return the exact behavior version carried by an actor-critic transition."""
+    transition = replay_data.payload.get(_TRANSITION_PAYLOAD_KEY)
+    if transition is None:
+        return 0
+    if not isinstance(transition, Mapping):
+        raise TypeError("PolicyReplayData payload['transition'] must be a mapping")
+    if "behavior_policy_version" not in transition:
+        raise ValueError("actor-critic transition is missing behavior_policy_version")
+    value = transition["behavior_policy_version"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("behavior_policy_version must be a non-negative integer")
+    return value
 
 
 def _zero_padding_transition_signal(template: TrainingSignal) -> dict[str, torch.Tensor]:

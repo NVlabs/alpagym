@@ -7,11 +7,12 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 from concurrent import futures
-from pathlib import Path
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Callable, Mapping, Protocol, runtime_checkable
 
 import grpc
@@ -23,6 +24,7 @@ from alpagym_host.endpoint_registry import TopologyEndpoint
 from alpasim_grpc.v0.common_pb2 import Empty, SessionRequestStatus, VersionId
 from alpasim_grpc.v0.humanoid_pb2 import (
     HumanoidAction,
+    HumanoidEnvValue,
     HumanoidEnvState,
     HumanoidPolicyRequest,
     HumanoidPolicyResponse,
@@ -45,6 +47,7 @@ class HumanoidPolicyInput:
     """One humanoid env-lane observation delivered to a policy."""
 
     session_uuid: str
+    episode_id: int
     step_index: int
     timestamp_us: int
     env_id: int
@@ -73,6 +76,8 @@ class HumanoidPolicy(Protocol):
     def step(
         self,
         policy_inputs: tuple[HumanoidPolicyInput, ...],
+        *,
+        sample_actions: bool = True,
     ) -> tuple[HumanoidPolicyStepOutput, ...]:
         """Return one action for each env-lane input."""
 
@@ -85,6 +90,8 @@ class HumanoidSessionRecord:
     """Frozen per-session humanoid policy outputs drained by the rollout worker."""
 
     outputs: tuple[PolicyOutput, ...]
+    final_bootstrap_values: Mapping[int, float]
+    behavior_policy_version: int
 
 
 @dataclass
@@ -93,9 +100,13 @@ class _Session:
 
     policy: HumanoidPolicy
     action_size: int
+    observation_schema: str
+    observation_terms: tuple[tuple[str, int], ...]
+    behavior_policy_version: int = 0
     save_camera_dir: Path | None = None
     step_index: int = 0
     outputs: list[PolicyOutput] = field(default_factory=list)
+    final_bootstrap_values: dict[int, float] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def consume_step_index(self) -> int:
@@ -107,11 +118,37 @@ class _Session:
 
     def record_outputs(self, outputs: tuple[PolicyOutput, ...]) -> None:
         """Append policy outputs in env-lane order."""
-        self.outputs.extend(outputs)
+        with self.lock:
+            self.outputs.extend(outputs)
+
+    def record_final_values(
+        self,
+        outputs: tuple[HumanoidPolicyStepOutput, ...],
+    ) -> None:
+        """Store one bootstrap value for every truncated final-state lane."""
+        with self.lock:
+            if self.final_bootstrap_values:
+                raise ValueError("humanoid session received multiple bootstrap-only requests")
+            for output in outputs:
+                if output.value is None:
+                    raise ValueError("humanoid bootstrap output is missing a value")
+                value = float(
+                    torch.as_tensor(output.value, dtype=torch.float32).reshape(()).item()
+                )
+                if not math.isfinite(value):
+                    raise ValueError(
+                        f"humanoid final value for env_id={output.env_id} is non-finite"
+                    )
+                self.final_bootstrap_values[int(output.env_id)] = value
 
     def get_record(self) -> HumanoidSessionRecord:
         """Freeze this session's outputs for the rollout worker."""
-        return HumanoidSessionRecord(outputs=tuple(self.outputs))
+        with self.lock:
+            return HumanoidSessionRecord(
+                outputs=tuple(self.outputs),
+                final_bootstrap_values=dict(self.final_bootstrap_values),
+                behavior_policy_version=self.behavior_policy_version,
+            )
 
 
 class ZeroHumanoidPolicy:
@@ -123,7 +160,10 @@ class ZeroHumanoidPolicy:
     def step(
         self,
         policy_inputs: tuple[HumanoidPolicyInput, ...],
+        *,
+        sample_actions: bool = True,
     ) -> tuple[HumanoidPolicyStepOutput, ...]:
+        del sample_actions
         return tuple(
             HumanoidPolicyStepOutput(
                 env_id=policy_input.env_id,
@@ -149,6 +189,20 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
         self._sessions: dict[str, _Session] = {}
         self._sessions_lock = threading.Lock()
         self._session_records: dict[str, HumanoidSessionRecord] = {}
+        self._reserved_versions: dict[str, int] = {}
+
+    def reserve_session(self, session_uuid: str, behavior_policy_version: int) -> None:
+        """Bind queued simulator work to the exact rollout-weight version."""
+        if not session_uuid or behavior_policy_version < 0:
+            raise ValueError("humanoid session reservation requires UUID and non-negative version")
+        with self._sessions_lock:
+            if (
+                session_uuid in self._reserved_versions
+                or session_uuid in self._sessions
+                or session_uuid in self._session_records
+            ):
+                raise ValueError(f"humanoid session {session_uuid!r} is already reserved")
+            self._reserved_versions[session_uuid] = behavior_policy_version
 
     def start_session(
         self,
@@ -157,14 +211,22 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
     ) -> SessionRequestStatus:
         del context
         session_uuid = str(request.session_uuid)
-        policy = self._policy_factory(session_uuid, request)
-        save_camera_dir = _session_save_camera_dir(session_uuid, request)
-        session = _Session(
-            policy=policy,
-            action_size=int(request.action_size),
-            save_camera_dir=save_camera_dir,
-        )
         with self._sessions_lock:
+            if session_uuid not in self._reserved_versions:
+                raise ValueError(f"humanoid session {session_uuid!r} was not reserved")
+            behavior_policy_version = self._reserved_versions.pop(session_uuid)
+            policy = self._policy_factory(session_uuid, request)
+            save_camera_dir = _session_save_camera_dir(session_uuid, request)
+            session = _Session(
+                policy=policy,
+                action_size=int(request.action_size),
+                observation_schema=str(request.observation_schema),
+                observation_terms=tuple(
+                    (str(term.name), int(term.size)) for term in request.observation_terms
+                ),
+                behavior_policy_version=behavior_policy_version,
+                save_camera_dir=save_camera_dir,
+            )
             self._sessions[session_uuid] = session
         logger.info(
             "Started AlpaGym humanoid policy session=%s action_size=%d",
@@ -183,31 +245,66 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
         with self._sessions_lock:
             session = self._sessions[session_uuid]
         _save_camera_images(request.observation.camera_images, session.save_camera_dir)
-        step_index = session.consume_step_index()
+        bootstrap_only = bool(request.bootstrap_only)
+        step_index = session.step_index if bootstrap_only else session.consume_step_index()
         policy_inputs = tuple(
             _policy_input_from_state(
                 session_uuid=session_uuid,
                 step_index=step_index,
                 state=state,
+                observation_schema=session.observation_schema,
+                observation_terms=session.observation_terms,
             )
             for state in request.observation.env_states
         )
-        policy_outputs = session.policy.step(policy_inputs)
+        policy_outputs = session.policy.step(policy_inputs, sample_actions=not bootstrap_only)
         if len(policy_outputs) != len(policy_inputs):
             raise ValueError(
                 "humanoid policy returned "
                 f"{len(policy_outputs)} outputs for {len(policy_inputs)} env states"
             )
 
+        outputs_by_env = {int(output.env_id): output for output in policy_outputs}
+        input_env_ids = [int(policy_input.env_id) for policy_input in policy_inputs]
+        if len(outputs_by_env) != len(policy_outputs) or set(outputs_by_env) != set(
+            input_env_ids
+        ):
+            raise ValueError(
+                "humanoid policy outputs must match request env_ids exactly: "
+                f"inputs={sorted(input_env_ids)}, outputs={sorted(outputs_by_env)}"
+            )
+        ordered_outputs = tuple(outputs_by_env[env_id] for env_id in input_env_ids)
+        if bootstrap_only:
+            bootstrap_env_ids = [int(env_id) for env_id in request.bootstrap_env_ids]
+            if set(bootstrap_env_ids) != set(input_env_ids) or len(bootstrap_env_ids) != len(
+                set(bootstrap_env_ids)
+            ):
+                raise ValueError("humanoid bootstrap env_ids must match final observation lanes")
+            session.record_final_values(ordered_outputs)
+            return HumanoidPolicyResponse(
+                value_estimates=[
+                    HumanoidEnvValue(
+                        env_id=int(output.env_id),
+                        value=float(
+                            torch.as_tensor(output.value, dtype=torch.float32).reshape(()).item()
+                        ),
+                    )
+                    for output in ordered_outputs
+                ],
+                behavior_policy_version=str(session.behavior_policy_version),
+            )
+
         actions: list[HumanoidAction] = []
         recorded: list[PolicyOutput] = []
-        for output in sorted(policy_outputs, key=lambda item: int(item.env_id)):
+        for policy_input, output in zip(policy_inputs, ordered_outputs, strict=True):
             action_values = torch.as_tensor(output.action, dtype=torch.float32).reshape(-1)
             if action_values.numel() != session.action_size:
                 raise ValueError(
                     f"humanoid action for env_id={output.env_id} has "
                     f"{action_values.numel()} values; expected {session.action_size}"
                 )
+            if not torch.isfinite(action_values).all():
+                raise ValueError(f"humanoid action for env_id={output.env_id} is non-finite")
             actions.append(
                 HumanoidAction(
                     env_id=int(output.env_id),
@@ -217,12 +314,16 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
             recorded.append(
                 _recorded_policy_output(
                     step_index=step_index,
+                    policy_input=policy_input,
                     output=output,
                     action_values=action_values,
                 )
             )
         session.record_outputs(tuple(recorded))
-        return HumanoidPolicyResponse(actions=actions)
+        return HumanoidPolicyResponse(
+            actions=actions,
+            behavior_policy_version=str(session.behavior_policy_version),
+        )
 
     def close_session(
         self,
@@ -233,7 +334,7 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
         session_uuid = str(request.session_uuid)
         with self._sessions_lock:
             session = self._sessions.pop(session_uuid)
-        self._session_records[session_uuid] = session.get_record()
+            self._session_records[session_uuid] = session.get_record()
         session.policy.close()
         logger.info(
             "Closed AlpaGym humanoid policy session=%s recorded_outputs=%d",
@@ -244,7 +345,17 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
 
     def pop_session_record(self, session_uuid: str) -> HumanoidSessionRecord:
         """Remove and return the frozen record for ``session_uuid``."""
-        return self._session_records.pop(session_uuid)
+        with self._sessions_lock:
+            return self._session_records.pop(session_uuid)
+
+    def discard_session(self, session_uuid: str) -> None:
+        """Drop a failed reservation/session/record before scheduling its retry."""
+        with self._sessions_lock:
+            self._reserved_versions.pop(session_uuid, None)
+            session = self._sessions.pop(session_uuid, None)
+            self._session_records.pop(session_uuid, None)
+        if session is not None:
+            session.policy.close()
 
     def get_version(self, request: Empty, context: grpc.ServicerContext) -> VersionId:
         del request, context
@@ -348,33 +459,89 @@ def _policy_input_from_state(
     session_uuid: str,
     step_index: int,
     state: HumanoidEnvState,
+    observation_schema: str,
+    observation_terms: tuple[tuple[str, int], ...],
 ) -> HumanoidPolicyInput:
+    if str(state.observation_schema) != observation_schema:
+        raise ValueError(
+            f"humanoid state for env_id={state.env_id} has observation_schema="
+            f"{state.observation_schema!r}; expected {observation_schema!r}"
+        )
+    qpos = torch.as_tensor(list(state.qpos), dtype=torch.float32)
+    qvel = torch.as_tensor(list(state.qvel), dtype=torch.float32)
+    observation = torch.as_tensor(list(state.observation), dtype=torch.float32)
+    expected_observation_size = sum(size for _, size in observation_terms)
+    if observation.shape != (expected_observation_size,):
+        raise ValueError(
+            f"humanoid state for env_id={state.env_id} has flat observation shape "
+            f"{tuple(observation.shape)}; expected ({expected_observation_size},)"
+        )
+    named_observations = tuple(state.named_observations)
+    actual_terms = tuple((str(named.name), len(named.values)) for named in named_observations)
+    if actual_terms != observation_terms:
+        raise ValueError(
+            f"humanoid state for env_id={state.env_id} named observation terms do not "
+            f"match the session ABI: expected={observation_terms}, actual={actual_terms}"
+        )
+    named_flat_parts: list[torch.Tensor] = []
+    for named, (_, expected_size) in zip(
+        named_observations,
+        observation_terms,
+        strict=True,
+    ):
+        shape = tuple(int(width) for width in named.shape)
+        if math.prod(shape) != expected_size:
+            raise ValueError(
+                f"humanoid named observation {named.name!r} shape {shape} does not "
+                f"contain {expected_size} elements"
+            )
+        named_flat_parts.append(torch.as_tensor(list(named.values), dtype=torch.float32))
+    named_flat = torch.cat(named_flat_parts)
+    if not torch.equal(named_flat, observation):
+        raise ValueError(
+            f"humanoid state for env_id={state.env_id} flat and named observations differ"
+        )
+    if not all(torch.isfinite(tensor).all() for tensor in (qpos, qvel, observation)):
+        raise ValueError(f"humanoid state for env_id={state.env_id} contains non-finite values")
+    scalars = {str(key): float(value) for key, value in state.scalars.items()}
+    if not all(math.isfinite(value) for value in scalars.values()):
+        raise ValueError(f"humanoid scalars for env_id={state.env_id} contain non-finite values")
     return HumanoidPolicyInput(
         session_uuid=session_uuid,
+        episode_id=int(state.reset_id),
         step_index=step_index,
         timestamp_us=int(state.timestamp_us),
         env_id=int(state.env_id),
-        qpos=torch.as_tensor(list(state.qpos), dtype=torch.float32),
-        qvel=torch.as_tensor(list(state.qvel), dtype=torch.float32),
-        observation=torch.as_tensor(list(state.observation), dtype=torch.float32),
-        scalars={str(key): float(value) for key, value in state.scalars.items()},
+        qpos=qpos,
+        qvel=qvel,
+        observation=observation,
+        scalars=scalars,
     )
 
 
 def _recorded_policy_output(
     *,
     step_index: int,
+    policy_input: HumanoidPolicyInput,
     output: HumanoidPolicyStepOutput,
     action_values: torch.Tensor,
 ) -> PolicyOutput:
     model_extra = dict(output.model_extra or {})
     model_extra.setdefault("humanoid_env_id", int(output.env_id))
+    model_extra.setdefault("humanoid_episode_id", int(policy_input.episode_id))
     model_extra.setdefault("humanoid_step_index", int(step_index))
+    model_extra.setdefault("humanoid_timestamp_us", int(policy_input.timestamp_us))
     if output.value is not None:
         model_extra.setdefault(
             "humanoid_value",
             float(torch.as_tensor(output.value, dtype=torch.float32).reshape(()).item()),
         )
+
+    for name, value in (("logprob", output.logprob), ("value", output.value)):
+        if value is not None and not torch.isfinite(torch.as_tensor(value)).all():
+            raise ValueError(
+                f"humanoid actor-critic {name} for env_id={output.env_id} is non-finite"
+            )
 
     replay_data = output.replay_data
     if replay_data is not None:

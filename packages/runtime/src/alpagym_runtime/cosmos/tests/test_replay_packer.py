@@ -113,6 +113,7 @@ def test_replay_packer_extracts_transition_signal_and_zero_pads_it(
             "terminated": terminated,
             "truncated": False,
             "old_value": torch.tensor(old_value),
+            "behavior_policy_version": 7,
         }
         replay_data = replace(output.replay_data, payload=payload)
         outputs.append(replace(output, replay_data=replay_data))
@@ -139,6 +140,7 @@ def test_replay_packer_extracts_transition_signal_and_zero_pads_it(
         torch.tensor([0.25, 0.75, 0.0], dtype=torch.float32),
     )
     assert bool(batch.training_signal.is_padding[-1].item())
+    assert torch.equal(batch.weight_versions, torch.full((3,), 7, dtype=torch.int64))
 
 
 def test_replay_packer_exact_t_pack_has_no_padding(

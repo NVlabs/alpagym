@@ -59,6 +59,9 @@ alpasim:
   # Selects the AlpaSim runtime domain: av uses EgodriverService; humanoid uses
   # HumanoidPolicyService + HumanoidDynamicsService.
   simulation_domain: av
+  # Non-null only for the G1/MJLab domain. Experiment presets fill the
+  # portable task parameters; machine-specific paths remain explicit inputs.
+  humanoid: null
   # Set repo_path to use an existing checkout directly. When set, AlpaGym skips
   # clone/fetch/checkout/sync and starts Wizard from this path.
   repo_path: null

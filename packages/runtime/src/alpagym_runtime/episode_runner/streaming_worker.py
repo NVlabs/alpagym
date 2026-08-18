@@ -6,14 +6,13 @@
 
 import itertools
 import logging
+import math
 import queue
 import threading
 import uuid
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Mapping
-
-import torch
+from typing import Any, Callable
 from alpagym_runtime.alpasim.grpc_import import ensure_alpasim_grpc_source
 
 ensure_alpasim_grpc_source()
@@ -22,11 +21,12 @@ from alpasim_grpc.v0.runtime_pb2_grpc import RuntimeServiceStub
 from cosmos_rl.dispatcher.data.schema import RLPayload
 
 from alpagym_runtime.alpasim.driver_server import EgodriverServer
+from alpagym_runtime.alpasim.humanoid_replay import attach_humanoid_transitions
 from alpagym_runtime.alpasim.humanoid_policy_server import HumanoidPolicyServer
 from alpagym_runtime.alpasim.proto_conversion import build_simulation_request_proto
 from alpagym_runtime.perf.instrument.scope import measure_perf, timed_scope
 from alpagym_runtime.rewards.compute import compute_reward
-from alpagym_runtime.types import EpisodeMetrics, EpisodeOutput, PolicyOutput, RewardResult
+from alpagym_runtime.types import EpisodeMetrics, EpisodeOutput, RewardResult
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,7 @@ class SharedPayloadState:
     n_target: int
     future: Future[list[EpisodeOutput]]
     retries_left: int
+    behavior_policy_version: int = 0
     collected: list[EpisodeOutput] = field(default_factory=list)
     permanently_failed: bool = False
     future_resolved: bool = False
@@ -69,106 +70,6 @@ def _dense_metrics_from_rollout_return(rollout_return: object) -> dict[str, Any]
             "valid": [bool(value) for value in metric.valid],
         }
     return dense
-
-
-def _metric_values_by_name(rollout_return: object) -> dict[str, list[float]]:
-    return {
-        str(metric.name): [float(value) for value in metric.values]
-        for metric in getattr(rollout_return, "timestep_metrics", [])
-    }
-
-
-def _payload_humanoid_meta(output: PolicyOutput) -> Mapping[str, Any]:
-    replay_data = output.replay_data
-    if replay_data is None:
-        return {}
-    meta = replay_data.payload.get("humanoid", {})
-    return meta if isinstance(meta, Mapping) else {}
-
-
-def _output_env_id(output: PolicyOutput) -> int:
-    if output.model_extra and "humanoid_env_id" in output.model_extra:
-        return int(output.model_extra["humanoid_env_id"])
-    meta = _payload_humanoid_meta(output)
-    return int(meta.get("env_id", 0))
-
-
-def _output_step_index(output: PolicyOutput, fallback: int) -> int:
-    if output.model_extra and "humanoid_step_index" in output.model_extra:
-        return int(output.model_extra["humanoid_step_index"])
-    meta = _payload_humanoid_meta(output)
-    return int(meta.get("step_index", fallback))
-
-
-def _output_value(output: PolicyOutput) -> float:
-    if output.model_extra and "humanoid_value" in output.model_extra:
-        return float(output.model_extra["humanoid_value"])
-    meta = _payload_humanoid_meta(output)
-    if "value" in meta:
-        value = meta["value"]
-        if isinstance(value, torch.Tensor):
-            return float(value.reshape(()).item())
-        return float(value)
-    return 0.0
-
-
-def _metric_value(
-    metrics: Mapping[str, list[float]],
-    name: str,
-    step_index: int,
-    default: float,
-) -> float:
-    values = metrics.get(name)
-    if values is None or step_index < 0 or step_index >= len(values):
-        return default
-    return float(values[step_index])
-
-
-def _attach_humanoid_transition_payloads(
-    outputs: tuple[PolicyOutput, ...],
-    rollout_return: object,
-) -> tuple[PolicyOutput, ...]:
-    """Attach PPO transition facts from AlpaSim metrics to humanoid replay rows."""
-    metrics = _metric_values_by_name(rollout_return)
-    next_step_by_env: dict[int, int] = {}
-    patched_outputs: list[PolicyOutput] = []
-
-    for output in outputs:
-        replay_data = output.replay_data
-        if replay_data is None:
-            patched_outputs.append(output)
-            continue
-
-        env_id = _output_env_id(output)
-        fallback_step_index = next_step_by_env.get(env_id, 0)
-        step_index = _output_step_index(output, fallback=fallback_step_index)
-        next_step_by_env[env_id] = max(fallback_step_index, step_index) + 1
-        env_suffix = f"env{env_id}"
-
-        reward = _metric_value(metrics, f"humanoid_reward_{env_suffix}", step_index, 0.0)
-        terminated = bool(
-            _metric_value(metrics, f"humanoid_terminated_{env_suffix}", step_index, 0.0)
-        )
-        truncated = bool(
-            _metric_value(metrics, f"humanoid_truncated_{env_suffix}", step_index, 0.0)
-        )
-
-        payload = dict(replay_data.payload)
-        transition = dict(payload.get("transition", {}))
-        transition.setdefault("reward", reward)
-        transition.setdefault("terminated", terminated)
-        transition.setdefault("truncated", truncated)
-        transition.setdefault("old_value", _output_value(output))
-        # A value-only final-state query is not part of the service contract yet.
-        # Use zero bootstrap for now; the policy/value at each sampled state is
-        # still trained from the rollout values and realized rewards.
-        transition.setdefault("bootstrap_value", 0.0)
-        payload["transition"] = transition
-        patched_outputs.append(
-            replace(output, replay_data=replace(replay_data, payload=payload))
-        )
-
-    return tuple(patched_outputs)
 
 
 class StreamingRolloutWorker:
@@ -200,6 +101,10 @@ class StreamingRolloutWorker:
         max_concurrent_rollouts: int,
         rollouts_per_payload: int,
         scene_id_resolver: Callable[[RLPayload], str],
+        scenario_id_resolver: Callable[[str], str] | None = None,
+        control_timestep_us: int = 20_000,
+        expected_num_envs: int = 1,
+        max_transition_rows: int = 250,
         max_scene_retries: int = 3,
         humanoid_policy_server: HumanoidPolicyServer | None = None,
         simulation_domain: str = "av",
@@ -211,6 +116,8 @@ class StreamingRolloutWorker:
             raise ValueError("rollouts_per_payload must be at least 1")
         if max_scene_retries < 0:
             raise ValueError("max_scene_retries must be non-negative")
+        if control_timestep_us <= 0 or expected_num_envs <= 0 or max_transition_rows <= 0:
+            raise ValueError("humanoid timestep, lane count, and replay row budget must be positive")
         self._alpasim_runtime_stub = alpasim_runtime_stub
         self._simulation_domain = str(simulation_domain)
         self._driver_server = driver_server
@@ -229,6 +136,10 @@ class StreamingRolloutWorker:
         self._reward_config = reward_config
         self._rollouts_per_payload = rollouts_per_payload
         self._scene_id_resolver = scene_id_resolver
+        self._scenario_id_resolver = scenario_id_resolver
+        self._control_timestep_us = int(control_timestep_us)
+        self._expected_num_envs = int(expected_num_envs)
+        self._max_transition_rows = int(max_transition_rows)
         self._max_scene_retries = max_scene_retries
 
         self._lock = threading.Lock()
@@ -260,7 +171,12 @@ class StreamingRolloutWorker:
 
     # ---------- public dispatch surface ----------
 
-    def submit_payload(self, payload: RLPayload) -> SharedPayloadState:
+    def submit_payload(
+        self,
+        payload: RLPayload,
+        *,
+        behavior_policy_version: int | None = None,
+    ) -> SharedPayloadState:
         """Return the running state for `payload`; dispatch at most once per `prompt_idx`.
 
         A repeat call with the same `prompt_idx` returns the state from
@@ -277,25 +193,49 @@ class StreamingRolloutWorker:
 
             # Return the existing state if the payload has already been submitted.
             if payload.prompt_idx in self._active_payload_states:
-                return self._active_payload_states[payload.prompt_idx]
+                existing = self._active_payload_states[payload.prompt_idx]
+                if (
+                    behavior_policy_version is not None
+                    and behavior_policy_version != existing.behavior_policy_version
+                ):
+                    raise ValueError(
+                        "duplicate payload submission changed behavior_policy_version"
+                    )
+                return existing
 
             # Otherwise, create a new state and enqueue the rollout jobs.
             scene_id = self._scene_id_resolver(payload)
+            if self._simulation_domain == "humanoid":
+                if behavior_policy_version is None or behavior_policy_version < 0:
+                    raise ValueError(
+                        "humanoid payload submission requires a non-negative "
+                        "behavior_policy_version"
+                    )
+                if self._scenario_id_resolver is None:
+                    raise ValueError("humanoid payload submission requires a scenario resolver")
+            frozen_version = 0 if behavior_policy_version is None else behavior_policy_version
             payload_state = SharedPayloadState(
                 payload=payload,
                 n_target=self._rollouts_per_payload,
                 future=Future(),
                 retries_left=self._max_scene_retries,
+                behavior_policy_version=frozen_version,
             )
             self._active_payload_states[payload.prompt_idx] = payload_state
             for _ in range(self._rollouts_per_payload):
+                session_uuid = uuid.uuid4().hex
+                if self._humanoid_policy_server is not None:
+                    self._humanoid_policy_server.servicer.reserve_session(
+                        session_uuid,
+                        frozen_version,
+                    )
                 self._rollout_job_queue.put(
                     (
                         1,  # fresh-dispatch priority
                         next(self._rollout_job_seq),
                         _RolloutJob(
                             shared_payload_state=payload_state,
-                            session_uuid=uuid.uuid4().hex,
+                            session_uuid=session_uuid,
                             scene_id=scene_id,
                         ),
                     )
@@ -372,6 +312,7 @@ class StreamingRolloutWorker:
         """Build the RuntimeService request for this worker's simulation domain."""
         endpoint = self._policy_endpoint
         if self._simulation_domain == "humanoid":
+            assert self._scenario_id_resolver is not None
             return build_simulation_request_proto(
                 scene_ids=(rollout_job.scene_id,),
                 n_generation=1,
@@ -379,6 +320,9 @@ class StreamingRolloutWorker:
                 humanoid_policy_port=int(endpoint.port),
                 n_concurrent_per_humanoid_policy=1,
                 session_uuid=rollout_job.session_uuid,
+                humanoid_scenario_ids=(
+                    self._scenario_id_resolver(rollout_job.scene_id),
+                ),
             )
         return build_simulation_request_proto(
             scene_ids=(rollout_job.scene_id,),
@@ -422,8 +366,28 @@ class StreamingRolloutWorker:
         )
         aggregated = dict(rollout_return.aggregated_metrics)
         dense = _dense_metrics_from_rollout_return(rollout_return)
-        outputs = _attach_humanoid_transition_payloads(record.outputs, rollout_return)
-        reward_total = float(aggregated.get("humanoid_total_return", 0.0))
+        returned_version_raw = str(getattr(rollout_return, "behavior_policy_version", ""))
+        if returned_version_raw != str(record.behavior_policy_version):
+            raise ValueError(
+                "AlpaSim behavior_policy_version differs from the reserved rollout "
+                f"version: returned={returned_version_raw!r}, "
+                f"reserved={record.behavior_policy_version}"
+            )
+        outputs = attach_humanoid_transitions(
+            record.outputs,
+            dense,
+            aggregated,
+            behavior_policy_version=record.behavior_policy_version,
+            final_bootstrap_values=record.final_bootstrap_values,
+            control_timestep_us=self._control_timestep_us,
+            expected_num_envs=self._expected_num_envs,
+            max_transition_rows=self._max_transition_rows,
+        )
+        if "humanoid_total_return" not in aggregated:
+            raise ValueError("AlpaSim humanoid rollout is missing humanoid_total_return")
+        reward_total = float(aggregated["humanoid_total_return"])
+        if not math.isfinite(reward_total):
+            raise ValueError("AlpaSim humanoid_total_return is non-finite")
         return EpisodeOutput(
             scene_id=rollout_job.scene_id,
             session_uuid=rollout_job.session_uuid,
@@ -461,13 +425,22 @@ class StreamingRolloutWorker:
                 return
             payload_state.retries_left -= 1
             if payload_state.retries_left >= 0:
+                retry_session_uuid = uuid.uuid4().hex
+                if self._humanoid_policy_server is not None:
+                    self._humanoid_policy_server.servicer.discard_session(
+                        rollout_job.session_uuid
+                    )
+                    self._humanoid_policy_server.servicer.reserve_session(
+                        retry_session_uuid,
+                        payload_state.behavior_policy_version,
+                    )
                 self._rollout_job_queue.put(
                     (
                         0,  # retry priority: jumps ahead of fresh dispatch
                         next(self._rollout_job_seq),
                         _RolloutJob(
                             shared_payload_state=payload_state,
-                            session_uuid=uuid.uuid4().hex,
+                            session_uuid=retry_session_uuid,
                             scene_id=rollout_job.scene_id,
                             attempts=rollout_job.attempts + 1,
                         ),
@@ -482,6 +455,10 @@ class StreamingRolloutWorker:
                     exc,
                 )
             else:
+                if self._humanoid_policy_server is not None:
+                    self._humanoid_policy_server.servicer.discard_session(
+                        rollout_job.session_uuid
+                    )
                 payload_state.permanently_failed = True
                 if not payload_state.future_resolved:
                     payload_state.future_resolved = True

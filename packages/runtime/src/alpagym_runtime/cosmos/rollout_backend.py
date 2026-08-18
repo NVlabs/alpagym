@@ -173,9 +173,25 @@ class AlpagymRollout(RolloutBase):
             "scene_id_resolver": _scene_id_for,
         }
         if simulation_domain == "humanoid":
+            humanoid_config = self._run_config.alpasim.humanoid
+            if humanoid_config is None:
+                raise ValueError("humanoid simulation requires alpasim.humanoid config")
+
+            def _scenario_id_for(scene_id: str) -> str:
+                try:
+                    return humanoid_config.scenario_ids_by_scene[scene_id]
+                except KeyError as exc:
+                    raise ValueError(
+                        f"no humanoid scenario configured for scene_id={scene_id!r}"
+                    ) from exc
+
             worker_kwargs.update(
                 humanoid_policy_server=self._humanoid_policy_server,
                 simulation_domain=simulation_domain,
+                scenario_id_resolver=_scenario_id_for,
+                control_timestep_us=self._run_config.alpasim.wizard_args.control_timestep_us,
+                expected_num_envs=humanoid_config.num_envs,
+                max_transition_rows=self._run_config.expected_valid_steps,
             )
         self._worker = StreamingRolloutWorker(**worker_kwargs)
 
@@ -220,6 +236,11 @@ class AlpagymRollout(RolloutBase):
         if not self._engine_initialized or self._worker is None:
             logger.info("[Prefetch] skipped (engine not initialized)")
             return
+        if self._run_config.alpasim.simulation_domain == "humanoid":
+            raise RuntimeError(
+                "humanoid prefetch is disabled because Cosmos does not pass a frozen "
+                "weight version to enqueue_prefetch_payloads"
+            )
         for payload in payloads:
             self._worker.submit_payload(payload)
 
@@ -254,7 +275,7 @@ class AlpagymRollout(RolloutBase):
         # deleting the unused kwargs is preferred over a `**kwargs` shim so a
         # new Cosmos kwarg surfaces as a loud TypeError instead of being
         # silently absorbed.
-        del stream, data_fetcher, current_weight_version, data_packer
+        del stream, data_fetcher, data_packer
         if self._worker is None:
             raise RuntimeError("rollout_generation called before init_engine")
         logger.info(
@@ -264,7 +285,20 @@ class AlpagymRollout(RolloutBase):
         )
         # Submit all before awaiting so simulate jobs run in parallel; the
         # in-order await just preserves cosmos's ordered-return contract.
-        payload_states = [self._worker.submit_payload(p) for p in payloads]
+        if self._run_config.alpasim.simulation_domain == "humanoid":
+            if current_weight_version is None or current_weight_version < 0:
+                raise ValueError(
+                    "humanoid rollout_generation requires current_weight_version"
+                )
+            payload_states = [
+                self._worker.submit_payload(
+                    payload,
+                    behavior_policy_version=current_weight_version,
+                )
+                for payload in payloads
+            ]
+        else:
+            payload_states = [self._worker.submit_payload(payload) for payload in payloads]
         # The streaming worker resolves permanent-failure payloads with `[]`
         # (after `max_scene_retries` failed simulate attempts) instead of
         # raising. Surface that as a hard error here so cosmos sees the

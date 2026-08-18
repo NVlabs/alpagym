@@ -476,10 +476,13 @@ def test_humanoid_policy_server_saves_camera_images_from_policy_options(
             int(request.action_size)
         )
     )
+    servicer.reserve_session("session/1", behavior_policy_version=7)
     servicer.start_session(
         SimpleNamespace(
             session_uuid="session/1",
             action_size=1,
+            observation_schema="test.v1",
+            observation_terms=[SimpleNamespace(name="test", size=1)],
             policy_options={"save_camera_dir": str(tmp_path)},
         ),
         context=None,
@@ -492,10 +495,15 @@ def test_humanoid_policy_server_saves_camera_images_from_policy_options(
                 env_states=[
                     SimpleNamespace(
                         env_id=0,
+                        reset_id=0,
                         timestamp_us=20_000,
                         qpos=[],
                         qvel=[],
                         observation=[0.0],
+                        observation_schema="test.v1",
+                        named_observations=[
+                            SimpleNamespace(name="test", values=[0.0], shape=[1])
+                        ],
                         scalars={},
                     )
                 ],
@@ -509,11 +517,14 @@ def test_humanoid_policy_server_saves_camera_images_from_policy_options(
                     )
                 ],
             ),
+            bootstrap_only=False,
+            bootstrap_env_ids=[],
         ),
         context=None,
     )
 
     assert len(response.actions) == 1
+    assert response.behavior_policy_version == "7"
     saved = list((tmp_path / "session_1").glob("*.jpg"))
     assert [path.name for path in saved] == [
         "frame_000000020000_env000_00_front_camera.jpg"

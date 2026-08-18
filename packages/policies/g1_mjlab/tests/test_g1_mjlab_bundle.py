@@ -9,9 +9,12 @@ import torch
 from alpagym_g1_mjlab.bundle import build_model_inputs, get_bundle, load_inference_model
 from alpagym_g1_mjlab.humanoid_policy import build_humanoid_policy_factory
 from alpagym_g1_mjlab.model import (
+    ACTION_SCHEMA,
     G1MjlabActorCriticModel,
     G1MjlabConfig,
     G1_MJLAB_REPLAY_SCHEMA,
+    JOINT_NAMES,
+    OBSERVATION_SCHEMA,
     OBS_DIMS,
     OBS_KEYS,
     register_g1_mjlab_model,
@@ -80,7 +83,7 @@ def test_load_inference_model_and_humanoid_policy_factory(tmp_path: Path) -> Non
     )
     inference = load_inference_model(run_config, torch.device("cpu"), torch.float32)
     factory = build_humanoid_policy_factory(run_config, SimpleNamespace(get_model=inference.get_model))
-    policy = factory("session", SimpleNamespace(action_size=23))
+    policy = factory("session", _session_request())
     flat_obs = torch.zeros(sum(OBS_DIMS[key] for key in OBS_KEYS))
     output = policy.step((SimpleNamespace(env_id=3, observation=flat_obs),))[0]
     assert output.env_id == 3
@@ -88,6 +91,53 @@ def test_load_inference_model_and_humanoid_policy_factory(tmp_path: Path) -> Non
     assert output.logprob is not None
     assert output.value is not None
     assert output.replay_data is not None
+
+
+def test_humanoid_policy_reads_replaced_inference_model_at_every_step(tmp_path: Path) -> None:
+    """Cosmos model replacement must affect sessions created before the swap."""
+    _write_bundle(tmp_path)
+    run_config = SimpleNamespace(
+        policy=SimpleNamespace(
+            model=SimpleNamespace(
+                path=str(tmp_path),
+                device="cpu",
+                bundle_config={"deterministic": True},
+            )
+        )
+    )
+    first = load_inference_model(run_config, torch.device("cpu"), torch.float32).get_model()
+    second = G1MjlabActorCriticModel(G1MjlabConfig(hidden_dims=[8], init_std=0.2))
+    engine = SimpleNamespace(model=first)
+    engine.get_model = lambda: engine.model
+    policy = build_humanoid_policy_factory(run_config, engine)("session", _session_request())
+    flat_obs = torch.zeros(sum(OBS_DIMS.values()))
+    policy_input = SimpleNamespace(env_id=0, observation=flat_obs)
+    first_action = policy.step((policy_input,))[0].action
+
+    with torch.no_grad():
+        second.actor[-1].weight.zero_()
+        second.actor[-1].bias.fill_(0.75)
+    engine.model = second
+    second_action = policy.step((policy_input,))[0].action
+
+    assert not torch.equal(first_action, second_action)
+    torch.testing.assert_close(second_action, torch.full((23,), 0.75))
+
+
+def _session_request() -> SimpleNamespace:
+    return SimpleNamespace(
+        action_size=23,
+        random_seed=17,
+        observation_schema=OBSERVATION_SCHEMA,
+        action_schema=ACTION_SCHEMA,
+        observation_terms=[
+            SimpleNamespace(name=key, size=OBS_DIMS[key]) for key in OBS_KEYS
+        ],
+        joint_names=JOINT_NAMES,
+        attempt_id="attempt-0",
+        scene_id="hq_stairs",
+        scenario_id="ascend",
+    )
 
 
 def test_build_model_inputs_rejects_foreign_schema() -> None:

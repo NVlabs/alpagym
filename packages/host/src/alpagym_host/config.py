@@ -215,6 +215,9 @@ class CosmosRLTrainPolicyConfig:
     ppo_normalize_advantages: bool = True
     ppo_gamma: float = 0.99
     ppo_gae_lambda: float = 0.95
+    # Number of flattened transition rows per PPO optimizer update. This is
+    # deliberately independent from Cosmos's rollout/shard ``mini_batch``.
+    step_mini_batch: int | None = None
 
 
 @dataclass
@@ -396,6 +399,50 @@ class AlpaSimWizardArgs:
 
 
 @dataclass
+class HumanoidAlpaSimConfig:
+    """Scene-bound inputs and task parameters for managed MJLab rollouts."""
+
+    repo_path: str
+    scene_store_path: str
+    scenario_ids_by_scene: dict[str, str]
+    num_envs: int = 1
+    service_image: str = "alpasim-humanoid:local"
+    reward_profile_id: str = "direct_v9_shaped.v1"
+    route_center_soft_m: float = 0.10
+    route_progress_credit_m: float = 0.30
+    route_corridor_half_width_m: float = 0.45
+
+    def __post_init__(self) -> None:
+        """Reject ambiguous scene routing and invalid centerline thresholds."""
+        if not self.repo_path or not self.scene_store_path:
+            raise ValueError("HumanoidAlpaSimConfig paths must be non-empty")
+        if not self.scenario_ids_by_scene or any(
+            not scene_id or not scenario_id
+            for scene_id, scenario_id in self.scenario_ids_by_scene.items()
+        ):
+            raise ValueError(
+                "HumanoidAlpaSimConfig.scenario_ids_by_scene must contain non-empty IDs"
+            )
+        if self.num_envs != 1:
+            raise ValueError(
+                "HumanoidAlpaSimConfig.num_envs must be 1 until replay carries "
+                "lane-local trajectory identity"
+            )
+        thresholds = (
+            self.route_center_soft_m,
+            self.route_progress_credit_m,
+            self.route_corridor_half_width_m,
+        )
+        if not all(math.isfinite(value) for value in thresholds):
+            raise ValueError("Humanoid route thresholds must be finite")
+        if not 0 <= thresholds[0] < thresholds[1] < thresholds[2]:
+            raise ValueError(
+                "Humanoid route thresholds must satisfy 0 <= center_soft < "
+                "progress_credit < corridor_half_width"
+            )
+
+
+@dataclass
 class AlpaSimConfig:
     """Host-managed AlpaSim Wizard startup settings."""
 
@@ -408,6 +455,7 @@ class AlpaSimConfig:
     repo_path: str | None = None
     # Optional directory for cached AlpaSim checkouts. Defaults to XDG_CACHE_HOME.
     checkout_cache_dir: str | None = None
+    humanoid: HumanoidAlpaSimConfig | None = None
 
     def __post_init__(self) -> None:
         """Reject configs that pin both an explicit repo_path and a remote repo.
@@ -419,6 +467,10 @@ class AlpaSimConfig:
         """
         if self.repo_path is not None and (self.repo_url is not None or self.repo_ref is not None):
             raise ValueError("AlpaSimConfig.repo_path is mutually exclusive with repo_url/repo_ref")
+        if self.humanoid is not None and self.simulation_domain != "humanoid":
+            raise ValueError(
+                "alpasim.humanoid requires alpasim.simulation_domain='humanoid'"
+            )
 
 
 class TransportKind(StrEnum):

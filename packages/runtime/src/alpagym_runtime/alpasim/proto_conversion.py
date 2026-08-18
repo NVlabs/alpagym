@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: E402
 
+import hashlib
+
 from alpasim_grpc.v0.common_pb2 import Pose as ProtoPose, PoseAtTime, Trajectory as ProtoTrajectory
 from alpasim_grpc.v0.egodriver_pb2 import (
     DriveResponse,
@@ -42,6 +44,7 @@ def build_simulation_request_proto(
     humanoid_policy_host: str | None = None,
     humanoid_policy_port: int | None = None,
     n_concurrent_per_humanoid_policy: int = 0,
+    humanoid_scenario_ids: tuple[str, ...] | None = None,
 ) -> SimulationRequest:
     """Build one RuntimeService simulate request."""
     if not scene_ids:
@@ -93,12 +96,26 @@ def build_simulation_request_proto(
         humanoid_policy.port = humanoid_policy_port
         simulation_request.n_concurrent_per_humanoid_policy = n_concurrent_per_humanoid_policy
 
-    for scene_id in scene_ids:
+        if humanoid_scenario_ids is None or len(humanoid_scenario_ids) != len(scene_ids):
+            raise ValueError("humanoid requests require one scenario_id per scene_id")
+
+    for scene_index, scene_id in enumerate(scene_ids):
         rollout_spec = simulation_request.rollout_specs.add()
-        rollout_spec.scenario_id = scene_id
+        if uses_humanoid_policy:
+            assert humanoid_scenario_ids is not None
+            rollout_spec.scene_id = scene_id
+            rollout_spec.scenario_id = humanoid_scenario_ids[scene_index]
+        else:
+            rollout_spec.scenario_id = scene_id
         rollout_spec.nr_rollouts = n_generation
         if session_uuid is not None:
             rollout_spec.session_uuids.append(session_uuid)
+            if uses_humanoid_policy:
+                rollout_spec.attempt_ids.append(session_uuid)
+                digest = hashlib.sha256(
+                    f"alpagym-humanoid-v1:{session_uuid}".encode()
+                ).digest()
+                rollout_spec.random_seed = int.from_bytes(digest[:8], "big") or 1
     return simulation_request
 
 

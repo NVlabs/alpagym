@@ -9,7 +9,7 @@ supported-markers = [
 ]
 
 [options]
-exclude-newer = "2026-08-11T20:20:44.692242792Z"
+exclude-newer = "2026-08-15T05:17:52.62976832Z"
 exclude-newer-span = "P3D"
 
 [manifest]
@@ -23,7 +23,7 @@ members = [
     "alpagym-workspace",
 ]
 overrides = [
-    { name = "cosmos-rl", git = "https://github.com/nvidia-cosmos/cosmos-rl.git?rev=d2a2c57c4bd6496482bc42da19a59b4432705eda" },
+    { name = "cosmos-rl", git = "https://github.com/nvidia-cosmos/cosmos-rl.git?rev=a367b4cc814ff153e846f386fde59919ab7247e3" },
     { name = "xformers", marker = "sys_platform == 'never'" },
 ]
 
@@ -190,7 +190,7 @@ requires-dist = [
     { name = "alpagym-plugins", editable = "packages/plugins" },
     { name = "alpamayo-recipes", git = "https://github.com/NVlabs/alpamayo-recipes.git?subdirectory=src&rev=4bc76779739461a028ee8bb9008bc4082a3328dd" },
     { name = "alpasim-grpc", git = "https://github.com/NVlabs/alpasim.git?subdirectory=src%2Fgrpc&rev=10cae1c2b943da72eabafad65df80f4e3c16d90d" },
-    { name = "cosmos-rl", extras = ["rl", "wfm"], git = "https://github.com/nvidia-cosmos/cosmos-rl.git?rev=d2a2c57c4bd6496482bc42da19a59b4432705eda" },
+    { name = "cosmos-rl", extras = ["rl", "wfm"], git = "https://github.com/nvidia-cosmos/cosmos-rl.git?rev=a367b4cc814ff153e846f386fde59919ab7247e3" },
     { name = "einops" },
     { name = "flash-attn", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" },
     { name = "grouped-gemm", git = "https://github.com/fanshiqing/grouped_gemm?rev=v1.1.4" },
@@ -496,8 +496,8 @@ wheels = [
 
 [[package]]
 name = "cosmos-rl"
-version = "0.4.3.post1.dev17+gd2a2c57c4"
-source = { git = "https://github.com/nvidia-cosmos/cosmos-rl.git?rev=d2a2c57c4bd6496482bc42da19a59b4432705eda#d2a2c57c4bd6496482bc42da19a59b4432705eda" }
+version = "0.4.3.post1.dev40+ga367b4cc8"
+source = { git = "https://github.com/nvidia-cosmos/cosmos-rl.git?rev=a367b4cc814ff153e846f386fde59919ab7247e3#a367b4cc814ff153e846f386fde59919ab7247e3" }
 dependencies = [
     { name = "accelerate", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "blobfile", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },

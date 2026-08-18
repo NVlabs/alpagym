@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E402
 
 import logging
 import os
@@ -12,6 +13,9 @@ from typing import cast
 
 import grpc
 import yaml
+from alpagym_runtime.alpasim.grpc_import import ensure_alpasim_grpc_source
+
+ensure_alpasim_grpc_source()
 from alpasim_grpc.v0.common_pb2 import Empty
 from alpasim_grpc.v0.runtime_pb2_grpc import RuntimeServiceStub
 
