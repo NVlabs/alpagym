@@ -177,11 +177,23 @@ class EpisodeOutput:
     session_uuid: str
     num_steps: int
     policy_outputs: tuple[PolicyOutput, ...]
+    # Exact seed shared by simulator dynamics and per-lane policy sampling.
+    # JSON integers preserve the full uint64 range; float-valued metric maps do not.
+    rollout_seed: int | None = None
     executed_ego_trajectory: Trajectory = field(default_factory=Trajectory)
     route_waypoints: tuple[RouteWaypoint, ...] = ()
     metrics: EpisodeMetrics | None = None
     reward: RewardResult | None = None
     is_valid: bool = True
+
+    def __post_init__(self) -> None:
+        """Reject seeds that cannot round-trip through the rollout uint64 ABI."""
+        if self.rollout_seed is not None and (
+            isinstance(self.rollout_seed, bool)
+            or not isinstance(self.rollout_seed, int)
+            or not 0 <= self.rollout_seed <= (1 << 64) - 1
+        ):
+            raise ValueError("EpisodeOutput.rollout_seed must be a uint64 or null")
 
 
 @dataclass(frozen=True)

@@ -17,6 +17,7 @@ from alpagym_host.config import (
     CosmosRLMode,
     ExecutionBackend,
     HumanoidAlpaSimConfig,
+    HumanoidExecutionProfile,
     RunConfig,
     SeparateNodesSlurmTopologyConfig,
     TransportKind,
@@ -24,7 +25,12 @@ from alpagym_host.config import (
     register_config_schema,
 )
 from alpagym_host.config_validation import validate_run_config
-from alpagym_host.run_artifacts import build_artifact_paths, build_run_config, write_run_artifacts
+from alpagym_host.humanoid_scene_identity import freeze_humanoid_scene_fingerprints
+from alpagym_host.run_artifacts import (
+    build_artifact_paths,
+    build_run_config,
+    write_run_artifacts,
+)
 from hydra import compose, initialize_config_module
 
 
@@ -65,16 +71,24 @@ def test_host_writes_and_loads_handoff_artifacts(
     cosmos_config = tomllib.loads(artifact_paths.cosmos_config_path.read_text())
 
     assert config_dict["artifact_paths"] == {
-        field: str(getattr(artifact_paths, field)) for field in ArtifactPaths.__dataclass_fields__
+        field: str(getattr(artifact_paths, field))
+        for field in ArtifactPaths.__dataclass_fields__
     }
     assert isinstance(loaded_config, RunConfig)
     assert loaded_config.artifact_paths.topology_registry_dir == (
         artifact_paths.topology_registry_dir
     )
-    assert loaded_config.artifact_paths.alpasim_log_dir == artifact_paths.alpasim_log_dir
-    assert loaded_config.artifact_paths.submit_script_path == artifact_paths.submit_script_path
+    assert (
+        loaded_config.artifact_paths.alpasim_log_dir == artifact_paths.alpasim_log_dir
+    )
+    assert (
+        loaded_config.artifact_paths.submit_script_path
+        == artifact_paths.submit_script_path
+    )
     assert artifact_paths.submit_script_path == artifact_paths.run_dir / "submit.sbatch"
-    assert isinstance(loaded_config.execution.slurm.topology, AllInOneSlurmTopologyConfig)
+    assert isinstance(
+        loaded_config.execution.slurm.topology, AllInOneSlurmTopologyConfig
+    )
     assert loaded_config.execution.slurm.topology.alpasim_gpus == 1
     assert loaded_config.policy.kind == "alpamayo"
     assert loaded_config.policy.model.kind == "alpamayo_r1"
@@ -152,6 +166,8 @@ def test_host_writes_alpagym_ppo_trainer_config(
         "normalize_advantages": False,
         "gamma": 0.97,
         "gae_lambda": 0.9,
+        "min_action_std": 0.02,
+        "max_action_std": 2.0,
     }
 
 
@@ -234,7 +250,9 @@ def test_topology_preset_selects_separate_nodes_schema(tmp_path: Path) -> None:
     assert "cosmos_nodes" not in cfg.execution.slurm
     assert "alpasim_nodes" not in cfg.execution.slurm
     assert "alpasim_gpus" not in cfg.execution.slurm
-    assert isinstance(resolved_config.execution.slurm.topology, SeparateNodesSlurmTopologyConfig)
+    assert isinstance(
+        resolved_config.execution.slurm.topology, SeparateNodesSlurmTopologyConfig
+    )
     assert resolved_config.execution.backend is ExecutionBackend.slurm
     assert resolved_config.execution.slurm.topology.cosmos_nodes == 2
     assert resolved_config.execution.slurm.topology.alpasim_nodes == 1
@@ -311,7 +329,10 @@ def test_cosmos_config_extracts_real_model_tarball(tmp_path: Path) -> None:
     extracted_bundle_dir = artifact_paths.policy_model_bundle_dir
     assert cosmos_config["policy"]["model_name_or_path"] == str(extracted_bundle_dir)
     assert run_config.policy.model.path == str(extracted_bundle_dir)
-    assert json.loads((extracted_bundle_dir / "config.json").read_text())["model_type"] == "alpamayo_r1"
+    assert (
+        json.loads((extracted_bundle_dir / "config.json").read_text())["model_type"]
+        == "alpamayo_r1"
+    )
 
 
 def test_load_or_create_run_config_validates_before_writing_artifacts(
@@ -352,7 +373,9 @@ def test_load_or_create_run_config_validates_before_writing_artifacts(
     assert not any(tmp_path.iterdir())
 
 
-def test_load_prepared_run_config_accepts_extracted_hf_bundle_dir(tmp_path: Path) -> None:
+def test_load_prepared_run_config_accepts_extracted_hf_bundle_dir(
+    tmp_path: Path,
+) -> None:
     """Prepared resolved configs accept normalized HF bundle directories."""
     register_config_schema()
     model_path = _write_hf_bundle_tarball(tmp_path)
@@ -385,7 +408,9 @@ def test_load_prepared_run_config_accepts_extracted_hf_bundle_dir(tmp_path: Path
 
     loaded_config = load_or_create_run_config(prepared_cfg)
 
-    assert loaded_config.policy.model.path == str(artifact_paths.policy_model_bundle_dir)
+    assert loaded_config.policy.model.path == str(
+        artifact_paths.policy_model_bundle_dir
+    )
 
 
 def test_load_prepared_run_config_rejects_model_tarball_path(tmp_path: Path) -> None:
@@ -493,7 +518,9 @@ def test_load_or_create_run_config_accepts_hf_bundle_tarball_with_sharded_weight
 
     run_config = load_or_create_run_config(cfg)
 
-    assert run_config.policy.model.path == str(run_config.artifact_paths.policy_model_bundle_dir)
+    assert run_config.policy.model.path == str(
+        run_config.artifact_paths.policy_model_bundle_dir
+    )
 
 
 def test_load_or_create_run_config_accepts_numbered_single_file_hf_bundle_tarball(
@@ -519,7 +546,9 @@ def test_load_or_create_run_config_accepts_numbered_single_file_hf_bundle_tarbal
 
     run_config = load_or_create_run_config(cfg)
 
-    assert run_config.policy.model.path == str(run_config.artifact_paths.policy_model_bundle_dir)
+    assert run_config.policy.model.path == str(
+        run_config.artifact_paths.policy_model_bundle_dir
+    )
 
 
 @pytest.mark.parametrize(
@@ -628,6 +657,200 @@ def test_humanoid_config_rejects_vector_env_until_lane_local_gae_exists() -> Non
             scenario_ids_by_scene={"stairs": "ascend"},
             num_envs=2,
         )
+
+
+@pytest.mark.parametrize("rollout_seed_base", [-1, 1 << 64, True, 1.5])
+def test_humanoid_config_rejects_non_uint64_rollout_seed_base(
+    rollout_seed_base: object,
+) -> None:
+    """The optional deterministic panel base matches the uint64 proto ABI."""
+    with pytest.raises(ValueError, match="rollout_seed_base must be a uint64"):
+        HumanoidAlpaSimConfig(
+            repo_path="/tmp/alpasim-humanoid",
+            scene_store_path="/tmp/humanoid-scenes",
+            scenario_ids_by_scene={"stairs": "ascend"},
+            rollout_seed_base=rollout_seed_base,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("rollout_seed_base", [0, (1 << 64) - 1])
+def test_humanoid_config_accepts_uint64_rollout_seed_boundaries(
+    rollout_seed_base: int,
+) -> None:
+    config = HumanoidAlpaSimConfig(
+        repo_path="/tmp/alpasim-humanoid",
+        scene_store_path="/tmp/humanoid-scenes",
+        scenario_ids_by_scene={"stairs": "ascend"},
+        rollout_seed_base=rollout_seed_base,
+    )
+
+    assert config.rollout_seed_base == rollout_seed_base
+
+
+@pytest.mark.parametrize(
+    ("execution_profile", "reward_profile_id", "grail_root_path", "match"),
+    [
+        (
+            HumanoidExecutionProfile.direct_action,
+            "reference_route_centered.v2",
+            None,
+            "direct_action requires",
+        ),
+        (
+            HumanoidExecutionProfile.motion_reference,
+            "reference_route_centered.v4",
+            "/tmp/GRAIL",
+            "reward_profile_id must be one of",
+        ),
+    ],
+)
+def test_humanoid_config_rejects_reward_profiles_outside_execution_abi(
+    execution_profile: HumanoidExecutionProfile,
+    reward_profile_id: str,
+    grail_root_path: str | None,
+    match: str,
+) -> None:
+    """Each humanoid execution ABI accepts only its known reward profiles."""
+    with pytest.raises(ValueError, match=match):
+        HumanoidAlpaSimConfig(
+            repo_path="/tmp/alpasim-humanoid",
+            scene_store_path="/tmp/humanoid-scenes",
+            scenario_ids_by_scene={"stairs": "ascend"},
+            execution_profile=execution_profile,
+            grail_root_path=grail_root_path,
+            reward_profile_id=reward_profile_id,
+        )
+
+
+def test_motion_reference_freeze_injects_single_source_paths_and_fingerprint(
+    tmp_path: Path,
+) -> None:
+    scene_store = tmp_path / "scene_store"
+    scene_root = scene_store / "scenes" / "stairs"
+    scene_root.mkdir(parents=True)
+    digest = "a" * 64
+    (scene_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "scene_id": "stairs",
+                "identity": {"scene_content_sha256": digest},
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_config = _make_run_config(
+        tmp_path,
+        "alpasim.simulation_domain=humanoid",
+        "dataset.scene_ids=[stairs]",
+        "alpasim.wizard_args.force_gt_duration_us=0",
+        "cosmos.rollout.prefetch_rollout=false",
+    )
+    run_config.alpasim.humanoid = HumanoidAlpaSimConfig(
+        repo_path="/tmp/humanoid-support",
+        scene_store_path=str(scene_store),
+        scenario_ids_by_scene={"stairs": "ascend"},
+        execution_profile=HumanoidExecutionProfile.motion_reference,
+        grail_root_path="/tmp/GRAIL",
+        reward_profile_id="reference_route_centered.v1",
+    )
+
+    frozen = freeze_humanoid_scene_fingerprints(run_config)
+
+    assert frozen.alpasim.humanoid is not None
+    assert frozen.alpasim.humanoid.expected_scene_fingerprints == {"stairs": digest}
+    assert frozen.policy.model.bundle_config["humanoid_repo_path"] == (
+        "/tmp/humanoid-support"
+    )
+    assert frozen.policy.model.bundle_config["scene_store_path"] == str(
+        scene_store.resolve()
+    )
+    assert frozen.policy.model.bundle_config["expected_scene_fingerprints_json"] == (
+        '{"stairs":"' + digest + '"}'
+    )
+
+
+@pytest.mark.parametrize(
+    ("reward_profile_override", "expected_reward_profile_id"),
+    [
+        (None, "reference_route_centered.v3"),
+        (
+            "alpasim.humanoid.reward_profile_id=reference_route_centered.v2",
+            "reference_route_centered.v2",
+        ),
+        (
+            "alpasim.humanoid.reward_profile_id=reference_route_centered.v3",
+            "reference_route_centered.v3",
+        ),
+    ],
+)
+def test_motion_reference_experiment_resolves_seed_panel_and_horizon(
+    tmp_path: Path,
+    reward_profile_override: str | None,
+    expected_reward_profile_id: str,
+) -> None:
+    """The preset resolves its horizon, panel seed, and opt-in reward profile."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    scene_root = tmp_path / "scene_store" / "scenes" / "hq_stairs"
+    scene_root.mkdir(parents=True)
+    (scene_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "scene_id": "hq_stairs",
+                "identity": {"scene_content_sha256": "a" * 64},
+            }
+        ),
+        encoding="utf-8",
+    )
+    register_config_schema()
+    with initialize_config_module(version_base=None, config_module="alpagym_host.conf"):
+        cfg = compose(
+            config_name="default",
+            overrides=[
+                "experiment=g1_videomimic_planner_hq_stairs_local_1gpu",
+                f"run_root={tmp_path.as_posix()}",
+                f"policy.model.path={model_path.as_posix()}",
+                f"alpasim.repo_path={(tmp_path / 'alpasim').as_posix()}",
+                "alpasim.repo_url=null",
+                "alpasim.repo_ref=null",
+                f"alpasim.humanoid.repo_path={(tmp_path / 'humanoid').as_posix()}",
+                "alpasim.humanoid.scene_store_path="
+                f"{(tmp_path / 'scene_store').as_posix()}",
+                f"alpasim.humanoid.grail_root_path={(tmp_path / 'GRAIL').as_posix()}",
+                "alpasim.humanoid.rollout_seed_base=9000",
+                *([reward_profile_override] if reward_profile_override else []),
+            ],
+        )
+    run_config = freeze_humanoid_scene_fingerprints(
+        build_run_config(cfg, build_artifact_paths(cfg))
+    )
+
+    validate_run_config(run_config, "run")
+    write_run_artifacts(run_config)
+    resolved_config = yaml.safe_load(
+        run_config.artifact_paths.resolved_config_path.read_text(encoding="utf-8")
+    )
+
+    assert (
+        run_config.alpasim.wizard_args.n_sim_steps
+        == run_config.expected_valid_steps
+        == 300
+    )
+    assert run_config.alpasim.wizard_args.control_timestep_us == 100_000
+    assert run_config.cosmos.train.optm_lr == pytest.approx(1.0e-6)
+    assert run_config.cosmos.train.train_policy.step_mini_batch == 300
+    assert run_config.cosmos.train.train_policy.grpo_optimization_iterations == 1
+    assert run_config.cosmos.train.train_policy.kl_beta == pytest.approx(0.1)
+    assert run_config.cosmos.train.train_policy.reference_reset_interval == 0
+    assert run_config.cosmos.train.train_policy.ppo_gamma**5 == pytest.approx(0.99)
+    assert run_config.cosmos.train.train_policy.ppo_gae_lambda**5 == pytest.approx(0.95)
+    assert run_config.alpasim.humanoid is not None
+    assert run_config.alpasim.humanoid.rollout_seed_base == 9000
+    assert resolved_config["alpasim"]["humanoid"]["rollout_seed_base"] == 9000
+    assert run_config.alpasim.humanoid.reward_profile_id == expected_reward_profile_id
+    assert (
+        resolved_config["alpasim"]["humanoid"]["reward_profile_id"]
+        == expected_reward_profile_id
+    )
 
 
 def test_humanoid_config_rejects_unqualified_distributed_async_mode(
@@ -810,14 +1033,20 @@ def test_slurm_distributed_shared_cosmos_2_3_preset_keeps_coupled_run_shape(
 
     validate_run_config(run_config, "run")
 
-    assert isinstance(run_config.execution.slurm.topology, SeparateNodesSlurmTopologyConfig)
+    assert isinstance(
+        run_config.execution.slurm.topology, SeparateNodesSlurmTopologyConfig
+    )
     topology = run_config.execution.slurm.topology
-    assert run_config.execution.slurm.nodes == topology.cosmos_nodes + topology.alpasim_nodes
+    assert (
+        run_config.execution.slurm.nodes
+        == topology.cosmos_nodes + topology.alpasim_nodes
+    )
     assert topology.cosmos_nodes == 2
     assert topology.alpasim_nodes == 3
     assert run_config.transport.kind is TransportKind.disk
     assert (
-        "runtime.simulation_config.n_sim_steps=30" in run_config.alpasim.wizard_args.extra_overrides
+        "runtime.simulation_config.n_sim_steps=30"
+        in run_config.alpasim.wizard_args.extra_overrides
     )
     assert (
         "runtime.simulation_config.force_gt_duration_us=1600000"
@@ -937,7 +1166,9 @@ def _make_run_config(tmp_path: Path, *overrides: str) -> RunConfig:
     with deploy=local.
     """
     register_config_schema()
-    requests_slurm = any(override.startswith("topology=slurm") for override in overrides)
+    requests_slurm = any(
+        override.startswith("topology=slurm") for override in overrides
+    )
     if requests_slurm:
         base_overrides = [
             f"run_root={tmp_path.as_posix()}",
@@ -947,7 +1178,8 @@ def _make_run_config(tmp_path: Path, *overrides: str) -> RunConfig:
             "execution.slurm.account=research",
         ]
         if not any(
-            override.startswith("execution.slurm.container_mounts") for override in overrides
+            override.startswith("execution.slurm.container_mounts")
+            for override in overrides
         ):
             # Identity-mount the tmp run dir so the Slurm host-path mount check accepts the
             # tmp_path run_root and model bundle, alongside the required uv-cache mount.
@@ -963,7 +1195,9 @@ def _make_run_config(tmp_path: Path, *overrides: str) -> RunConfig:
     if not any(override.startswith("policy.model.kind=") for override in overrides):
         base_overrides.append("policy.model.kind=alpamayo_r1")
     if not any(override.startswith("policy.model.path=") for override in overrides):
-        base_overrides.append(f"policy.model.path={(tmp_path / 'model_bundle').as_posix()}")
+        base_overrides.append(
+            f"policy.model.path={(tmp_path / 'model_bundle').as_posix()}"
+        )
     with initialize_config_module(version_base=None, config_module="alpagym_host.conf"):
         cfg = compose(
             config_name="default",
@@ -991,7 +1225,9 @@ def _write_hf_bundle_dir(
     """Create a minimal local HF bundle directory."""
     bundle_dir = tmp_path / "model_bundle"
     bundle_dir.mkdir()
-    (bundle_dir / "config.json").write_text(json.dumps({"model_type": "alpamayo_r1"}), encoding="utf-8")
+    (bundle_dir / "config.json").write_text(
+        json.dumps({"model_type": "alpamayo_r1"}), encoding="utf-8"
+    )
     if include_weight_file:
         (bundle_dir / weight_filename).write_text("weights", encoding="utf-8")
     if include_shard_index:

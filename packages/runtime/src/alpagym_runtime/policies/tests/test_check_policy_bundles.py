@@ -53,7 +53,9 @@ def _bundle(
     )
 
 
-def test_check_policy_bundles_loads_each_installed_bundle(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_check_policy_bundles_loads_each_installed_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The all-bundles check loads and validates each installed entry point."""
     monkeypatch.setattr(
         check_policy_bundles.policy_bundles,
@@ -69,7 +71,9 @@ def test_check_policy_bundles_loads_each_installed_bundle(monkeypatch: pytest.Mo
         loaded.append(kind)
         return _bundle()
 
-    monkeypatch.setattr(check_policy_bundles, "get_policy_bundle", fake_get_policy_bundle)
+    monkeypatch.setattr(
+        check_policy_bundles, "get_policy_bundle", fake_get_policy_bundle
+    )
 
     checked = check_policy_bundles.check_policy_bundles()
 
@@ -77,7 +81,9 @@ def test_check_policy_bundles_loads_each_installed_bundle(monkeypatch: pytest.Mo
     assert loaded == ["a_policy", "b_policy"]
 
 
-def test_check_policy_bundles_rejects_non_callable_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_check_policy_bundles_rejects_non_callable_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Loaded bundles must expose callable hooks."""
     monkeypatch.setattr(
         check_policy_bundles.policy_bundles,
@@ -92,3 +98,15 @@ def test_check_policy_bundles_rejects_non_callable_hook(monkeypatch: pytest.Monk
 
     with pytest.raises(TypeError, match="load_inference_model"):
         check_policy_bundles.check_policy_bundles()
+
+
+def test_policy_bundle_rejects_non_callable_optional_export_hook() -> None:
+    with pytest.raises(TypeError, match="export_model_checkpoint"):
+        PolicyBundle(
+            setup_tokenizer=_setup_tokenizer,
+            build_data_packer=_build_data_packer,
+            install_runtime_bridge=_install_runtime_bridge,
+            load_inference_model=_load_inference_model,
+            build_model_inputs=_build_model_inputs,
+            export_model_checkpoint="not-callable",  # type: ignore[arg-type]
+        )

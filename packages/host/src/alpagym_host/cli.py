@@ -15,6 +15,7 @@ from alpagym_host.config import (
 )
 from alpagym_host.config_validation import validate_run_config
 from alpagym_host.huggingface_validation import validate_huggingface_access
+from alpagym_host.humanoid_scene_identity import freeze_humanoid_scene_fingerprints
 from alpagym_host.run_artifacts import (
     build_artifact_paths,
     build_run_config,
@@ -32,6 +33,7 @@ def load_or_create_run_config(cfg: DictConfig) -> RunConfig:
         artifact_paths = build_artifact_paths(cfg)
         run_config = build_run_config(cfg, artifact_paths)
         run_config = normalize_generated_policy_model_path(run_config)
+        run_config = freeze_humanoid_scene_fingerprints(run_config)
     else:
         run_config = load_run_config(cfg.execution.resolved_config_path)
 
@@ -54,7 +56,10 @@ def main(cfg: DictConfig) -> object:
     # Validate HuggingFace access before AV/NuRec dispatch, so submit fails before
     # queuing a Slurm allocation and run fails before resolving the AlpaSim
     # checkout. Humanoid dynamics-only runs do not consume HuggingFace NuRec assets.
-    if getattr(getattr(run_config, "alpasim", None), "simulation_domain", "av") != "humanoid":
+    if (
+        getattr(getattr(run_config, "alpasim", None), "simulation_domain", "av")
+        != "humanoid"
+    ):
         validate_huggingface_access()
     if cfg.command == "run":
         execute_run(run_config)

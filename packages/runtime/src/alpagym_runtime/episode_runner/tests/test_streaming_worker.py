@@ -9,6 +9,7 @@ replaces `_run_rollout` with a deterministic per-uuid outcome map, so
 no AlpaSim runtime, gRPC channel, disk I/O, or reward computation runs.
 """
 
+import hashlib
 import threading
 from concurrent.futures import Future
 from pathlib import Path
@@ -16,7 +17,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from alpagym_runtime.alpasim.tests.test_proto_conversion import install_alpasim_grpc_stubs
+from alpagym_runtime.alpasim.tests.test_proto_conversion import (
+    install_alpasim_grpc_stubs,
+)
 
 install_alpasim_grpc_stubs()
 
@@ -39,13 +42,18 @@ def _resolve_scene(payload: SimpleNamespace) -> str:
     return f"scene-{payload.prompt_idx}"
 
 
-def _make_episode(scene_id: str, session_uuid: str) -> EpisodeOutput:
+def _make_episode(
+    scene_id: str,
+    session_uuid: str,
+    rollout_seed: int | None = None,
+) -> EpisodeOutput:
     """Build a minimal in-memory `EpisodeOutput` for synchronous finalize calls."""
     return EpisodeOutput(
         scene_id=scene_id,
         session_uuid=session_uuid,
         num_steps=0,
         policy_outputs=(),
+        rollout_seed=rollout_seed,
         executed_ego_trajectory=Trajectory(poses=()),
     )
 
@@ -68,28 +76,53 @@ class _StubWorker(StreamingRolloutWorker):
         max_concurrent_rollouts: int = 2,
         rollouts_per_payload: int = 1,
         max_scene_retries: int = 3,
+        simulation_domain: str = "av",
+        rollout_seed_base: int | None = None,
     ) -> None:
         """Wire the worker with deterministic outcomes; tracks concurrency observed."""
         self._tmp_path = tmp_path
         self._outcomes_by_scene = outcomes_by_scene
         self._outcomes_by_uuid: dict[str, str] = dict(outcomes_by_uuid or {})
         self._call_log: list[str] = []  # list of session_uuid in dispatch order
+        self._random_seed_log: list[int | None] = []
         self._in_flight = 0
         self._max_in_flight = 0
         self._in_flight_lock = threading.Lock()
         self._gate = threading.Event()
         self._gate.set()
+        humanoid_policy_server = None
+        driver_server = SimpleNamespace(
+            topology_endpoint=SimpleNamespace(host="localhost", port=0),
+        )
+        if simulation_domain == "humanoid":
+
+            class _Servicer:
+                def reserve_session(
+                    self, session_uuid: str, behavior_policy_version: int
+                ) -> None:
+                    del session_uuid, behavior_policy_version
+
+                def discard_session(self, session_uuid: str) -> None:
+                    del session_uuid
+
+            humanoid_policy_server = SimpleNamespace(
+                topology_endpoint=SimpleNamespace(host="localhost", port=0),
+                servicer=_Servicer(),
+            )
+            driver_server = None
         super().__init__(
             alpasim_runtime_stub=SimpleNamespace(),
-            driver_server=SimpleNamespace(
-                topology_endpoint=SimpleNamespace(host="localhost", port=0),
-            ),
+            driver_server=driver_server,
+            humanoid_policy_server=humanoid_policy_server,
+            simulation_domain=simulation_domain,
             simulation_timeout_s=10.0,
             reward_config=SimpleNamespace(),
             max_concurrent_rollouts=max_concurrent_rollouts,
             rollouts_per_payload=rollouts_per_payload,
             scene_id_resolver=_resolve_scene,
+            scenario_id_resolver=lambda scene_id: "ascend",
             max_scene_retries=max_scene_retries,
+            rollout_seed_base=rollout_seed_base,
         )
 
     def _run_rollout(self, rollout_job: _RolloutJob) -> None:
@@ -98,6 +131,7 @@ class _StubWorker(StreamingRolloutWorker):
             self._in_flight += 1
             self._max_in_flight = max(self._max_in_flight, self._in_flight)
             self._call_log.append(rollout_job.session_uuid)
+            self._random_seed_log.append(rollout_job.random_seed)
         try:
             self._gate.wait(timeout=5.0)
             outcome = self._outcomes_by_uuid.get(rollout_job.session_uuid)
@@ -106,7 +140,11 @@ class _StubWorker(StreamingRolloutWorker):
             if outcome == "success":
                 self._on_rollout_succeeded(
                     rollout_job,
-                    _make_episode(rollout_job.scene_id, rollout_job.session_uuid),
+                    _make_episode(
+                        rollout_job.scene_id,
+                        rollout_job.session_uuid,
+                        rollout_job.random_seed,
+                    ),
                 )
             elif outcome == "fail":
                 self._on_rollout_failed(
@@ -125,7 +163,6 @@ def _drain_pool(worker: StreamingRolloutWorker) -> None:
     worker.shutdown()
     for rollout_worker in worker._rollout_workers:
         rollout_worker.join(timeout=5.0)
-
 
 
 def test_humanoid_worker_request_and_transition_payloads(tmp_path: Path) -> None:
@@ -176,6 +213,18 @@ def test_humanoid_worker_request_and_transition_payloads(tmp_path: Path) -> None
         assert list(request.rollout_specs[0].session_uuids) == ["humanoid-session"]
         assert request.rollout_specs[0].scene_id == "stairs-scene"
         assert request.rollout_specs[0].scenario_id == "ascend"
+        expected_seed = (
+            int.from_bytes(
+                hashlib.sha256(b"alpagym-humanoid-v1:humanoid-session").digest()[:8],
+                "big",
+            )
+            or 1
+        )
+        assert request.rollout_specs[0].random_seed == expected_seed
+
+        rollout_job.random_seed = 17
+        fixed_seed_request = worker._build_simulation_request(rollout_job)
+        assert fixed_seed_request.rollout_specs[0].random_seed == 17
 
         replay_data = PolicyReplayData(
             replay_schema_version=1,
@@ -239,6 +288,7 @@ def test_humanoid_worker_request_and_transition_payloads(tmp_path: Path) -> None
 
         assert episode.reward is not None
         assert episode.reward.total == pytest.approx(2.0)
+        assert episode.rollout_seed == 17
         assert episode.metrics is not None
         assert episode.metrics.dense["humanoid_reward_env0"]["values"] == [2.0]
         transition = episode.policy_outputs[0].replay_data.payload["transition"]
@@ -256,6 +306,7 @@ def test_humanoid_worker_request_and_transition_payloads(tmp_path: Path) -> None
         }
     finally:
         worker.shutdown()
+
 
 # ---------- 1. Slot budget respected ----------
 
@@ -280,9 +331,9 @@ def test_slot_budget_caps_in_flight_simulate_calls(tmp_path: Path) -> None:
         assert worker._max_in_flight == 2
         worker._gate.set()
         for payload_state in payload_states:
-            assert payload_state.future.result(timeout=5.0)[0].scene_id == _resolve_scene(
-                payload_state.payload
-            )
+            assert payload_state.future.result(timeout=5.0)[
+                0
+            ].scene_id == _resolve_scene(payload_state.payload)
         assert worker._max_in_flight == 2
     finally:
         worker._gate.set()
@@ -351,7 +402,10 @@ def test_submit_payload_dispatches_inline_on_cache_miss(tmp_path: Path) -> None:
         rollouts_per_payload=1,
     )
     try:
-        payload_states = [worker.submit_payload(_payload(0)), worker.submit_payload(_payload(1))]
+        payload_states = [
+            worker.submit_payload(_payload(0)),
+            worker.submit_payload(_payload(1)),
+        ]
         for payload_state in payload_states:
             artifacts = payload_state.future.result(timeout=5.0)
             assert len(artifacts) == 1
@@ -387,7 +441,9 @@ def test_distinct_prompt_idx_dispatches_independently(tmp_path: Path) -> None:
 # ---------- 6. Retry with fresh uuid ----------
 
 
-def test_failed_job_retries_with_fresh_uuid_and_decrements_budget(tmp_path: Path) -> None:
+def test_failed_job_retries_with_fresh_uuid_and_decrements_budget(
+    tmp_path: Path,
+) -> None:
     """A failing job is re-enqueued with a new session_uuid and the budget decrements."""
     # First uuid fails; the retry (any other uuid) succeeds via scene-level default.
     worker = _StubWorker(
@@ -415,6 +471,96 @@ def test_failed_job_retries_with_fresh_uuid_and_decrements_budget(tmp_path: Path
         assert payload_state.retries_left == 2  # one retry consumed
     finally:
         worker._gate.set()
+        _drain_pool(worker)
+
+
+def test_fixed_seed_panel_is_sequential_across_siblings_and_episodes(
+    tmp_path: Path,
+) -> None:
+    """Fresh humanoid jobs consume ``base + ordinal`` in creation order."""
+    worker = _StubWorker(
+        tmp_path=tmp_path,
+        outcomes_by_scene={"scene-0": "success", "scene-1": "success"},
+        max_concurrent_rollouts=1,
+        rollouts_per_payload=3,
+        simulation_domain="humanoid",
+        rollout_seed_base=100,
+    )
+    try:
+        first = worker.submit_payload(_payload(0), behavior_policy_version=7)
+        assert len(first.future.result(timeout=5.0)) == 3
+        second = worker.submit_payload(_payload(1), behavior_policy_version=7)
+        assert len(second.future.result(timeout=5.0)) == 3
+
+        assert worker._random_seed_log == [100, 101, 102, 103, 104, 105]
+        assert [episode.rollout_seed for episode in first.collected] == [100, 101, 102]
+        assert [episode.rollout_seed for episode in second.collected] == [103, 104, 105]
+    finally:
+        _drain_pool(worker)
+
+
+def test_fixed_seed_retry_reuses_seed_while_minting_fresh_uuid(tmp_path: Path) -> None:
+    """Infrastructure retry changes session identity but not panel identity."""
+    worker = _StubWorker(
+        tmp_path=tmp_path,
+        outcomes_by_scene={"scene-0": "success"},
+        max_concurrent_rollouts=1,
+        max_scene_retries=1,
+        simulation_domain="humanoid",
+        rollout_seed_base=42,
+    )
+    worker._gate.clear()
+    try:
+        payload_state = worker.submit_payload(_payload(0), behavior_policy_version=3)
+        for _ in range(200):
+            if worker._call_log:
+                break
+            threading.Event().wait(0.01)
+        assert len(worker._call_log) == 1
+        first_uuid = worker._call_log[0]
+        worker._outcomes_by_uuid[first_uuid] = "fail"
+        worker._gate.set()
+
+        artifacts = payload_state.future.result(timeout=5.0)
+        assert len(artifacts) == 1
+        assert artifacts[0].session_uuid != first_uuid
+        assert worker._random_seed_log == [42, 42]
+    finally:
+        worker._gate.set()
+        _drain_pool(worker)
+
+
+def test_unset_seed_base_keeps_legacy_uuid_hash_selection(tmp_path: Path) -> None:
+    """Training-default jobs leave proto conversion to derive the UUID hash seed."""
+    worker = _StubWorker(
+        tmp_path=tmp_path,
+        outcomes_by_scene={"scene-0": "success"},
+        max_concurrent_rollouts=1,
+        simulation_domain="humanoid",
+        rollout_seed_base=None,
+    )
+    try:
+        payload_state = worker.submit_payload(_payload(0), behavior_policy_version=0)
+        assert len(payload_state.future.result(timeout=5.0)) == 1
+        assert worker._random_seed_log == [None]
+    finally:
+        _drain_pool(worker)
+
+
+def test_fixed_seed_panel_rejects_job_ordinal_overflow(tmp_path: Path) -> None:
+    """A panel cannot silently wrap past the uint64 ABI boundary."""
+    worker = _StubWorker(
+        tmp_path=tmp_path,
+        outcomes_by_scene={"scene-0": "success"},
+        max_concurrent_rollouts=1,
+        rollouts_per_payload=2,
+        simulation_domain="humanoid",
+        rollout_seed_base=(1 << 64) - 1,
+    )
+    try:
+        with pytest.raises(OverflowError, match="exceeds uint64"):
+            worker.submit_payload(_payload(0), behavior_policy_version=0)
+    finally:
         _drain_pool(worker)
 
 

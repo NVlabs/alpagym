@@ -73,6 +73,16 @@ def validate_local_process_config(execution_backend: ExecutionBackend) -> None:
             "execution.backend=local_process requires Docker in PATH because AlpaSim Wizard "
             "uses Docker Compose for local launches."
         )
+    if shutil.which("redis-server") is None:
+        raise ValueError(
+            "execution.backend=local_process requires redis-server in PATH because "
+            "Cosmos-RL starts a local Redis process."
+        )
+    if shutil.which("redis-cli") is None:
+        raise ValueError(
+            "execution.backend=local_process requires redis-cli in PATH because "
+            "Cosmos-RL uses it to shut down its local Redis process."
+        )
     try:
         subprocess.run(
             ["docker", "compose", "version"],
@@ -220,12 +230,27 @@ def execute_run(config: RunConfig) -> None:
         apply_transport_env_vars(config.transport)
         if config.transport.nccl_env:
             logging.info(
-                "Applied NCCL fabric env to os.environ: %s", dict(config.transport.nccl_env)
+                "Applied NCCL fabric env to os.environ: %s",
+                dict(config.transport.nccl_env),
             )
         # Unbuffer worker stdout so cosmos-rl's import-time print() output (e.g. its
         # model auto-discovery) is interleaved in order instead of being flushed in a
         # block when the process exits.
         os.environ["PYTHONUNBUFFERED"] = "1"
+        if (
+            config.alpasim.simulation_domain == "humanoid"
+            and not execution_backend.is_slurm_run
+        ):
+            # The workspace pin can lag a local AlpaSim humanoid proto while
+            # the two worktrees are developed together.  Every local Cosmos
+            # worker must import the exact generated source used by Wizard.
+            grpc_root = (alpasim_checkout_root / "src" / "grpc").resolve()
+            if not (grpc_root / "alpasim_grpc" / "v0" / "humanoid_pb2.py").is_file():
+                raise ValueError(
+                    "humanoid AlpaSim checkout has no generated gRPC source at "
+                    f"{grpc_root}"
+                )
+            os.environ["ALPASIM_GRPC_ROOT"] = str(grpc_root)
         # Only local runs inherit this terminal; Slurm replicas write their own logs.
         tee_logs = (
             tee_role_logs(config.artifact_paths.log_dir)
@@ -241,7 +266,9 @@ def execute_run(config: RunConfig) -> None:
         logging.info("Cosmos launcher completed")
     finally:
         if wizard_processes:
-            logging.info("Stopping %d AlpaSim Wizard process(es)", len(wizard_processes))
+            logging.info(
+                "Stopping %d AlpaSim Wizard process(es)", len(wizard_processes)
+            )
         for process in wizard_processes:
             ensure_process_terminated(process)
 
@@ -282,7 +309,9 @@ def _start_wizard_process(
         host=host,
         slurm=config.execution.slurm,
         wizard_command=wizard_command,
-        log_path=(config.artifact_paths.log_dir / f"wizard_{runtime_index}.log").resolve(),
+        log_path=(
+            config.artifact_paths.log_dir / f"wizard_{runtime_index}.log"
+        ).resolve(),
     )
     logging.info(
         "Submitting AlpaSim Wizard through srun: runtime_index=%d host=%s slurm_log=%s",
@@ -295,7 +324,9 @@ def _start_wizard_process(
     # shared `ensure_process_terminated` can `os.killpg` it on cleanup (srun then forwards
     # the signal to the remote Wizard step). Without it killpg targets a non-existent group
     # and silently no-ops, leaking the Wizard srun. This mirrors the local `start_wizard`.
-    return subprocess.Popen(command, cwd=alpasim_checkout_root, start_new_session=True, text=True)
+    return subprocess.Popen(
+        command, cwd=alpasim_checkout_root, start_new_session=True, text=True
+    )
 
 
 def _wizard_log_dir(config: RunConfig, runtime_index: int) -> Path:
@@ -323,7 +354,9 @@ def _build_cosmos_command(
 
     Path(config.execution.slurm.uv_cache_dir).mkdir(parents=True, exist_ok=True)
     cosmos_hosts = topology.cosmos_host_plans
-    controller_url = f"{cosmos_hosts[0].hostname}:{config.cosmos.launch.controller_port}"
+    controller_url = (
+        f"{cosmos_hosts[0].hostname}:{config.cosmos.launch.controller_port}"
+    )
     worker_commands: list[list[str]] = []
     for worker_index, _host in enumerate(cosmos_hosts):
         worker_commands.append(
@@ -453,4 +486,6 @@ def _ensure_wizard_processes_running(processes: list[subprocess.Popen[str]]) -> 
     for process in processes:
         return_code = process.poll()
         if return_code is not None:
-            raise RuntimeError(f"AlpaSim Wizard exited before readiness with code {return_code}")
+            raise RuntimeError(
+                f"AlpaSim Wizard exited before readiness with code {return_code}"
+            )

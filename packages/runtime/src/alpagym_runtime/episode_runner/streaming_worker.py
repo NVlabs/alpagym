@@ -57,6 +57,9 @@ class _RolloutJob:
     shared_payload_state: SharedPayloadState
     session_uuid: str
     scene_id: str
+    # ``None`` selects the legacy session-UUID hash in proto conversion.
+    # An explicit seed survives retries even though their session UUID changes.
+    random_seed: int | None = None
     attempts: int = 0
 
 
@@ -89,6 +92,10 @@ class StreamingRolloutWorker:
     continue until the payload's `max_scene_retries` budget is exhausted;
     on exhaustion the future resolves with `[]` and pending siblings are
     dropped.
+
+    When ``rollout_seed_base`` is configured, fresh jobs receive consecutive
+    uint64 seeds in creation order and retries reuse the failed job's seed.
+    Leaving it unset preserves the legacy session-UUID hash seed path.
     """
 
     def __init__(
@@ -108,6 +115,7 @@ class StreamingRolloutWorker:
         max_scene_retries: int = 3,
         humanoid_policy_server: HumanoidPolicyServer | None = None,
         simulation_domain: str = "av",
+        rollout_seed_base: int | None = None,
     ) -> None:
         """Wire the worker and start `max_concurrent_rollouts` simulate-pool threads."""
         if max_concurrent_rollouts < 1:
@@ -116,8 +124,14 @@ class StreamingRolloutWorker:
             raise ValueError("rollouts_per_payload must be at least 1")
         if max_scene_retries < 0:
             raise ValueError("max_scene_retries must be non-negative")
-        if control_timestep_us <= 0 or expected_num_envs <= 0 or max_transition_rows <= 0:
-            raise ValueError("humanoid timestep, lane count, and replay row budget must be positive")
+        if (
+            control_timestep_us <= 0
+            or expected_num_envs <= 0
+            or max_transition_rows <= 0
+        ):
+            raise ValueError(
+                "humanoid timestep, lane count, and replay row budget must be positive"
+            )
         self._alpasim_runtime_stub = alpasim_runtime_stub
         self._simulation_domain = str(simulation_domain)
         self._driver_server = driver_server
@@ -132,6 +146,17 @@ class StreamingRolloutWorker:
             self._policy_endpoint = driver_server.topology_endpoint
         else:
             raise ValueError(f"unsupported simulation_domain={simulation_domain!r}")
+        if rollout_seed_base is not None:
+            if self._simulation_domain != "humanoid":
+                raise ValueError(
+                    "rollout_seed_base is only supported for humanoid simulation"
+                )
+            if (
+                isinstance(rollout_seed_base, bool)
+                or not isinstance(rollout_seed_base, int)
+                or not 0 <= rollout_seed_base <= (1 << 64) - 1
+            ):
+                raise ValueError("rollout_seed_base must be a uint64 or null")
         self._simulation_timeout_s = simulation_timeout_s
         self._reward_config = reward_config
         self._rollouts_per_payload = rollouts_per_payload
@@ -141,6 +166,8 @@ class StreamingRolloutWorker:
         self._expected_num_envs = int(expected_num_envs)
         self._max_transition_rows = int(max_transition_rows)
         self._max_scene_retries = max_scene_retries
+        self._rollout_seed_base = rollout_seed_base
+        self._next_rollout_seed_ordinal = 0
 
         self._lock = threading.Lock()
         # Inserted on first submit per prompt_idx, removed on future resolution;
@@ -153,9 +180,9 @@ class StreamingRolloutWorker:
         # priority 0 so they preempt fresh dispatch (priority 1); shutdown
         # sentinels use priority 2 (only reached after the queue is drained).
         # `seq` is a monotonic tiebreak so equal-priority items pop FIFO.
-        self._rollout_job_queue: queue.PriorityQueue[tuple[int, int, _RolloutJob | None]] = (
-            queue.PriorityQueue()
-        )
+        self._rollout_job_queue: queue.PriorityQueue[
+            tuple[int, int, _RolloutJob | None]
+        ] = queue.PriorityQueue()
         self._rollout_job_seq = itertools.count()
         self._closed = False
         self._rollout_workers = [
@@ -212,8 +239,23 @@ class StreamingRolloutWorker:
                         "behavior_policy_version"
                     )
                 if self._scenario_id_resolver is None:
-                    raise ValueError("humanoid payload submission requires a scenario resolver")
-            frozen_version = 0 if behavior_policy_version is None else behavior_policy_version
+                    raise ValueError(
+                        "humanoid payload submission requires a scenario resolver"
+                    )
+            frozen_version = (
+                0 if behavior_policy_version is None else behavior_policy_version
+            )
+            if self._rollout_seed_base is not None:
+                final_seed = (
+                    self._rollout_seed_base
+                    + self._next_rollout_seed_ordinal
+                    + self._rollouts_per_payload
+                    - 1
+                )
+                if final_seed > (1 << 64) - 1:
+                    raise OverflowError(
+                        "rollout_seed_base + job creation ordinal exceeds uint64"
+                    )
             payload_state = SharedPayloadState(
                 payload=payload,
                 n_target=self._rollouts_per_payload,
@@ -224,6 +266,12 @@ class StreamingRolloutWorker:
             self._active_payload_states[payload.prompt_idx] = payload_state
             for _ in range(self._rollouts_per_payload):
                 session_uuid = uuid.uuid4().hex
+                random_seed = None
+                if self._rollout_seed_base is not None:
+                    random_seed = (
+                        self._rollout_seed_base + self._next_rollout_seed_ordinal
+                    )
+                    self._next_rollout_seed_ordinal += 1
                 if self._humanoid_policy_server is not None:
                     self._humanoid_policy_server.servicer.reserve_session(
                         session_uuid,
@@ -237,6 +285,7 @@ class StreamingRolloutWorker:
                             shared_payload_state=payload_state,
                             session_uuid=session_uuid,
                             scene_id=scene_id,
+                            random_seed=random_seed,
                         ),
                     )
                 )
@@ -320,6 +369,7 @@ class StreamingRolloutWorker:
                 humanoid_policy_port=int(endpoint.port),
                 n_concurrent_per_humanoid_policy=1,
                 session_uuid=rollout_job.session_uuid,
+                random_seed=rollout_job.random_seed,
                 humanoid_scenario_ids=(
                     self._scenario_id_resolver(rollout_job.scene_id),
                 ),
@@ -333,11 +383,15 @@ class StreamingRolloutWorker:
             session_uuid=rollout_job.session_uuid,
         )
 
-    def _build_av_episode(self, rollout_job: _RolloutJob, rollout_return: object) -> EpisodeOutput:
+    def _build_av_episode(
+        self, rollout_job: _RolloutJob, rollout_return: object
+    ) -> EpisodeOutput:
         """Build an EpisodeOutput for the existing AV egodriver path."""
         if self._driver_server is None:
             raise RuntimeError("AV rollout completed without a driver server")
-        record = self._driver_server.servicer.pop_session_record(rollout_job.session_uuid)
+        record = self._driver_server.servicer.pop_session_record(
+            rollout_job.session_uuid
+        )
         aggregated = dict(rollout_return.aggregated_metrics)
         base = EpisodeOutput(
             scene_id=rollout_job.scene_id,
@@ -346,10 +400,14 @@ class StreamingRolloutWorker:
             policy_outputs=record.outputs,
             executed_ego_trajectory=record.executed_ego_trajectory,
             route_waypoints=(),
-            metrics=EpisodeMetrics(aggregated=aggregated, dense={}) if aggregated else None,
+            metrics=EpisodeMetrics(aggregated=aggregated, dense={})
+            if aggregated
+            else None,
             reward=None,
         )
-        with timed_scope("rollout/reward_compute", category="compute_cpu", cpu_snapshot=True):
+        with timed_scope(
+            "rollout/reward_compute", category="compute_cpu", cpu_snapshot=True
+        ):
             reward = compute_reward(base, record.ground_truth, self._reward_config)
         return replace(base, reward=reward)
 
@@ -366,7 +424,9 @@ class StreamingRolloutWorker:
         )
         aggregated = dict(rollout_return.aggregated_metrics)
         dense = _dense_metrics_from_rollout_return(rollout_return)
-        returned_version_raw = str(getattr(rollout_return, "behavior_policy_version", ""))
+        returned_version_raw = str(
+            getattr(rollout_return, "behavior_policy_version", "")
+        )
         if returned_version_raw != str(record.behavior_policy_version):
             raise ValueError(
                 "AlpaSim behavior_policy_version differs from the reserved rollout "
@@ -384,7 +444,9 @@ class StreamingRolloutWorker:
             max_transition_rows=self._max_transition_rows,
         )
         if "humanoid_total_return" not in aggregated:
-            raise ValueError("AlpaSim humanoid rollout is missing humanoid_total_return")
+            raise ValueError(
+                "AlpaSim humanoid rollout is missing humanoid_total_return"
+            )
         reward_total = float(aggregated["humanoid_total_return"])
         if not math.isfinite(reward_total):
             raise ValueError("AlpaSim humanoid_total_return is non-finite")
@@ -393,11 +455,14 @@ class StreamingRolloutWorker:
             session_uuid=rollout_job.session_uuid,
             num_steps=len(outputs),
             policy_outputs=outputs,
+            rollout_seed=rollout_job.random_seed,
             metrics=EpisodeMetrics(aggregated=aggregated, dense=dense),
             reward=RewardResult(total=reward_total, report_metrics=aggregated),
         )
 
-    def _on_rollout_succeeded(self, rollout_job: _RolloutJob, episode: EpisodeOutput) -> None:
+    def _on_rollout_succeeded(
+        self, rollout_job: _RolloutJob, episode: EpisodeOutput
+    ) -> None:
         """Append the episode; resolve the future when `n_target` siblings land."""
         payload_state = rollout_job.shared_payload_state
         should_resolve = False
@@ -411,8 +476,12 @@ class StreamingRolloutWorker:
                 ):
                     payload_state.future_resolved = True
                     should_resolve = True
-                    result_payload = list(payload_state.collected[: payload_state.n_target])
-                    self._active_payload_states.pop(payload_state.payload.prompt_idx, None)
+                    result_payload = list(
+                        payload_state.collected[: payload_state.n_target]
+                    )
+                    self._active_payload_states.pop(
+                        payload_state.payload.prompt_idx, None
+                    )
         if should_resolve:
             payload_state.future.set_result(result_payload)
 
@@ -442,6 +511,7 @@ class StreamingRolloutWorker:
                             shared_payload_state=payload_state,
                             session_uuid=retry_session_uuid,
                             scene_id=rollout_job.scene_id,
+                            random_seed=rollout_job.random_seed,
                             attempts=rollout_job.attempts + 1,
                         ),
                     )
@@ -463,7 +533,9 @@ class StreamingRolloutWorker:
                 if not payload_state.future_resolved:
                     payload_state.future_resolved = True
                     should_drop = True
-                    self._active_payload_states.pop(payload_state.payload.prompt_idx, None)
+                    self._active_payload_states.pop(
+                        payload_state.payload.prompt_idx, None
+                    )
                 logger.error(
                     "Dropping payload after exhausted retries: scene=%s last_uuid=%s: %s",
                     rollout_job.scene_id,

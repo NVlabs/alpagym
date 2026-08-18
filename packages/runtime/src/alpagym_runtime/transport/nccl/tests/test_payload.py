@@ -6,7 +6,13 @@ import numpy as np
 import pytest
 import torch
 from alpagym_runtime.replay import ActionSelection, PolicyReplayData
-from alpagym_runtime.transport.nccl.payload import WirePayload, _pack, _unpack, pack, unpack
+from alpagym_runtime.transport.nccl.payload import (
+    WirePayload,
+    _pack,
+    _unpack,
+    pack,
+    unpack,
+)
 from alpagym_runtime.types import (
     EgoPose,
     EpisodeMetrics,
@@ -143,6 +149,7 @@ def test_full_episode_round_trip() -> None:
         session_uuid="session_full",
         num_steps=2,
         policy_outputs=(policy_output,),
+        rollout_seed=(1 << 64) - 1,
         executed_ego_trajectory=Trajectory(
             poses=(
                 EgoPose(
@@ -165,12 +172,15 @@ def test_full_episode_round_trip() -> None:
     assert new_po.replay_data.action_selection.set_ix == 0
     assert new_po.replay_data.action_selection.sample_ix == 1
     assert torch.equal(new_po.replay_data.payload["per_traj_logprob"], replay_tensor)
-    assert torch.equal(new_po.replay_data.payload["nested"]["inner_tensor"], nested_tensor)
+    assert torch.equal(
+        new_po.replay_data.payload["nested"]["inner_tensor"], nested_tensor
+    )
     assert new_po.model_extra == {"score": 0.75}
     assert reconstructed.metrics == episode.metrics
     assert reconstructed.reward == episode.reward
     assert reconstructed.executed_ego_trajectory == episode.executed_ego_trajectory
     assert reconstructed.route_waypoints == episode.route_waypoints
+    assert reconstructed.rollout_seed == (1 << 64) - 1
     assert reconstructed.is_valid is False
 
 
@@ -232,7 +242,9 @@ def test_dataclass_in_any_slot_round_trips_with_type() -> None:
     payload) rely on that type surviving the
     transport.
     """
-    pose = Pose(vec=Vec3(x=1.0, y=2.0, z=3.0), quat=Quaternion(w=0.5, x=0.5, y=0.5, z=0.5))
+    pose = Pose(
+        vec=Vec3(x=1.0, y=2.0, z=3.0), quat=Quaternion(w=0.5, x=0.5, y=0.5, z=0.5)
+    )
     policy_output = PolicyOutput(
         chosen_xyz=torch.zeros((1, 3), dtype=torch.float32),
         chosen_quat=torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
@@ -286,9 +298,21 @@ def test_unpack_rejects_dataclass_type_outside_allowed_prefix() -> None:
         "num_steps": 1,
         "policy_outputs": [
             {
-                "chosen_xyz": {"__tensor_key__": "x", "shape": [1, 3], "dtype": "torch.float32"},
-                "chosen_quat": {"__tensor_key__": "q", "shape": [1, 4], "dtype": "torch.float32"},
-                "chosen_dt_us": {"__tensor_key__": "t", "shape": [1], "dtype": "torch.int64"},
+                "chosen_xyz": {
+                    "__tensor_key__": "x",
+                    "shape": [1, 3],
+                    "dtype": "torch.float32",
+                },
+                "chosen_quat": {
+                    "__tensor_key__": "q",
+                    "shape": [1, 4],
+                    "dtype": "torch.float32",
+                },
+                "chosen_dt_us": {
+                    "__tensor_key__": "t",
+                    "shape": [1],
+                    "dtype": "torch.int64",
+                },
                 "chosen_logprob": None,
                 "replay_data": {
                     "replay_schema_version": 1,

@@ -5,7 +5,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from alpagym_runtime.alpasim.tests.test_proto_conversion import install_alpasim_grpc_stubs
+from alpagym_runtime.alpasim.tests.test_proto_conversion import (
+    install_alpasim_grpc_stubs,
+)
 
 install_alpasim_grpc_stubs()
 
@@ -18,9 +20,14 @@ from alpagym_runtime.alpasim.driver_server import (  # noqa: E402
     _Session,
 )
 from alpagym_runtime.alpasim.humanoid_policy_server import (  # noqa: E402
+    MOTION_REFERENCE_JOINT_NAMES,
+    HumanoidMotionReference,
+    HumanoidMotionReferenceFrame,
     HumanoidPolicyGrpcServicer,
+    HumanoidPolicyStepOutput,
     ZeroHumanoidPolicy,
 )
+from alpagym_runtime.replay import ActionSelection, PolicyReplayData  # noqa: E402
 from alpagym_runtime.types import (  # noqa: E402
     EgoPose,
     PolicyInput,
@@ -249,7 +256,9 @@ def test_drive_pipeline_passes_buffered_observations_into_policy_step() -> None:
     )
 
     response = servicer.drive(
-        SimpleNamespace(session_uuid="session-1", time_now_us=1_000, time_query_us=2_000),
+        SimpleNamespace(
+            session_uuid="session-1", time_now_us=1_000, time_query_us=2_000
+        ),
         context=None,
     )
 
@@ -415,11 +424,15 @@ def test_concurrent_sessions_keep_per_session_state_isolated() -> None:
 
         # Both drive ticks succeed independently and bump only their own step_index.
         servicer.drive(
-            SimpleNamespace(session_uuid="session-1", time_now_us=1_000, time_query_us=2_000),
+            SimpleNamespace(
+                session_uuid="session-1", time_now_us=1_000, time_query_us=2_000
+            ),
             context=None,
         )
         servicer.drive(
-            SimpleNamespace(session_uuid="session-2", time_now_us=3_000, time_query_us=4_000),
+            SimpleNamespace(
+                session_uuid="session-2", time_now_us=3_000, time_query_us=4_000
+            ),
             context=None,
         )
         assert servicer._sessions["session-1"].step_index == 1
@@ -462,8 +475,12 @@ def _policy_input(ego_poses: tuple[EgoPose, ...] = ()) -> PolicyInput:
 def _policy_output(value: float) -> PolicyOutput:
     """Build a tiny `PolicyOutput` whose tensors carry `value` for identification."""
     return PolicyOutput(
-        chosen_xyz=torch.tensor([[0.0, 0.0, 0.0], [value, value, value]], dtype=torch.float32),
-        chosen_quat=torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+        chosen_xyz=torch.tensor(
+            [[0.0, 0.0, 0.0], [value, value, value]], dtype=torch.float32
+        ),
+        chosen_quat=torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]], dtype=torch.float32
+        ),
         chosen_dt_us=torch.tensor([0, 100], dtype=torch.int64),
     )
 
@@ -532,6 +549,240 @@ def test_humanoid_policy_server_saves_camera_images_from_policy_options(
     assert saved[0].read_bytes() == b"\xff\xd8fake-jpeg"
 
 
+class _MotionPlannerPolicy:
+    """Deterministic reference planner used to exercise the full RPC lifecycle."""
+
+    def step(self, policy_inputs, *, sample_actions: bool = True):
+        outputs = []
+        for item in policy_inputs:
+            if not sample_actions:
+                outputs.append(
+                    HumanoidPolicyStepOutput(
+                        env_id=item.env_id,
+                        value=(torch.tensor(3.0) if item.bootstrap_requested else None),
+                    )
+                )
+                continue
+            digest = ("a" if item.decision_id == 0 else "b") * 64
+            root = item.qpos[:3].clone()
+            root[2] += 0.125
+            frames = tuple(
+                HumanoidMotionReferenceFrame(
+                    timestamp_us=item.timestamp_us + index * 20_000,
+                    joint_position=item.qpos[7:].clone(),
+                    joint_velocity=item.qvel[6:].clone(),
+                    root_position=root.clone(),
+                    root_quaternion_wxyz=item.qpos[3:7].clone(),
+                )
+                for index in range(50)
+            )
+            reference = HumanoidMotionReference(
+                reference_id=100 + item.decision_id,
+                source_decision_id=item.decision_id,
+                frames=frames,
+                reference_sha256=digest,
+                root_z_alignment_offset_m=0.125,
+            )
+            replay = PolicyReplayData(
+                replay_schema_version=1,
+                payload_schema="motion.test.v1",
+                payload_schema_version=1,
+                model_family="motion-test",
+                action_selection=ActionSelection(0, 0),
+                old_logprob=torch.tensor(0.0),
+                payload={"trace": torch.zeros(1)},
+            )
+            outputs.append(
+                HumanoidPolicyStepOutput(
+                    env_id=item.env_id,
+                    motion_reference=reference,
+                    logprob=torch.tensor(0.0),
+                    value=torch.tensor(1.0),
+                    replay_data=replay,
+                )
+            )
+        return tuple(outputs)
+
+    def close(self) -> None:
+        return None
+
+
+def _motion_state(timestamp_us: int) -> SimpleNamespace:
+    qpos = [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0] + [0.0] * 29
+    qvel = [0.0] * 35
+    return SimpleNamespace(
+        env_id=0,
+        reset_id=9,
+        timestamp_us=timestamp_us,
+        qpos=qpos,
+        qvel=qvel,
+        observation=[0.0, 0.0],
+        observation_schema="videomimic_motion_planner_state.v1",
+        named_observations=[
+            SimpleNamespace(
+                name="navigation_position_xy",
+                values=[0.0, 0.0],
+                shape=[2],
+            )
+        ],
+        scalars={},
+    )
+
+
+def _motion_feedback(
+    *,
+    source_decision_id: int,
+    reference_id: int,
+    digest: str,
+    start_timestamp_us: int,
+    first_control_step: int,
+) -> SimpleNamespace:
+    ticks = []
+    for index in range(5):
+        timestamp_us = start_timestamp_us + index * 20_000
+        ticks.append(
+            SimpleNamespace(
+                control_tick_offset=index + 1,
+                reference_action_index=index,
+                state=_motion_state(timestamp_us),
+                active_reference_id=reference_id,
+                active_reference_sha256=digest,
+                applied_reference_sha256=digest,
+                root_z_alignment_offset_m=0.125,
+                reward=0.1,
+                terminated=False,
+                truncated=False,
+                metrics={},
+                control_episode_step=first_control_step + index,
+            )
+        )
+    return SimpleNamespace(
+        env_id=0,
+        source_decision_id=source_decision_id,
+        ticks=ticks,
+    )
+
+
+def _motion_act_request(
+    *,
+    decision_id: int,
+    timestamp_us: int,
+    request_kind: int,
+    feedback_traces: list[SimpleNamespace],
+    bootstrap_env_ids: list[int] | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        session_uuid="motion-session",
+        request_kind=request_kind,
+        bootstrap_only=False,
+        bootstrap_env_ids=list(bootstrap_env_ids or []),
+        observation=SimpleNamespace(
+            decision_id=decision_id,
+            env_states=[_motion_state(timestamp_us)],
+            camera_images=[],
+            feedback_traces=feedback_traces,
+        ),
+    )
+
+
+def test_motion_reference_policy_rpc_joins_feedback_and_finalizes_without_extra_plan() -> (
+    None
+):
+    servicer = HumanoidPolicyGrpcServicer(
+        policy_factory=lambda session_uuid, request: _MotionPlannerPolicy()
+    )
+    servicer.reserve_session("motion-session", behavior_policy_version=11)
+    servicer.start_session(
+        SimpleNamespace(
+            session_uuid="motion-session",
+            random_seed=7,
+            action_size=0,
+            execution_mode=2,
+            joint_names=list(MOTION_REFERENCE_JOINT_NAMES),
+            observation_schema="videomimic_motion_planner_state.v1",
+            action_schema="g1_motion_reference_29d_50hz_h50.v1",
+            observation_terms=[SimpleNamespace(name="navigation_position_xy", size=2)],
+            reference_spec=SimpleNamespace(
+                schema="g1_motion_reference_29d_50hz_h50.v1",
+                joint_names=list(MOTION_REFERENCE_JOINT_NAMES),
+                frame_count=50,
+                sample_period_us=20_000,
+                control_ticks_per_policy_step=5,
+            ),
+            policy_options={},
+            attempt_id="attempt",
+            scene_id="hq_stairs",
+            scenario_id="ascend",
+        ),
+        context=None,
+    )
+
+    initial = servicer.act(
+        _motion_act_request(
+            decision_id=0,
+            timestamp_us=0,
+            request_kind=2,
+            feedback_traces=[],
+        ),
+        context=None,
+    )
+    assert len(initial.plan_updates) == 1
+    assert len(initial.actions) == 0
+    first = initial.plan_updates[0]
+
+    replanned = servicer.act(
+        _motion_act_request(
+            decision_id=1,
+            timestamp_us=100_000,
+            request_kind=3,
+            feedback_traces=[
+                _motion_feedback(
+                    source_decision_id=0,
+                    reference_id=first.reference_id,
+                    digest=first.reference_sha256,
+                    start_timestamp_us=20_000,
+                    first_control_step=1,
+                )
+            ],
+        ),
+        context=None,
+    )
+    assert len(replanned.plan_updates) == 1
+    second = replanned.plan_updates[0]
+
+    finalized = servicer.act(
+        _motion_act_request(
+            decision_id=2,
+            timestamp_us=200_000,
+            request_kind=4,
+            feedback_traces=[
+                _motion_feedback(
+                    source_decision_id=1,
+                    reference_id=second.reference_id,
+                    digest=second.reference_sha256,
+                    start_timestamp_us=120_000,
+                    first_control_step=6,
+                )
+            ],
+            bootstrap_env_ids=[0],
+        ),
+        context=None,
+    )
+    assert len(finalized.plan_updates) == 0
+    assert finalized.value_estimates[0].value == pytest.approx(3.0)
+
+    servicer.close_session(
+        SimpleNamespace(session_uuid="motion-session"),
+        context=None,
+    )
+    record = servicer.pop_session_record("motion-session")
+    assert len(record.outputs) == 2
+    assert record.final_bootstrap_values == {0: 3.0}
+    assert "feedback_trace" in record.outputs[0].replay_data.payload
+    assert "feedback_trace" in record.outputs[1].replay_data.payload
+    assert record.outputs[1].replay_data.payload["outer_truncated"] is True
+
+
 def test_session_record_step_appends_outputs_and_dedupes_executed_poses() -> None:
     """`record_step` keeps outputs in call order and drops already-recorded poses across ticks."""
     session = _Session(calibration=(), policy=_StubPolicy("session-a", (), 0))
@@ -541,7 +792,9 @@ def test_session_record_step_appends_outputs_and_dedupes_executed_poses() -> Non
         _policy_input(ego_poses=(_ego_pose(10, x=1.0), _ego_pose(20, x=2.0))), out_a
     )
     session.record_step(
-        _policy_input(ego_poses=(_ego_pose(10, x=1.0), _ego_pose(20, x=2.0), _ego_pose(30, x=3.0))),
+        _policy_input(
+            ego_poses=(_ego_pose(10, x=1.0), _ego_pose(20, x=2.0), _ego_pose(30, x=3.0))
+        ),
         out_b,
     )
     session.record_step(
@@ -563,7 +816,9 @@ def test_session_record_step_skips_empty_ego_trajectories() -> None:
     """Ticks with no ego trajectory contribute no pose but still append the output."""
     session = _Session(calibration=(), policy=_StubPolicy("session-a", (), 0))
     session.record_step(_policy_input(ego_poses=()), _policy_output(1.0))
-    session.record_step(_policy_input(ego_poses=(_ego_pose(10, x=1.0),)), _policy_output(2.0))
+    session.record_step(
+        _policy_input(ego_poses=(_ego_pose(10, x=1.0),)), _policy_output(2.0)
+    )
     session.record_step(_policy_input(ego_poses=()), _policy_output(3.0))
 
     assert len(session.outputs) == 3
@@ -598,7 +853,9 @@ def test_close_session_freezes_session_record_for_runner_to_drain() -> None:
         record = servicer.pop_session_record("session-1")
         assert record == SessionRecord(
             outputs=(out_a, out_b),
-            executed_ego_trajectory=Trajectory(poses=(_ego_pose(10, x=1.0), _ego_pose(20, x=2.0))),
+            executed_ego_trajectory=Trajectory(
+                poses=(_ego_pose(10, x=1.0), _ego_pose(20, x=2.0))
+            ),
             ground_truth=None,
         )
         with pytest.raises(KeyError):

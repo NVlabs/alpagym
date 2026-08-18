@@ -24,15 +24,78 @@ _HUMANOID_REQUIRED_FIELDS: Mapping[str, frozenset[str]] = {
             "scene_id",
             "scenario_id",
             "random_seed",
+            "execution_mode",
+            "reference_spec",
         }
     ),
     "HumanoidEnvState": frozenset(
         {"timestamp_us", "named_observations", "observation_schema", "reset_id"}
     ),
-    "HumanoidPolicyRequest": frozenset({"bootstrap_only", "bootstrap_env_ids"}),
-    "HumanoidPolicyResponse": frozenset({"behavior_policy_version", "value_estimates"}),
+    "HumanoidPolicyRequest": frozenset(
+        {"bootstrap_only", "bootstrap_env_ids", "request_kind", "observation"}
+    ),
+    "HumanoidObservation": frozenset({"decision_id", "feedback_traces"}),
+    "HumanoidPolicyResponse": frozenset(
+        {"behavior_policy_version", "value_estimates", "plan_updates"}
+    ),
+    "HumanoidPlanUpdate": frozenset(
+        {
+            "reference_id",
+            "source_decision_id",
+            "frames",
+            "reference_sha256",
+            "root_z_alignment_offset_m",
+        }
+    ),
+    "HumanoidRealizedControlTick": frozenset(
+        {
+            "control_tick_offset",
+            "state",
+            "active_reference_id",
+            "reference_action_index",
+            "active_reference_sha256",
+            "applied_reference_sha256",
+            "root_z_alignment_offset_m",
+            "reward",
+            "terminated",
+            "truncated",
+            "metrics",
+            "control_episode_step",
+        }
+    ),
+    "HumanoidRealizedFeedbackTrace": frozenset(
+        {"env_id", "source_decision_id", "ticks"}
+    ),
     "HumanoidStepResult": frozenset(
-        {"state", "reward", "terminated", "truncated", "final_state", "episode_step"}
+        {
+            "state",
+            "reward",
+            "terminated",
+            "truncated",
+            "final_state",
+            "episode_step",
+            "control_ticks",
+            "executed_control_ticks",
+            "active_reference_sha256",
+            "applied_reference_sha256",
+        }
+    ),
+}
+
+_HUMANOID_REQUIRED_ENUM_VALUES: Mapping[str, frozenset[str]] = {
+    "HumanoidExecutionMode": frozenset(
+        {
+            "HUMANOID_EXECUTION_MODE_DIRECT_ACTION",
+            "HUMANOID_EXECUTION_MODE_MOTION_REFERENCE",
+        }
+    ),
+    "HumanoidPolicyRequestKind": frozenset(
+        {
+            "HUMANOID_POLICY_REQUEST_KIND_DIRECT_ACTION",
+            "HUMANOID_POLICY_REQUEST_KIND_INITIAL_PLAN",
+            "HUMANOID_POLICY_REQUEST_KIND_REPLAN_WITH_FEEDBACK",
+            "HUMANOID_POLICY_REQUEST_KIND_FINALIZE_WITH_FEEDBACK",
+        }
     ),
 }
 
@@ -85,6 +148,11 @@ def _validate_humanoid_grpc_abi() -> None:
         _HUMANOID_REQUIRED_FIELDS,
         source="alpasim_grpc.v0.humanoid_pb2",
     )
+    _validate_descriptor_enums(
+        humanoid_pb2.DESCRIPTOR,
+        _HUMANOID_REQUIRED_ENUM_VALUES,
+        source="alpasim_grpc.v0.humanoid_pb2",
+    )
     _validate_descriptor_fields(
         runtime_pb2.DESCRIPTOR,
         _RUNTIME_REQUIRED_FIELDS,
@@ -103,7 +171,11 @@ def _validate_descriptor_fields(
         parts = qualified_name.split(".")
         message = descriptor.message_types_by_name.get(parts[0])
         for nested_name in parts[1:]:
-            message = None if message is None else message.nested_types_by_name.get(nested_name)
+            message = (
+                None
+                if message is None
+                else message.nested_types_by_name.get(nested_name)
+            )
         if message is None:
             raise RuntimeError(
                 f"{source} is incompatible with the humanoid PPO ABI: "
@@ -118,6 +190,29 @@ def _validate_descriptor_fields(
                 f"{qualified_name!r} is missing fields {sorted(missing_fields)}. "
                 "Use the matching AlpaSim checkout or set ALPASIM_GRPC_ROOT to its "
                 "src/grpc directory."
+            )
+
+
+def _validate_descriptor_enums(
+    descriptor: Any,
+    requirements: Mapping[str, frozenset[str]],
+    *,
+    source: str,
+) -> None:
+    """Require lifecycle enum values used by the motion-reference RPC."""
+    for enum_name, required_values in requirements.items():
+        enum = descriptor.enum_types_by_name.get(enum_name)
+        if enum is None:
+            raise RuntimeError(
+                f"{source} is incompatible with the humanoid planner ABI: "
+                f"missing enum {enum_name!r}"
+            )
+        actual = set(enum.values_by_name)
+        missing = required_values - actual
+        if missing:
+            raise RuntimeError(
+                f"{source} is incompatible with the humanoid planner ABI: enum "
+                f"{enum_name!r} is missing values {sorted(missing)}"
             )
 
 

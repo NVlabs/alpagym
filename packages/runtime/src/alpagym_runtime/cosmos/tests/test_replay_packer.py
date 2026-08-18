@@ -32,7 +32,9 @@ def _build_generic_model_inputs(
     payload = replay.payload
     model_inputs: dict[str, object] = {
         "step_index": torch.as_tensor(payload["step_index"], dtype=torch.int64),
-        "token_logprob_count": torch.as_tensor(payload["token_logprob_count"], dtype=torch.int64),
+        "token_logprob_count": torch.as_tensor(
+            payload["token_logprob_count"], dtype=torch.int64
+        ),
     }
     for key in ("samples_list", "timesteps", "noise_level"):
         if payload.get(key) is not None:
@@ -46,15 +48,19 @@ def test_replay_packer_collates_padding_and_old_logprobs(
     tmp_path: Path,
     cosmos_stubs: None,
 ) -> None:
-    """Replay payloads pack to fixed rows with old logprobs zero-padded."""
+    """Replay payloads pad with internally consistent cloned behavior traces."""
     del cosmos_stubs
     packer_module = importlib.import_module("alpagym_runtime.cosmos.packer")
     packer = packer_module.AlpagymDataPacker(
         config=DataPackerConfig(expected_valid_steps=3),
         build_model_inputs=_generic_build_model_inputs(),
     )
-    first = _write_episode(tmp_path / "first.json", "rollout-1", _generic_outputs([-1.0, -2.0]))
-    second = _write_episode(tmp_path / "second.json", "rollout-2", _generic_outputs([-3.0]))
+    first = _write_episode(
+        tmp_path / "first.json", "rollout-1", _generic_outputs([-1.0, -2.0])
+    )
+    second = _write_episode(
+        tmp_path / "second.json", "rollout-2", _generic_outputs([-3.0])
+    )
 
     steps_a = packer.get_policy_input(0, first.handle)
     steps_b = packer.get_policy_input(1, second.handle)
@@ -71,7 +77,7 @@ def test_replay_packer_collates_padding_and_old_logprobs(
     )
     assert torch.equal(
         signal.old_logprobs,
-        torch.tensor([-1.0, -2.0, 0.0, -3.0, 0.0, 0.0]),
+        torch.tensor([-1.0, -2.0, -1.0, -3.0, -3.0, -3.0]),
     )
     assert torch.equal(
         signal.is_padding,
@@ -117,7 +123,9 @@ def test_replay_packer_extracts_transition_signal_and_zero_pads_it(
         }
         replay_data = replace(output.replay_data, payload=payload)
         outputs.append(replace(output, replay_data=replay_data))
-    artifact = _write_episode(tmp_path / "transition.json", "rollout-transition", outputs)
+    artifact = _write_episode(
+        tmp_path / "transition.json", "rollout-transition", outputs
+    )
 
     batch = packer.policy_collate_fn(packer.get_policy_input(0, artifact.handle))
 
@@ -208,7 +216,9 @@ def test_replay_packer_rejects_missing_replay_data(
         [
             PolicyOutput(
                 chosen_xyz=torch.zeros((2, 3), dtype=torch.float32),
-                chosen_quat=torch.tensor([[1.0, 0.0, 0.0, 0.0]] * 2, dtype=torch.float32),
+                chosen_quat=torch.tensor(
+                    [[1.0, 0.0, 0.0, 0.0]] * 2, dtype=torch.float32
+                ),
                 chosen_dt_us=torch.tensor([0, 1], dtype=torch.int64),
                 chosen_logprob=torch.zeros((1,), dtype=torch.float32),
                 replay_data=None,

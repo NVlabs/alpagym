@@ -61,6 +61,7 @@ sudo apt-get install -y libnccl-dev=2.26.2-1+cuda12.8 libnccl2=2.26.2-1+cuda12.8
 # Redis executable used by Cosmos-RL.
 sudo apt-get install -y redis-server
 redis-server --version
+redis-cli --version
 
 # Git LFS files for AlpaSim checkouts.
 sudo apt-get install -y git-lfs
@@ -69,9 +70,9 @@ git lfs pull
 ```
 
 The runtime expects a CUDA-capable host with CUDA, cuDNN, and NCCL headers.
-AlpaSim Wizard expects Docker Compose. Cosmos-RL starts its own Redis process,
-so the `redis-server` executable must be installed even though Redis is not a
-Python package.
+AlpaSim Wizard expects Docker Compose. Cosmos-RL starts its own Redis process
+and shuts it down through the command-line client, so both `redis-server` and
+`redis-cli` must be installed even though Redis is not a Python package.
 
 Before syncing, run the pre-flight check to confirm the host tools and headers
 above are installed correctly. It prints a fix command for anything missing:

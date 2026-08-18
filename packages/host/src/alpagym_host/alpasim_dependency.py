@@ -28,16 +28,20 @@ def resolve_alpasim_checkout(config: AlpaSimConfig) -> Path:
             raise NotADirectoryError(checkout_root)
         logging.info("Using local AlpaSim checkout %s", checkout_root)
         _validate_alpasim_layout(checkout_root)
+        _compile_protos(checkout_root)
         _sync_alpasim_env(checkout_root, relocatable=False)
         return checkout_root
 
     if config.repo_url is None or config.repo_ref is None:
-        raise ValueError("AlpaSim config requires repo_url and repo_ref when repo_path is not set")
+        raise ValueError(
+            "AlpaSim config requires repo_url and repo_ref when repo_path is not set"
+        )
 
     commit = _resolve_commit_sha(config.repo_url, config.repo_ref)
     checkout_cache_dir = _checkout_cache_dir(config)
     checkout_root = (
-        checkout_cache_dir / hashlib.sha256(f"{config.repo_url}@{commit}".encode()).hexdigest()[:12]
+        checkout_cache_dir
+        / hashlib.sha256(f"{config.repo_url}@{commit}".encode()).hexdigest()[:12]
     )
     if checkout_root.is_dir():
         # A prior run already built and published this commit; consume it read-only.
@@ -47,17 +51,17 @@ def resolve_alpasim_checkout(config: AlpaSimConfig) -> Path:
     checkout_cache_dir.mkdir(parents=True, exist_ok=True)
     build_dir = Path(tempfile.mkdtemp(dir=checkout_cache_dir, prefix=".build-"))
     try:
-        logging.info("Building AlpaSim checkout %s@%s in %s", config.repo_url, commit, build_dir)
-        subprocess.run(["git", "clone", config.repo_url, str(build_dir)], check=True, text=True)
-        subprocess.run(["git", "checkout", commit], cwd=build_dir, check=True, text=True)
-        _validate_alpasim_layout(build_dir)
-        subprocess.run(
-            ["uv", "run", "compile-protos"],
-            cwd=build_dir / "src" / "grpc",
-            env=uv_env(build_dir / "src" / "grpc" / ".venv"),
-            check=True,
-            text=True,
+        logging.info(
+            "Building AlpaSim checkout %s@%s in %s", config.repo_url, commit, build_dir
         )
+        subprocess.run(
+            ["git", "clone", config.repo_url, str(build_dir)], check=True, text=True
+        )
+        subprocess.run(
+            ["git", "checkout", commit], cwd=build_dir, check=True, text=True
+        )
+        _validate_alpasim_layout(build_dir)
+        _compile_protos(build_dir)
         _sync_alpasim_env(build_dir, relocatable=True)
     except BaseException:
         shutil.rmtree(build_dir, ignore_errors=True)
@@ -157,6 +161,18 @@ def _sync_alpasim_env(checkout_root: Path, relocatable: bool) -> None:
         _install_plugin_configs(checkout_root, venv)
 
 
+def _compile_protos(checkout_root: Path) -> None:
+    """Generate checkout-local protobuf modules before any service imports them."""
+    grpc_root = checkout_root / "src" / "grpc"
+    subprocess.run(
+        ["uv", "run", "compile-protos"],
+        cwd=grpc_root,
+        env=uv_env(grpc_root / ".venv"),
+        check=True,
+        text=True,
+    )
+
+
 def _install_plugin_configs(checkout_root: Path, venv: Path) -> None:
     """Copy each AlpaSim plugin's source ``configs`` tree into its installed package.
 
@@ -174,19 +190,25 @@ def _install_plugin_configs(checkout_root: Path, venv: Path) -> None:
         # Fail fast: a synced venv always has site-packages. Returning here would
         # publish a checkout whose plugin configs are missing and only surface much
         # later as a confusing Hydra resolution error.
-        raise FileNotFoundError(f"relocatable venv has no site-packages directory: {venv}")
+        raise FileNotFoundError(
+            f"relocatable venv has no site-packages directory: {venv}"
+        )
     for plugin_dir in sorted((checkout_root / "plugins").glob("*")):
         source_configs = plugin_dir / "configs"
         plugin_pyproject = plugin_dir / "pyproject.toml"
         if not source_configs.is_dir() or not plugin_pyproject.is_file():
             continue
         # The wheel installs the plugin under its import name (pyproject name, ``-``->``_``).
-        package = tomllib.loads(plugin_pyproject.read_text(encoding="utf-8"))["project"]["name"]
+        package = tomllib.loads(plugin_pyproject.read_text(encoding="utf-8"))[
+            "project"
+        ]["name"]
         installed_package = site_packages / package.replace("-", "_")
         # Skip plugins this sync did not install (e.g. an extra that was not requested).
         if not installed_package.is_dir():
             continue
-        shutil.copytree(source_configs, installed_package / "configs", dirs_exist_ok=True)
+        shutil.copytree(
+            source_configs, installed_package / "configs", dirs_exist_ok=True
+        )
 
 
 def _validate_alpasim_layout(checkout_root: Path) -> None:
@@ -213,8 +235,11 @@ def uv_env(environment: Path) -> dict[str, str]:
     `/opt/venv`. `uv sync` rewrites whatever this points at, so a checkout uv call
     that did not set it would sync into, and prune, the runtime's `/opt/venv`.
     `VIRTUAL_ENV` is dropped only to silence uv's "does not match the project
-    environment" warning; uv ignores it for project commands. See the README "uv
-    environments" section for a diagram.
+    environment" warning; uv ignores it for project commands. `UV_NO_SYNC` is also
+    dropped: dependency preparation explicitly owns the checkout sync and protobuf
+    generation, so an ambient launcher optimization must not turn ``uv run
+    compile-protos`` into a no-sync invocation against an empty fresh environment.
+    See the README "uv environments" section for a diagram.
 
     Args:
         environment: Path to the project virtual environment uv should use,
@@ -222,10 +247,11 @@ def uv_env(environment: Path) -> dict[str, str]:
 
     Returns:
         A copy of the current environment with `UV_PROJECT_ENVIRONMENT` set to
-        `environment` and `VIRTUAL_ENV` removed.
+        `environment` and `VIRTUAL_ENV`/`UV_NO_SYNC` removed.
     """
     env = os.environ.copy()
     env.pop("VIRTUAL_ENV", None)
+    env.pop("UV_NO_SYNC", None)
     env["UV_PROJECT_ENVIRONMENT"] = str(environment)
     return env
 

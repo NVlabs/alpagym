@@ -4,7 +4,11 @@
 
 import hashlib
 
-from alpasim_grpc.v0.common_pb2 import Pose as ProtoPose, PoseAtTime, Trajectory as ProtoTrajectory
+from alpasim_grpc.v0.common_pb2 import (
+    Pose as ProtoPose,
+    PoseAtTime,
+    Trajectory as ProtoTrajectory,
+)
 from alpasim_grpc.v0.egodriver_pb2 import (
     DriveResponse,
     DriveSessionRequest,
@@ -45,6 +49,7 @@ def build_simulation_request_proto(
     humanoid_policy_port: int | None = None,
     n_concurrent_per_humanoid_policy: int = 0,
     humanoid_scenario_ids: tuple[str, ...] | None = None,
+    random_seed: int | None = None,
 ) -> SimulationRequest:
     """Build one RuntimeService simulate request."""
     if not scene_ids:
@@ -59,9 +64,20 @@ def build_simulation_request_proto(
             "session_uuid is only valid for a single-rollout single-scene request "
             f"(n_generation={n_generation}, scene_ids={scene_ids})"
         )
+    if random_seed is not None:
+        if session_uuid is None:
+            raise ValueError("random_seed requires a session_uuid")
+        if (
+            isinstance(random_seed, bool)
+            or not isinstance(random_seed, int)
+            or not 0 <= random_seed <= (1 << 64) - 1
+        ):
+            raise ValueError("random_seed must be a uint64 or null")
 
     uses_driver = (
-        driver_host is not None or driver_port is not None or n_concurrent_per_driver > 0
+        driver_host is not None
+        or driver_port is not None
+        or n_concurrent_per_driver > 0
     )
     uses_humanoid_policy = (
         humanoid_policy_host is not None
@@ -73,11 +89,15 @@ def build_simulation_request_proto(
             "build_simulation_request_proto requires exactly one policy endpoint kind: "
             "driver or humanoid_policy"
         )
+    if random_seed is not None and not uses_humanoid_policy:
+        raise ValueError("random_seed is only supported for humanoid rollout requests")
 
     simulation_request = SimulationRequest()
     if uses_driver:
         if driver_host is None or driver_port is None:
-            raise ValueError("driver_host and driver_port are required for driver requests")
+            raise ValueError(
+                "driver_host and driver_port are required for driver requests"
+            )
         if n_concurrent_per_driver < 1:
             raise ValueError("n_concurrent_per_driver must be at least 1")
         driver = simulation_request.available_drivers.add()
@@ -94,9 +114,13 @@ def build_simulation_request_proto(
         humanoid_policy = simulation_request.available_humanoid_policies.add()
         humanoid_policy.ip = humanoid_policy_host
         humanoid_policy.port = humanoid_policy_port
-        simulation_request.n_concurrent_per_humanoid_policy = n_concurrent_per_humanoid_policy
+        simulation_request.n_concurrent_per_humanoid_policy = (
+            n_concurrent_per_humanoid_policy
+        )
 
-        if humanoid_scenario_ids is None or len(humanoid_scenario_ids) != len(scene_ids):
+        if humanoid_scenario_ids is None or len(humanoid_scenario_ids) != len(
+            scene_ids
+        ):
             raise ValueError("humanoid requests require one scenario_id per scene_id")
 
     for scene_index, scene_id in enumerate(scene_ids):
@@ -112,10 +136,13 @@ def build_simulation_request_proto(
             rollout_spec.session_uuids.append(session_uuid)
             if uses_humanoid_policy:
                 rollout_spec.attempt_ids.append(session_uuid)
-                digest = hashlib.sha256(
-                    f"alpagym-humanoid-v1:{session_uuid}".encode()
-                ).digest()
-                rollout_spec.random_seed = int.from_bytes(digest[:8], "big") or 1
+                if random_seed is None:
+                    digest = hashlib.sha256(
+                        f"alpagym-humanoid-v1:{session_uuid}".encode()
+                    ).digest()
+                    rollout_spec.random_seed = int.from_bytes(digest[:8], "big") or 1
+                else:
+                    rollout_spec.random_seed = random_seed
     return simulation_request
 
 
@@ -142,7 +169,9 @@ def policy_input_from_tick_buffer(
         step_index=step_index,
         time_now_us=int(time_now_us),
         time_query_us=int(time_query_us),
-        camera_images=tuple(_camera_image_from_proto(image) for image in tick_buffer.camera_images),
+        camera_images=tuple(
+            _camera_image_from_proto(image) for image in tick_buffer.camera_images
+        ),
         ego_trajectory=_trajectory_from_proto(tick_buffer.ego_trajectory),
         route_waypoints=_route_waypoints_from_proto(tick_buffer.route),
         route_timestamp_us=_route_timestamp_us(tick_buffer.route),
@@ -172,7 +201,9 @@ def drive_response_from_policy_output(
     response = DriveResponse()
     time_now_us = int(policy_input.time_now_us)
     for i in range(horizon):
-        pose_at_time = PoseAtTime(timestamp_us=time_now_us + int(chosen_dt_us[i].item()))
+        pose_at_time = PoseAtTime(
+            timestamp_us=time_now_us + int(chosen_dt_us[i].item())
+        )
         pose_at_time.pose.vec.x = float(chosen_xyz[i, 0].item())
         pose_at_time.pose.vec.y = float(chosen_xyz[i, 1].item())
         pose_at_time.pose.vec.z = float(chosen_xyz[i, 2].item())
@@ -231,7 +262,9 @@ def ground_truth_from_proto(proto: ProtoGroundTruth) -> GroundTruth:
     )
 
 
-def calibration_from_proto(proto: DriveSessionRequest.RolloutSpec) -> RolloutCalibration:
+def calibration_from_proto(
+    proto: DriveSessionRequest.RolloutSpec,
+) -> RolloutCalibration:
     """Convert session rollout camera metadata into AlpaGym calibration.
 
     AlpaSim sends calibration once at session start.

@@ -59,7 +59,9 @@ class AlpagymRollout(RolloutBase):
     def post_init_hook(self, **kwargs: Any) -> None:
         """Load the resolved alpagym config and topology registry."""
         del kwargs
-        self._run_config = load_run_config(Path(self.config.custom["resolved_config_path"]))
+        self._run_config = load_run_config(
+            Path(self.config.custom["resolved_config_path"])
+        )
         initialize_perf(self._run_config)
         self._topology_registry = FileTopologyRegistry(
             self._run_config.artifact_paths.topology_registry_dir
@@ -92,7 +94,9 @@ class AlpagymRollout(RolloutBase):
 
         rollouts_per_payload = int(self._run_config.cosmos.rollout.n_generation)
         scene_id_data: dict[str, list[str]] = yaml.safe_load(
-            self._run_config.artifact_paths.alpasim_scene_ids_path.read_text(encoding="utf-8")
+            self._run_config.artifact_paths.alpasim_scene_ids_path.read_text(
+                encoding="utf-8"
+            )
         )
         scene_ids = tuple(str(scene_id) for scene_id in scene_id_data["scene_ids"])
 
@@ -100,14 +104,20 @@ class AlpagymRollout(RolloutBase):
         self._model = self._inference_engine.get_model()
         record_perf_marker("rollout/model_ready", cpu_snapshot=True, gpu_snapshot=True)
         distributed = ExecutionBackend(self._run_config.execution.backend).is_slurm_run
-        simulation_domain = str(getattr(self._run_config.alpasim, "simulation_domain", "av"))
+        simulation_domain = str(
+            getattr(self._run_config.alpasim, "simulation_domain", "av")
+        )
 
         if simulation_domain == "av":
             policy_endpoint_id = f"driver-{socket.gethostname()}-pid-{os.getpid()}"
         else:
-            policy_endpoint_id = f"{simulation_domain}-policy-{socket.gethostname()}-pid-{os.getpid()}"
+            policy_endpoint_id = (
+                f"{simulation_domain}-policy-{socket.gethostname()}-pid-{os.getpid()}"
+            )
         alpasim_runtime_endpoint: TopologyEndpoint = (
-            self._topology_registry.acquire_alpasim_runtime(driver_id=policy_endpoint_id)
+            self._topology_registry.acquire_alpasim_runtime(
+                driver_id=policy_endpoint_id
+            )
         )
         max_concurrent_rollouts = rollout_worker_capacity(
             runtime_capacity=int(alpasim_runtime_endpoint.capacity),
@@ -128,7 +138,9 @@ class AlpagymRollout(RolloutBase):
             )
             self._humanoid_policy_server.start()
         elif simulation_domain == "av":
-            policy_factory = build_policy_factory(self._run_config, self._inference_engine)
+            policy_factory = build_policy_factory(
+                self._run_config, self._inference_engine
+            )
             self._driver_server = EgodriverServer(
                 name=policy_endpoint_id,
                 max_concurrent_rollouts=max_concurrent_rollouts,
@@ -136,9 +148,13 @@ class AlpagymRollout(RolloutBase):
                 publish_host=publish_host,
             )
             self._driver_server.start()
-            self._topology_registry.publish_driver(self._driver_server.topology_endpoint)
+            self._topology_registry.publish_driver(
+                self._driver_server.topology_endpoint
+            )
         else:
-            raise ValueError(f"unsupported alpasim.simulation_domain={simulation_domain!r}")
+            raise ValueError(
+                f"unsupported alpasim.simulation_domain={simulation_domain!r}"
+            )
 
         channel = grpc.insecure_channel(
             alpasim_runtime_endpoint.to_grpc_target(),
@@ -166,7 +182,9 @@ class AlpagymRollout(RolloutBase):
         worker_kwargs: dict[str, Any] = {
             "alpasim_runtime_stub": self._alpasim_runtime_stub,
             "driver_server": self._driver_server,
-            "simulation_timeout_s": float(self._run_config.alpasim.simulation_timeout_s),
+            "simulation_timeout_s": float(
+                self._run_config.alpasim.simulation_timeout_s
+            ),
             "reward_config": self._run_config.reward,
             "max_concurrent_rollouts": max_concurrent_rollouts,
             "rollouts_per_payload": rollouts_per_payload,
@@ -192,6 +210,7 @@ class AlpagymRollout(RolloutBase):
                 control_timestep_us=self._run_config.alpasim.wizard_args.control_timestep_us,
                 expected_num_envs=humanoid_config.num_envs,
                 max_transition_rows=self._run_config.expected_valid_steps,
+                rollout_seed_base=humanoid_config.rollout_seed_base,
             )
         self._worker = StreamingRolloutWorker(**worker_kwargs)
 
@@ -212,7 +231,9 @@ class AlpagymRollout(RolloutBase):
         atexit.register(self.shutdown)
 
         self._engine_initialized = True
-        record_perf_marker("rollout/backend_ready", cpu_snapshot=True, gpu_snapshot=True)
+        record_perf_marker(
+            "rollout/backend_ready", cpu_snapshot=True, gpu_snapshot=True
+        )
         logger.info(
             "[alpagym] Streaming rollout backend ready: runtime=%s domain=%s "
             "policy_endpoint=%s max_concurrent_rollouts=%d",
@@ -298,7 +319,9 @@ class AlpagymRollout(RolloutBase):
                 for payload in payloads
             ]
         else:
-            payload_states = [self._worker.submit_payload(payload) for payload in payloads]
+            payload_states = [
+                self._worker.submit_payload(payload) for payload in payloads
+            ]
         # The streaming worker resolves permanent-failure payloads with `[]`
         # (after `max_scene_retries` failed simulate attempts) instead of
         # raising. Surface that as a hard error here so cosmos sees the
@@ -346,7 +369,9 @@ class AlpagymRollout(RolloutBase):
     def get_underlying_model(self) -> torch.nn.Module:
         """Return the model object Cosmos should use for rollout weight sync."""
         if self._model is None:
-            raise RuntimeError("AlpaGym rollout model is not initialized; call init_engine first")
+            raise RuntimeError(
+                "AlpaGym rollout model is not initialized; call init_engine first"
+            )
         return self._model
 
     def model_param_map(self, weight_mapper: Any) -> dict[str, torch.Tensor]:

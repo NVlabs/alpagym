@@ -118,7 +118,9 @@ class G1MjlabActorCriticModel(BaseModel):
             nn.init.zeros_(self.actor_context.weight)
         if self.critic_context is not None:
             nn.init.zeros_(self.critic_context.weight)
-        self.actor = self._mlp(BASE_OBS_DIM, hidden_dims, action_dim, hf_config.activation)
+        self.actor = self._mlp(
+            BASE_OBS_DIM, hidden_dims, action_dim, hf_config.activation
+        )
         self.critic = self._mlp(BASE_OBS_DIM, hidden_dims, 1, hf_config.activation)
         self.std = nn.Parameter(torch.full((action_dim,), float(hf_config.init_std)))
         self._model_dir: Path | None = None
@@ -139,7 +141,9 @@ class G1MjlabActorCriticModel(BaseModel):
     def post_to_empty_hook(self, cosmos_config: Any) -> None:
         self.load_hf_weights(
             cosmos_config.policy.model_name_or_path,
-            cosmos_config.parallelism if hasattr(cosmos_config, "parallelism") else None,
+            cosmos_config.parallelism
+            if hasattr(cosmos_config, "parallelism")
+            else None,
             self.current_device(),
         )
 
@@ -166,8 +170,17 @@ class G1MjlabActorCriticModel(BaseModel):
         if checkpoint_path is None:
             self._weights_loaded = True
             return
-        checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
-        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        if checkpoint_path.suffix == ".safetensors":
+            from safetensors.torch import load_file
+
+            state_dict = load_file(str(checkpoint_path), device="cpu")
+        else:
+            checkpoint = torch.load(
+                str(checkpoint_path),
+                map_location="cpu",
+                weights_only=False,
+            )
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
         if not isinstance(state_dict, Mapping):
             raise TypeError(
                 f"G1 checkpoint {checkpoint_path} must contain a state dict or "
@@ -206,14 +219,20 @@ class G1MjlabActorCriticModel(BaseModel):
     ) -> dict[str, torch.Tensor | None]:
         del return_log_prob
         mean, value = self._forward_heads(obs)
-        scored_actions = mean if actions is None else actions.to(device=mean.device, dtype=mean.dtype)
+        scored_actions = (
+            mean
+            if actions is None
+            else actions.to(device=mean.device, dtype=mean.dtype)
+        )
         dist = self.distribution(mean)
         log_probs = dist.log_prob(scored_actions).sum(dim=-1)
         kl_div = None
         if teacher_model is not None:
             with torch.no_grad():
                 teacher_mean, _teacher_value = teacher_model._forward_heads(obs)
-                teacher_std = teacher_model.std.clamp(min=1.0e-6).expand_as(teacher_mean)
+                teacher_std = teacher_model.std.clamp(min=1.0e-6).expand_as(
+                    teacher_mean
+                )
                 teacher_dist = torch.distributions.Normal(teacher_mean, teacher_std)
             kl_div = torch.distributions.kl_divergence(dist, teacher_dist).sum(dim=-1)
         return {"log_probs": log_probs, "values": value.squeeze(-1), "kl_div": kl_div}
@@ -308,14 +327,18 @@ class G1MjlabActorCriticModel(BaseModel):
         layers.append(nn.Linear(prev, int(out_dim)))
         return nn.Sequential(*layers)
 
-    def _load_state_dict(self, state_dict: dict[str, Any], *, device: torch.device) -> None:
+    def _load_state_dict(
+        self, state_dict: dict[str, Any], *, device: torch.device
+    ) -> None:
         normalized = _strip_known_prefixes(state_dict)
         if "actor_terrain.weight" in normalized:
             self.load_state_dict(_to_device_state(normalized, device), strict=False)
             return
         self._load_legacy_state_dict(normalized, device=device)
 
-    def _load_legacy_state_dict(self, state_dict: Mapping[str, Any], *, device: torch.device) -> None:
+    def _load_legacy_state_dict(
+        self, state_dict: Mapping[str, Any], *, device: torch.device
+    ) -> None:
         self.std.data.copy_(_state_tensor(state_dict, "std", self.std, device))
         self.actor_attention.data.copy_(
             _state_tensor(
@@ -366,10 +389,18 @@ class G1MjlabActorCriticModel(BaseModel):
             )
         )
         self.actor.load_state_dict(
-            {key.removeprefix("actor."): value.to(device=device) for key, value in state_dict.items() if key.startswith("actor.")}
+            {
+                key.removeprefix("actor."): value.to(device=device)
+                for key, value in state_dict.items()
+                if key.startswith("actor.")
+            }
         )
         self.critic.load_state_dict(
-            {key.removeprefix("critic."): value.to(device=device) for key, value in state_dict.items() if key.startswith("critic.")}
+            {
+                key.removeprefix("critic."): value.to(device=device)
+                for key, value in state_dict.items()
+                if key.startswith("critic.")
+            }
         )
 
 
@@ -389,7 +420,9 @@ def split_flat_observation(flat: Any) -> dict[str, torch.Tensor]:
     tensor = torch.as_tensor(flat, dtype=torch.float32).reshape(-1)
     expected = sum(OBS_DIMS[key] for key in OBS_KEYS)
     if tuple(tensor.shape) != (expected,):
-        raise ValueError(f"flat observation must have shape ({expected},), got {tuple(tensor.shape)}")
+        raise ValueError(
+            f"flat observation must have shape ({expected},), got {tuple(tensor.shape)}"
+        )
     out: dict[str, torch.Tensor] = {}
     offset = 0
     for key in OBS_KEYS:
@@ -399,11 +432,15 @@ def split_flat_observation(flat: Any) -> dict[str, torch.Tensor]:
     return out
 
 
-def stack_observations(observations: list[Mapping[str, torch.Tensor]], device: torch.device) -> dict[str, torch.Tensor]:
+def stack_observations(
+    observations: list[Mapping[str, torch.Tensor]], device: torch.device
+) -> dict[str, torch.Tensor]:
     if not observations:
         raise ValueError("cannot stack an empty observation sequence")
     return {
-        key: torch.stack([obs[key].to(dtype=torch.float32) for obs in observations], dim=0).to(device)
+        key: torch.stack(
+            [obs[key].to(dtype=torch.float32) for obs in observations], dim=0
+        ).to(device)
         for key in OBS_KEYS
     }
 
@@ -429,7 +466,9 @@ def _activation(name: str) -> nn.Module:
     raise ValueError(f"unsupported activation: {name}")
 
 
-def _resolve_checkpoint_path(model_name_or_path: str, configured_path: str | None) -> Path | None:
+def _resolve_checkpoint_path(
+    model_name_or_path: str, configured_path: str | None
+) -> Path | None:
     if not configured_path:
         return None
     path = Path(configured_path)
@@ -451,8 +490,13 @@ def _strip_known_prefixes(state_dict: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _to_device_state(state_dict: Mapping[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
-    return {key: torch.as_tensor(value).to(device=device) for key, value in state_dict.items()}
+def _to_device_state(
+    state_dict: Mapping[str, Any], device: torch.device
+) -> dict[str, torch.Tensor]:
+    return {
+        key: torch.as_tensor(value).to(device=device)
+        for key, value in state_dict.items()
+    }
 
 
 def _state_tensor(

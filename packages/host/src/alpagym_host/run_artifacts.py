@@ -46,7 +46,8 @@ def build_run_config(
     """Build the concrete run config from authored config and generated paths."""
     config_dict = cast(dict[str, Any], OmegaConf.to_container(config, resolve=True))
     config_dict["artifact_paths"] = {
-        field.name: str(getattr(artifact_paths, field.name)) for field in fields(ArtifactPaths)
+        field.name: str(getattr(artifact_paths, field.name))
+        for field in fields(ArtifactPaths)
     }
 
     return merge_run_config_schema(RunConfig, config_dict)
@@ -109,6 +110,8 @@ def _build_cosmos_config(config: RunConfig) -> dict[str, Any]:
         "normalize_advantages": train_policy.pop("ppo_normalize_advantages", True),
         "gamma": train_policy.pop("ppo_gamma", 0.99),
         "gae_lambda": train_policy.pop("ppo_gae_lambda", 0.95),
+        "min_action_std": train_policy.pop("ppo_min_action_std", 0.02),
+        "max_action_std": train_policy.pop("ppo_max_action_std", 2.0),
     }
     step_mini_batch = train_policy.pop("step_mini_batch", None)
     if step_mini_batch is not None:
@@ -158,7 +161,9 @@ def _extract_policy_model_tarball(tarball_path: Path, bundle_dir: Path) -> None:
         bundle_dir.parent.mkdir(parents=True, exist_ok=True)
         if bundle_dir.exists():
             if not bundle_dir.is_dir():
-                raise ValueError(f"model bundle extraction target is not a directory: {bundle_dir}")
+                raise ValueError(
+                    f"model bundle extraction target is not a directory: {bundle_dir}"
+                )
             shutil.rmtree(bundle_dir)
         bundle_dir.mkdir()
         tar.extractall(bundle_dir, filter="data")
@@ -184,7 +189,8 @@ def _is_supported_hf_weight_filename(filename: str) -> bool:
     if filename in ("model.safetensors", "pytorch_model.bin"):
         return True
     return any(
-        fnmatch(filename, pattern) for pattern in ("model*.safetensors", "pytorch_model*.bin")
+        fnmatch(filename, pattern)
+        for pattern in ("model*.safetensors", "pytorch_model*.bin")
     )
 
 
@@ -194,7 +200,9 @@ def _shard_index_references_existing_files(index_path: Path, bundle_dir: Path) -
         return False
     index_data: dict[str, Any] = json.loads(index_path.read_text(encoding="utf-8"))
     shard_files = _shard_files_from_index(index_data)
-    return bool(shard_files) and all((bundle_dir / filename).is_file() for filename in shard_files)
+    return bool(shard_files) and all(
+        (bundle_dir / filename).is_file() for filename in shard_files
+    )
 
 
 def _shard_files_from_index(index_data: Any) -> set[str]:
@@ -235,7 +243,9 @@ def _drop_none_mapping_values(value: Any) -> Any:
     """
     if isinstance(value, dict):
         return {
-            key: _drop_none_mapping_values(item) for key, item in value.items() if item is not None
+            key: _drop_none_mapping_values(item)
+            for key, item in value.items()
+            if item is not None
         }
     if isinstance(value, list):
         return [_drop_none_mapping_values(item) for item in value]

@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 import math
+import json
+import re
 from pathlib import Path
 
 from alpagym_host.alpasim_dependency import validate_alpasim_checkout_cache
@@ -13,6 +15,7 @@ from alpagym_host.config import (
     CosmosRLRolloutParallelismConfig,
     DatasetConfig,
     ExecutionBackend,
+    HumanoidExecutionProfile,
     RunConfig,
     SeparateNodesSlurmTopologyConfig,
     SlurmConfig,
@@ -49,9 +52,14 @@ def validate_run_config(
     _validate_cosmos_mode(config)
     execution_backend = ExecutionBackend(config.execution.backend)
     if requested_command == "submit" and not execution_backend.is_slurm_run:
-        raise ValueError("command=submit requires execution.backend to be a Slurm backend")
+        raise ValueError(
+            "command=submit requires execution.backend to be a Slurm backend"
+        )
     if execution_backend is ExecutionBackend.slurm:
-        if config.alpasim.repo_path is None and config.alpasim.checkout_cache_dir is None:
+        if (
+            config.alpasim.repo_path is None
+            and config.alpasim.checkout_cache_dir is None
+        ):
             raise ValueError(
                 "alpasim.checkout_cache_dir must be set for a Slurm run when "
                 "alpasim.repo_path is not set"
@@ -99,8 +107,12 @@ def _validate_wizard_startup_config(
         raise ValueError("config.wizard_args.driver_source must be non-empty")
     min_force_gt_duration_us = 0 if config.simulation_domain == "humanoid" else 1
     if config.wizard_args.force_gt_duration_us < min_force_gt_duration_us:
-        expectation = "non-negative" if config.simulation_domain == "humanoid" else "positive"
-        raise ValueError(f"config.wizard_args.force_gt_duration_us must be {expectation}")
+        expectation = (
+            "non-negative" if config.simulation_domain == "humanoid" else "positive"
+        )
+        raise ValueError(
+            f"config.wizard_args.force_gt_duration_us must be {expectation}"
+        )
     if config.wizard_args.driver is not None and not config.wizard_args.driver:
         raise ValueError("config.wizard_args.driver must be non-empty when set")
     if config.wizard_args.renderer is not None and not config.wizard_args.renderer:
@@ -134,6 +146,58 @@ def _validate_humanoid_config(config: RunConfig) -> None:
             f"missing={sorted(expected_scenes - mapped_scenes)}, "
             f"unexpected={sorted(mapped_scenes - expected_scenes)}"
         )
+    if humanoid.expected_scene_fingerprints:
+        fingerprint_scenes = set(humanoid.expected_scene_fingerprints)
+        if fingerprint_scenes != expected_scenes:
+            raise ValueError(
+                "alpasim.humanoid.expected_scene_fingerprints must match "
+                f"dataset.scene_ids: missing={sorted(expected_scenes - fingerprint_scenes)}, "
+                f"unexpected={sorted(fingerprint_scenes - expected_scenes)}"
+            )
+        if any(
+            re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for digest in humanoid.expected_scene_fingerprints.values()
+        ):
+            raise ValueError("humanoid scene fingerprints must be lowercase SHA256")
+    if humanoid.execution_profile is HumanoidExecutionProfile.motion_reference:
+        if not humanoid.expected_scene_fingerprints:
+            raise ValueError(
+                "motion_reference requires a frozen expected_scene_fingerprints map"
+            )
+        expected_json = json.dumps(
+            humanoid.expected_scene_fingerprints,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if (
+            config.policy.model.bundle_config.get("expected_scene_fingerprints_json")
+            != expected_json
+        ):
+            raise ValueError(
+                "motion_reference policy and AlpaSim scene fingerprint snapshots differ"
+            )
+        expected_bundle_paths = {
+            "humanoid_repo_path": str(Path(humanoid.repo_path).expanduser().resolve()),
+            "scene_store_path": str(
+                Path(humanoid.scene_store_path).expanduser().resolve()
+            ),
+        }
+        for key, expected_path in expected_bundle_paths.items():
+            if config.policy.model.bundle_config.get(key) != expected_path:
+                raise ValueError(
+                    f"motion_reference policy bundle {key} must come from "
+                    "alpasim.humanoid"
+                )
+        if config.alpasim.wizard_args.control_timestep_us != 100_000:
+            raise ValueError("motion_reference requires a 100000us outer policy period")
+        if config.policy.model.step_dt_us != 100_000:
+            raise ValueError("motion_reference policy.model.step_dt_us must be 100000")
+        if config.alpasim.wizard_args.force_gt_duration_us != 0:
+            raise ValueError("motion_reference requires force_gt_duration_us=0")
+        if config.alpasim.wizard_args.n_sim_steps != config.expected_valid_steps:
+            raise ValueError(
+                "motion_reference n_sim_steps must equal expected_valid_steps"
+            )
     if config.cosmos.rollout.prefetch_rollout:
         raise ValueError(
             "humanoid rollouts require prefetch_rollout=false until Cosmos passes "
@@ -150,7 +214,10 @@ def _validate_humanoid_config(config: RunConfig) -> None:
 def _validate_cosmos_mode(config: RunConfig) -> None:
     """Validate backend-specific Cosmos placement mode requirements."""
     execution_backend = ExecutionBackend(config.execution.backend)
-    if execution_backend.is_slurm_run and config.cosmos.mode is not CosmosRLMode.disaggregated:
+    if (
+        execution_backend.is_slurm_run
+        and config.cosmos.mode is not CosmosRLMode.disaggregated
+    ):
         raise ValueError("cosmos.mode must be 'disaggregated' for slurm execution")
 
 
@@ -165,7 +232,9 @@ def _validate_slurm_topology_config(slurm: SlurmConfig) -> None:
             if slurm.topology.alpasim_gpus < 1:
                 raise ValueError("all_in_one requires at least one AlpaSim GPU")
             if slurm.topology.alpasim_gpus >= slurm.gpus_per_node:
-                raise ValueError("all_in_one requires alpasim_gpus to leave a Cosmos GPU")
+                raise ValueError(
+                    "all_in_one requires alpasim_gpus to leave a Cosmos GPU"
+                )
         case SlurmLayout.separate_nodes:
             if not isinstance(slurm.topology, SeparateNodesSlurmTopologyConfig):
                 raise TypeError(type(slurm.topology))
@@ -173,7 +242,9 @@ def _validate_slurm_topology_config(slurm: SlurmConfig) -> None:
                 raise ValueError("separate_nodes requires at least one Cosmos node")
             if slurm.topology.alpasim_nodes < 1:
                 raise ValueError("separate_nodes requires at least one AlpaSim node")
-            if slurm.nodes != (slurm.topology.cosmos_nodes + slurm.topology.alpasim_nodes):
+            if slurm.nodes != (
+                slurm.topology.cosmos_nodes + slurm.topology.alpasim_nodes
+            ):
                 raise ValueError(
                     "separate_nodes requires nodes to equal cosmos_nodes + alpasim_nodes"
                 )
@@ -227,7 +298,9 @@ def _validate_nccl_parallelism(config: RunConfig) -> None:
     if config.cosmos.launch.policy_replicas <= 0:
         raise ValueError("NCCL transport requires cosmos.launch.policy_replicas >= 1")
     if policy_parallelism.dp_shard_size <= 0:
-        raise ValueError("NCCL transport requires policy.parallelism.dp_shard_size >= 1")
+        raise ValueError(
+            "NCCL transport requires policy.parallelism.dp_shard_size >= 1"
+        )
     unsupported_policy_axes = {
         "tp_size": policy_parallelism.tp_size,
         "cp_size": policy_parallelism.cp_size,
@@ -236,7 +309,9 @@ def _validate_nccl_parallelism(config: RunConfig) -> None:
         "pp_micro_batch_size": policy_parallelism.pp_micro_batch_size,
         "dp_replicate_size": policy_parallelism.dp_replicate_size,
     }
-    bad_policy_axes = {name: value for name, value in unsupported_policy_axes.items() if value != 1}
+    bad_policy_axes = {
+        name: value for name, value in unsupported_policy_axes.items() if value != 1
+    }
     if bad_policy_axes:
         raise ValueError(
             "NCCL transport sizes policy workers from "
@@ -311,6 +386,16 @@ def _validate_training_policy_config(config: RunConfig) -> None:
             "Cosmos replay training. It can be false only for a rollout-only "
             "entrypoint."
         )
+    train_policy = config.cosmos.train.train_policy
+    if not (
+        math.isfinite(train_policy.ppo_min_action_std)
+        and math.isfinite(train_policy.ppo_max_action_std)
+        and 0.0 < train_policy.ppo_min_action_std <= train_policy.ppo_max_action_std
+    ):
+        raise ValueError(
+            "PPO action std bounds must satisfy 0 < ppo_min_action_std <= "
+            "ppo_max_action_std"
+        )
 
 
 def _validate_cosmos_grpo_batch_geometry(cosmos: CosmosRLConfig) -> None:
@@ -367,7 +452,9 @@ def _validate_slurm_cosmos_gpu_capacity(config: RunConfig) -> None:
     cosmos_hosts = topology.cosmos_host_plans
     cosmos_gpus_per_host = cosmos_hosts[0].cosmos_gpu_count
     policy_gpus_per_replica = _policy_gpus_per_replica(config.cosmos.policy.parallelism)
-    rollout_gpus_per_replica = _rollout_gpus_per_replica(config.cosmos.rollout.parallelism)
+    rollout_gpus_per_replica = _rollout_gpus_per_replica(
+        config.cosmos.rollout.parallelism
+    )
 
     errors: list[str] = []
     if policy_gpus_per_replica > cosmos_gpus_per_host:
@@ -418,11 +505,17 @@ def _validate_shared_cosmos_2_3_shape(config: RunConfig) -> None:
             config.cosmos.train.train_batch_per_replica,
             12,
         ),
-        ("cosmos.train.train_policy.mini_batch", config.cosmos.train.train_policy.mini_batch, 1),
+        (
+            "cosmos.train.train_policy.mini_batch",
+            config.cosmos.train.train_policy.mini_batch,
+            1,
+        ),
         ("expected_valid_steps", config.expected_valid_steps, 22),
     ]
     mismatches = [
-        f"{key}={actual!r} (expected {want!r})" for key, actual, want in expected if actual != want
+        f"{key}={actual!r} (expected {want!r})"
+        for key, actual, want in expected
+        if actual != want
     ]
     if mismatches:
         raise ValueError(

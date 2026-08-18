@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alpagym-g1-videomimic-planner"
+version = "0.1.0"
+dependencies = [
+  "alpagym-g1-mjlab",
+  "alpagym-runtime",
+  "mujoco==3.10.0",
+  "safetensors",
+  "transformers",
+]
+
+[project.entry-points."alpagym.policy_bundles"]
+g1_videomimic_planner = "alpagym_g1_videomimic_planner.bundle:get_bundle"
+
+[project.entry-points."alpagym.configs"]
+g1_videomimic_planner = "alpagym_g1_videomimic_planner.configs"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"alpagym_g1_videomimic_planner.configs" = ["**/*.yaml"]

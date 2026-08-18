@@ -45,6 +45,93 @@ def _metric(name: str, values: list[float]) -> dict[str, object]:
     }
 
 
+def _motion_output(
+    *,
+    duration: int,
+    terminated: bool = True,
+    outer_truncated: bool = False,
+    active_digest: str | None = None,
+    root_offset: float = 0.125,
+) -> PolicyOutput:
+    digest = "a" * 64
+    rewards = [1.0 / duration] * duration
+    ticks = [
+        {
+            "control_tick_offset": index + 1,
+            "reference_action_index": index,
+            "timestamp_us": (index + 1) * 20_000,
+            "active_reference_id": 7,
+            "active_reference_sha256": active_digest or digest,
+            "applied_reference_sha256": digest,
+            "root_z_alignment_offset_m": root_offset,
+            "reward": rewards[index],
+            "terminated": terminated and index == duration - 1,
+            "truncated": False,
+            "control_episode_step": index + 1,
+        }
+        for index in range(duration)
+    ]
+    replay = PolicyReplayData(
+        replay_schema_version=1,
+        payload_schema="humanoid.motion.test.v1",
+        payload_schema_version=1,
+        model_family="test",
+        action_selection=ActionSelection(0, 0),
+        old_logprob=torch.tensor(0.0),
+        payload={
+            "reference_id": 7,
+            "source_decision_id": 0,
+            "reference_sha256": digest,
+            "root_z_alignment_offset_m": 0.125,
+            "feedback_trace": {
+                "env_id": 0,
+                "source_decision_id": 0,
+                "ticks": ticks,
+            },
+            **({"outer_truncated": True} if outer_truncated else {}),
+        },
+    )
+    return PolicyOutput(
+        chosen_xyz=torch.zeros((50, 3)),
+        chosen_quat=torch.tensor([[1.0, 0.0, 0.0, 0.0]] * 50),
+        chosen_dt_us=torch.arange(50, dtype=torch.int64) * 20_000,
+        replay_data=replay,
+        model_extra={
+            "humanoid_env_id": 0,
+            "humanoid_episode_id": 4,
+            "humanoid_step_index": 0,
+            "humanoid_decision_id": 0,
+            "humanoid_timestamp_us": 0,
+            "humanoid_value": 0.5,
+        },
+    )
+
+
+def _motion_metrics(
+    *,
+    timestamp_us: int,
+    terminated: bool,
+    truncated: bool,
+) -> dict[str, dict[str, object]]:
+    return {
+        "humanoid_reward_env0": {
+            "timestamps_us": [timestamp_us],
+            "values": [1.0],
+            "valid": [True],
+        },
+        "humanoid_terminated_env0": {
+            "timestamps_us": [timestamp_us],
+            "values": [float(terminated)],
+            "valid": [True],
+        },
+        "humanoid_truncated_env0": {
+            "timestamps_us": [timestamp_us],
+            "values": [float(truncated)],
+            "valid": [True],
+        },
+    }
+
+
 def test_truncated_episode_uses_next_values_and_real_final_bootstrap() -> None:
     outputs = (_output(0, 1.0), _output(1, 2.0))
     dense = {
@@ -183,4 +270,105 @@ def test_missing_reward_metric_fails_instead_of_zero_filling() -> None:
             control_timestep_us=20_000,
             expected_num_envs=1,
             max_transition_rows=750,
+        )
+
+
+@pytest.mark.parametrize("duration", (1, 5))
+def test_motion_reference_receipt_emits_exact_smdp_prefix(duration: int) -> None:
+    patched = attach_humanoid_transitions(
+        (_motion_output(duration=duration),),
+        _motion_metrics(
+            timestamp_us=duration * 20_000,
+            terminated=True,
+            truncated=False,
+        ),
+        {"humanoid_episode_length_env0": 1.0},
+        behavior_policy_version=9,
+        final_bootstrap_values={},
+        control_timestep_us=100_000,
+        expected_num_envs=1,
+        max_transition_rows=150,
+    )
+
+    transition = patched[0].replay_data.payload["transition"]
+    assert transition["duration_ticks"] == duration
+    assert transition["primitive_reward_mask"] == [
+        index < duration for index in range(5)
+    ]
+    assert sum(transition["primitive_rewards"]) == pytest.approx(1.0)
+    assert transition["terminated"] is True
+    assert transition["bootstrap_value"] == 0.0
+
+
+def test_motion_reference_outer_horizon_truncates_after_full_controller_prefix() -> (
+    None
+):
+    dense = _motion_metrics(
+        timestamp_us=100_000,
+        terminated=False,
+        truncated=True,
+    )
+    dense["humanoid_final_bootstrap_value_env0"] = {
+        "timestamps_us": [100_000],
+        "values": [2.0],
+        "valid": [True],
+    }
+    patched = attach_humanoid_transitions(
+        (
+            _motion_output(
+                duration=5,
+                terminated=False,
+                outer_truncated=True,
+            ),
+        ),
+        dense,
+        {
+            "humanoid_episode_length_env0": 1.0,
+            "humanoid_final_bootstrap_value_env0": 2.0,
+        },
+        behavior_policy_version=9,
+        final_bootstrap_values={0: 2.0},
+        control_timestep_us=100_000,
+        expected_num_envs=1,
+        max_transition_rows=150,
+    )
+
+    transition = patched[0].replay_data.payload["transition"]
+    assert transition["terminated"] is False
+    assert transition["truncated"] is True
+    assert transition["duration_ticks"] == 5
+    assert transition["bootstrap_value"] == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize(
+    ("output", "match"),
+    (
+        (
+            _motion_output(duration=1, active_digest="b" * 64),
+            "active reference digest",
+        ),
+        (
+            _motion_output(duration=1, root_offset=0.5),
+            "root Z alignment",
+        ),
+    ),
+)
+def test_motion_reference_receipt_rejects_mixed_identity(
+    output: PolicyOutput,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        attach_humanoid_transitions(
+            (output,),
+            _motion_metrics(
+                timestamp_us=20_000,
+                terminated=True,
+                truncated=False,
+            ),
+            {"humanoid_episode_length_env0": 1.0},
+            behavior_policy_version=9,
+            final_bootstrap_values={},
+            control_timestep_us=100_000,
+            expected_num_envs=1,
+            max_transition_rows=150,
         )

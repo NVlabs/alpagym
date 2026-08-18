@@ -15,10 +15,19 @@ from alpagym_runtime.cosmos.replay_objective import (
     assert_replay_shapes,
     compute_kl_penalty,
     compute_ppo_surrogate,
+    compute_token_ppo_surrogate,
     compute_value_loss,
 )
 from alpagym_runtime.cosmos.rollout_filter import filter_trainable_rollouts
-from alpagym_runtime.replay import TrainerReplayData, TrainerReplayDataBatch, TrainingSignal
+from alpagym_runtime.replay import (
+    ActionSelection,
+    DataPackerConfig,
+    PolicyReplayData,
+    TrainerReplayData,
+    TrainerReplayDataBatch,
+    TrainingSignal,
+)
+from alpagym_runtime.types import EpisodeOutput, PolicyOutput
 
 
 def test_trainer_applies_supplied_per_step_advantages(cosmos_stubs: None) -> None:
@@ -31,10 +40,14 @@ def test_trainer_applies_supplied_per_step_advantages(cosmos_stubs: None) -> Non
     del cosmos_stubs
     trainer = _trainer_for_replay_test(_ScalarLogProbModel())
 
-    loss, kl, ratio_max, ratio_min, clip_fraction, _grad_norm = trainer._train_minibatch(
-        minibatch_samples=[object(), object(), object(), object()],
-        minibatch_advantages=torch.tensor([1.0, 0.0, -2.0, -2.0], dtype=torch.float32),
-        inter_policy_nccl=object(),
+    loss, kl, ratio_max, ratio_min, clip_fraction, _grad_norm = (
+        trainer._train_minibatch(
+            minibatch_samples=[object(), object(), object(), object()],
+            minibatch_advantages=torch.tensor(
+                [1.0, 0.0, -2.0, -2.0], dtype=torch.float32
+            ),
+            inter_policy_nccl=object(),
+        )
     )
     expected_loss = _clipped_grpo_policy_loss(
         new_logprobs=torch.zeros(4, dtype=torch.float32),
@@ -68,10 +81,14 @@ def test_trainer_minibatch_matches_clipped_grpo_oracle(cosmos_stubs: None) -> No
     trainer._grpo_ratio_clip_high = 0.28
     before = trainer.model.log_probs.detach().clone()
 
-    loss, kl, ratio_max, ratio_min, clip_fraction, _grad_norm = trainer._train_minibatch(
-        minibatch_samples=[object(), object(), object(), object()],
-        minibatch_advantages=torch.tensor([1.0, 0.0, -2.0, -2.0], dtype=torch.float32),
-        inter_policy_nccl=object(),
+    loss, kl, ratio_max, ratio_min, clip_fraction, _grad_norm = (
+        trainer._train_minibatch(
+            minibatch_samples=[object(), object(), object(), object()],
+            minibatch_advantages=torch.tensor(
+                [1.0, 0.0, -2.0, -2.0], dtype=torch.float32
+            ),
+            inter_policy_nccl=object(),
+        )
     )
     # All 4 rows are forwarded, but the loss and the diagnostics (ratio min/max,
     # clip fraction) normalize over the 3 valid rows (0, 2, 3); the padded row 1
@@ -105,7 +122,9 @@ def test_trainer_requires_log_probs_output(cosmos_stubs: None) -> None:
     with pytest.raises(KeyError, match="log_probs"):
         trainer._train_minibatch(
             minibatch_samples=[object(), object(), object(), object()],
-            minibatch_advantages=torch.tensor([1.0, 0.0, -2.0, -2.0], dtype=torch.float32),
+            minibatch_advantages=torch.tensor(
+                [1.0, 0.0, -2.0, -2.0], dtype=torch.float32
+            ),
             inter_policy_nccl=object(),
         )
 
@@ -119,8 +138,12 @@ def test_prepare_training_data_flattens_steps_and_zeros_padding_advantage(
     trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
     trainer.data_packer = _PerStepPacker({"a": [False, False], "b": [False, True]})
     rollouts = [
-        SimpleNamespace(prompt="a", completion="a", n_ignore_prefix_tokens=0, advantage=1.5),
-        SimpleNamespace(prompt="b", completion="b", n_ignore_prefix_tokens=0, advantage=-3.0),
+        SimpleNamespace(
+            prompt="a", completion="a", n_ignore_prefix_tokens=0, advantage=1.5
+        ),
+        SimpleNamespace(
+            prompt="b", completion="b", n_ignore_prefix_tokens=0, advantage=-3.0
+        ),
     ]
 
     samples, advantages = trainer._prepare_training_data(rollouts)
@@ -132,7 +155,9 @@ def test_prepare_training_data_flattens_steps_and_zeros_padding_advantage(
     )
 
 
-def test_train_minibatch_forwards_all_rows_including_padding(cosmos_stubs: None) -> None:
+def test_train_minibatch_forwards_all_rows_including_padding(
+    cosmos_stubs: None,
+) -> None:
     """Padding rows are forwarded, not dropped, so every DP worker runs the
     identical model forward in lockstep.
 
@@ -144,10 +169,14 @@ def test_train_minibatch_forwards_all_rows_including_padding(cosmos_stubs: None)
     trainer = _trainer_for_replay_test(_ScalarLogProbModel())
     trainer.data_packer = _PaddingCapturingPacker()
 
-    loss, kl, ratio_max, ratio_min, clip_fraction, _grad_norm = trainer._train_minibatch(
-        minibatch_samples=[object(), object(), object(), object()],
-        minibatch_advantages=torch.tensor([1.0, 0.0, -2.0, -2.0], dtype=torch.float32),
-        inter_policy_nccl=object(),
+    loss, kl, ratio_max, ratio_min, clip_fraction, _grad_norm = (
+        trainer._train_minibatch(
+            minibatch_samples=[object(), object(), object(), object()],
+            minibatch_advantages=torch.tensor(
+                [1.0, 0.0, -2.0, -2.0], dtype=torch.float32
+            ),
+            inter_policy_nccl=object(),
+        )
     )
 
     assert trainer.model.rows_seen == 4
@@ -165,7 +194,9 @@ def test_ppo_prepare_training_data_computes_gae_inside_trainer(
     del cosmos_stubs
     trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
     trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
-    trainer.data_packer = _PpoPerStepPacker({"a": [(1.0, 0.0, False, False), (1.0, 0.0, True, False)]})
+    trainer.data_packer = _PpoPerStepPacker(
+        {"a": [(1.0, 0.0, False, False), (1.0, 0.0, True, False)]}
+    )
     trainer._normalize_advantages = False
     trainer._gamma = 1.0
     trainer._gae_lambda = 1.0
@@ -182,7 +213,9 @@ def test_ppo_prepare_training_data_computes_gae_inside_trainer(
     samples, advantages = trainer._prepare_training_data(rollouts)
 
     assert len(samples) == 2
-    torch.testing.assert_close(advantages, torch.tensor([2.0, 1.0], dtype=torch.float32))
+    torch.testing.assert_close(
+        advantages, torch.tensor([2.0, 1.0], dtype=torch.float32)
+    )
     torch.testing.assert_close(
         samples[0].training_signal.returns,
         torch.tensor([2.0], dtype=torch.float32),
@@ -193,14 +226,80 @@ def test_ppo_prepare_training_data_computes_gae_inside_trainer(
     )
 
 
+def test_ppo_smdp_gae_discounts_variable_controller_tick_blocks(
+    cosmos_stubs: None,
+) -> None:
+    """Macro transitions preserve primitive reward order and elapsed time."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer._gamma = 0.9
+    trainer._gae_lambda = 0.8
+    samples = [
+        _smdp_sample(
+            rewards=(1.0, 2.0, 3.0),
+            old_value=0.5,
+            bootstrap_value=0.25,
+            terminated=False,
+        ),
+        _smdp_sample(
+            rewards=(4.0, 5.0),
+            old_value=0.25,
+            bootstrap_value=0.0,
+            terminated=True,
+        ),
+    ]
+
+    advantages, returns = trainer._compute_gae(samples)
+
+    final_advantage = (4.0 + 0.9 * 5.0) - 0.25
+    first_delta = (1.0 + 0.9 * 2.0 + 0.9**2 * 3.0) + 0.9**3 * 0.25 - 0.5
+    first_advantage = first_delta + (0.9 * 0.8) ** 3 * final_advantage
+    assert advantages == pytest.approx([first_advantage, final_advantage])
+    assert returns == pytest.approx([first_advantage + 0.5, final_advantage + 0.25])
+
+
+def test_ppo_smdp_k1_matches_direct_transition_gae(cosmos_stubs: None) -> None:
+    """The semi-Markov representation is an exact K=1 direct-policy regression."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer._gamma = 0.95
+    trainer._gae_lambda = 0.8
+    direct = [
+        _direct_ppo_sample(1.0, old_value=0.3, terminated=False),
+        _direct_ppo_sample(2.0, old_value=0.4, terminated=True),
+    ]
+    smdp = [
+        _smdp_sample(
+            rewards=(1.0,),
+            old_value=0.3,
+            bootstrap_value=0.4,
+            terminated=False,
+            width=1,
+        ),
+        _smdp_sample(
+            rewards=(2.0,),
+            old_value=0.4,
+            bootstrap_value=0.0,
+            terminated=True,
+            width=1,
+        ),
+    ]
+
+    direct_advantages, direct_returns = trainer._compute_gae(direct)
+    smdp_advantages, smdp_returns = trainer._compute_gae(smdp)
+
+    assert smdp_advantages == pytest.approx(direct_advantages)
+    assert smdp_returns == pytest.approx(direct_returns)
+
+
 def test_ppo_rejects_behavior_version_mismatch(cosmos_stubs: None) -> None:
     """The Cosmos envelope and every real/padded replay row must agree."""
     del cosmos_stubs
     trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
     trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
-    trainer.data_packer = _PpoPerStepPacker(
-        {"a": [(1.0, 0.0, True, False)]}
-    )
+    trainer.data_packer = _PpoPerStepPacker({"a": [(1.0, 0.0, True, False)]})
     trainer._normalize_advantages = False
     trainer._gamma = 1.0
     trainer._gae_lambda = 1.0
@@ -215,6 +314,8 @@ def test_ppo_rejects_behavior_version_mismatch(cosmos_stubs: None) -> None:
                 )
             ]
         )
+
+
 @pytest.mark.parametrize(
     ("configured", "expected"),
     ((None, 3), (64, 64)),
@@ -265,6 +366,64 @@ def test_ppo_transition_minibatch_must_be_a_positive_integer(
         )
 
 
+def test_ppo_std_clamp_is_ordered_on_optimizer_cuda_stream(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The post-step clamp cannot race Adam and is visible to the next forward."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    events: list[object] = []
+    train_stream = object()
+
+    class _CallerStream:
+        def wait_stream(self, stream: object) -> None:
+            events.append(("caller_wait", stream))
+
+    class _StreamContext:
+        def __init__(self, stream: object) -> None:
+            self._stream = stream
+
+        def __enter__(self) -> None:
+            events.append(("enter", self._stream))
+
+        def __exit__(self, *exc: object) -> None:
+            del exc
+            events.append(("exit", self._stream))
+
+    def _base_step(self: object, nccl: object) -> float:
+        del self, nccl
+        events.append("optimizer")
+        return 3.0
+
+    def _clamp_std(*, min_std: float, max_std: float) -> None:
+        events.append(("clamp", min_std, max_std))
+
+    monkeypatch.setattr(
+        trainer_module.AlpagymGRPOTrainer,
+        "all_reduce_states",
+        _base_step,
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _CallerStream())
+    monkeypatch.setattr(torch.cuda, "stream", _StreamContext)
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer.train_stream = train_stream
+    trainer.model = SimpleNamespace(clamp_std_=_clamp_std)
+    trainer._min_action_std = 0.02
+    trainer._max_action_std = 2.0
+
+    grad_norm = trainer.all_reduce_states(object())
+
+    assert grad_norm == 3.0
+    assert events == [
+        "optimizer",
+        ("enter", train_stream),
+        ("clamp", 0.02, 2.0),
+        ("exit", train_stream),
+        ("caller_wait", train_stream),
+    ]
+
+
 def test_ppo_smoke_rl_training_step_with_mlp_actor_and_value_network(
     cosmos_stubs: None,
 ) -> None:
@@ -294,14 +453,18 @@ def test_ppo_smoke_rl_training_step_with_mlp_actor_and_value_network(
     value_before = _clone_parameters(model.value_net)
     log_std_before = model.log_std.detach().clone()
 
-    loss, kl, ratio_max, ratio_min, clip_fraction, _grad_norm = trainer._train_minibatch(
-        minibatch_samples=samples,
-        minibatch_advantages=advantages,
-        inter_policy_nccl=object(),
+    loss, kl, ratio_max, ratio_min, clip_fraction, _grad_norm = (
+        trainer._train_minibatch(
+            minibatch_samples=samples,
+            minibatch_advantages=advantages,
+            inter_policy_nccl=object(),
+        )
     )
 
     assert len(samples) == 3
-    torch.testing.assert_close(advantages, torch.tensor([3.0, 2.0, 1.0], dtype=torch.float32))
+    torch.testing.assert_close(
+        advantages, torch.tensor([3.0, 2.0, 1.0], dtype=torch.float32)
+    )
     torch.testing.assert_close(
         torch.cat([sample.training_signal.returns for sample in samples]),
         torch.tensor([3.0, 2.0, 1.0], dtype=torch.float32),
@@ -318,15 +481,148 @@ def test_ppo_smoke_rl_training_step_with_mlp_actor_and_value_network(
     assert _parameters_changed(model.value_net, value_before)
 
 
+def test_short_planner_episode_pads_and_trains_token_ppo(
+    cosmos_stubs: None,
+) -> None:
+    """An early terminal planner rollout keeps cloned token/scalar audits aligned."""
+    del cosmos_stubs
+    from alpagym_g1_videomimic_planner.bundle import build_model_inputs
+    from alpagym_g1_videomimic_planner.model import (
+        REPLAY_SCHEMA,
+        SHADOW_ACTION_STEPS,
+        G1VideoMimicPlannerActorCriticModel,
+        G1VideoMimicPlannerConfig,
+        OBS_DIMS,
+        OBS_KEYS,
+    )
+
+    torch.manual_seed(17)
+    model = G1VideoMimicPlannerActorCriticModel(
+        G1VideoMimicPlannerConfig(hidden_dims=[16, 8], init_std=0.3)
+    )
+    observations = {
+        key: torch.randn(SHADOW_ACTION_STEPS, OBS_DIMS[key]) for key in OBS_KEYS
+    }
+    actions = torch.randn(SHADOW_ACTION_STEPS, 23)
+    with torch.no_grad():
+        behavior = model(
+            actions=actions.unsqueeze(0),
+            **{key: value.unsqueeze(0) for key, value in observations.items()},
+        )
+    old_tokens = behavior["token_log_probs"][0].detach()
+    old_value = behavior["values"][0].detach()
+    digest = "a" * 64
+    transition = {
+        "env_id": 0,
+        "source_decision_id": 0,
+        "reference_id": 1,
+        "reference_sha256": digest,
+        "reward": 1.0,
+        "old_value": old_value,
+        "terminated": True,
+        "truncated": False,
+        "behavior_policy_version": 0,
+        "duration_ticks": 1,
+        "primitive_rewards": torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0]),
+        "primitive_reward_mask": torch.tensor([True, False, False, False, False]),
+    }
+    replay = PolicyReplayData(
+        replay_schema_version=1,
+        payload_schema=REPLAY_SCHEMA,
+        payload_schema_version=1,
+        model_family="g1_videomimic_planner",
+        action_selection=ActionSelection(set_ix=0, sample_ix=0),
+        old_logprob=old_tokens.sum(),
+        payload={
+            "shadow_observations": observations,
+            "raw_actions": actions,
+            "executed_actions": actions.clamp(-8.0, 8.0),
+            "old_token_logprobs": old_tokens,
+            "reference_id": 1,
+            "source_decision_id": 0,
+            "reference_sha256": digest,
+            "root_z_alignment_offset_m": 0.125,
+            "feedback_trace": {
+                "env_id": 0,
+                "source_decision_id": 0,
+                "ticks": [
+                    {
+                        "control_tick_offset": 1,
+                        "reference_action_index": 0,
+                        "active_reference_id": 1,
+                        "active_reference_sha256": digest,
+                        "applied_reference_sha256": digest,
+                        "root_z_alignment_offset_m": 0.125,
+                        "reward": 1.0,
+                        "control_episode_step": 0,
+                    }
+                ],
+            },
+            "transition": transition,
+        },
+    )
+    episode = EpisodeOutput(
+        scene_id="hq_stairs",
+        session_uuid="short-planner",
+        num_steps=1,
+        policy_outputs=(
+            PolicyOutput(
+                chosen_xyz=torch.zeros((50, 3)),
+                chosen_quat=torch.tensor([[1.0, 0.0, 0.0, 0.0]] * 50),
+                chosen_dt_us=torch.arange(50, dtype=torch.int64) * 20_000,
+                chosen_logprob=old_tokens.sum().reshape(1),
+                replay_data=replay,
+            ),
+        ),
+    )
+    packer_module = importlib.import_module("alpagym_runtime.cosmos.packer")
+    packer = packer_module.AlpagymDataPacker(
+        DataPackerConfig(expected_valid_steps=2),
+        build_model_inputs=build_model_inputs(SimpleNamespace()),
+    )
+    samples = packer.get_policy_input(0, episode)
+    assert not bool(samples[0].training_signal.is_padding.item())
+    assert bool(samples[1].training_signal.is_padding.item())
+    torch.testing.assert_close(
+        samples[1].training_signal.old_logprobs,
+        samples[1].model_inputs["old_token_logprobs"].sum().reshape(1),
+    )
+
+    trainer = _trainer_for_ppo_replay_test(model)
+    trainer.data_packer = packer
+    trainer._gamma = 0.99
+    trainer._gae_lambda = 0.95
+    trainer._normalize_advantages = False
+    rollouts = [
+        SimpleNamespace(
+            prompt=0,
+            completion=episode,
+            n_ignore_prefix_tokens=0,
+            advantage=0.0,
+            weight_version=0,
+        )
+    ]
+    train_samples, advantages = trainer._prepare_training_data(rollouts)
+    loss, *_ = trainer._train_minibatch(
+        minibatch_samples=train_samples,
+        minibatch_advantages=advantages,
+        inter_policy_nccl=object(),
+    )
+
+    assert torch.isfinite(torch.tensor(loss))
+
+
 def test_ppo_minibatch_trains_value_head(cosmos_stubs: None) -> None:
     """The PPO trainer backprops value loss through model forward key ``values``."""
     del cosmos_stubs
     trainer = _trainer_for_ppo_replay_test(_ActorCriticValueModel())
 
-    loss, kl, ratio_max, ratio_min, clip_fraction, _grad_norm = trainer._train_minibatch(
-        minibatch_samples=[object(), object(), object(), object()],
-        minibatch_advantages=torch.zeros(4, dtype=torch.float32),
-        inter_policy_nccl=object(),
+    loss, kl, ratio_max, ratio_min, clip_fraction, _grad_norm = (
+        trainer._train_minibatch(
+            minibatch_samples=[object(), object(), object(), object()],
+            minibatch_advantages=torch.zeros(4, dtype=torch.float32),
+            inter_policy_nccl=object(),
+        )
     )
 
     assert loss == pytest.approx(2.0)
@@ -367,7 +663,9 @@ def test_compute_ppo_surrogate_matches_oracle(cosmos_stubs: None) -> None:
         grpo_ratio_clip_high=0.28,
     )
     torch.testing.assert_close(loss, expected)
-    torch.testing.assert_close(ratio, torch.tensor([1.3, 0.8, 1.1, 0.8], dtype=torch.float32))
+    torch.testing.assert_close(
+        ratio, torch.tensor([1.3, 0.8, 1.1, 0.8], dtype=torch.float32)
+    )
 
 
 def test_compute_ppo_surrogate_normalizes_over_valid_rows(cosmos_stubs: None) -> None:
@@ -398,6 +696,217 @@ def test_compute_ppo_surrogate_normalizes_over_valid_rows(cosmos_stubs: None) ->
         is_padding=torch.tensor([False, False, True, True]),
     )
     torch.testing.assert_close(loss_no_pad, loss_padded)
+
+
+def test_compute_token_ppo_surrogate_clips_each_shadow_step(cosmos_stubs: None) -> None:
+    """A changed token must not force the other planner tokens to share its ratio."""
+    del cosmos_stubs
+    ratios = torch.tensor([[1.4, 1.0], [0.7, 1.1]], dtype=torch.float32)
+    advantages = torch.tensor([1.0, -2.0], dtype=torch.float32)
+
+    loss, actual_ratios = compute_token_ppo_surrogate(
+        new_token_logprobs=ratios.log(),
+        old_token_logprobs=torch.zeros_like(ratios),
+        advantages=advantages,
+        ratio_clip_low=0.1,
+        ratio_clip_high=0.2,
+        is_padding=torch.zeros(2, dtype=torch.bool),
+    )
+
+    # Positive row: min(1.4, 1.2), min(1.0, 1.0).
+    # Negative row: min(-1.4, -1.8), min(-2.2, -2.2).
+    expected = -torch.tensor([1.2, 1.0, -1.8, -2.2]).mean()
+    torch.testing.assert_close(loss, expected)
+    torch.testing.assert_close(actual_ratios, ratios)
+
+
+def test_compute_token_ppo_surrogate_masks_whole_macro_rows(cosmos_stubs: None) -> None:
+    del cosmos_stubs
+    loss, _ratio = compute_token_ppo_surrogate(
+        new_token_logprobs=torch.log(torch.tensor([[1.1, 0.9], [9.0, 9.0]])),
+        old_token_logprobs=torch.zeros(2, 2),
+        advantages=torch.tensor([2.0, 100.0]),
+        ratio_clip_low=0.2,
+        ratio_clip_high=0.2,
+        is_padding=torch.tensor([False, True]),
+    )
+    torch.testing.assert_close(loss, torch.tensor(-2.0))
+
+
+@pytest.mark.parametrize(
+    ("duration", "causal_tokens", "expected_loss"),
+    (
+        (1, 45, -1.0),
+        (5, 49, -(45.0 + 4.0 * 1.2) / 49.0),
+    ),
+)
+def test_compute_token_ppo_masks_noncausal_early_terminal_tail(
+    cosmos_stubs: None,
+    duration: int,
+    causal_tokens: int,
+    expected_loss: float,
+) -> None:
+    del cosmos_stubs, duration
+    new = torch.zeros(1, 49, dtype=torch.float32, requires_grad=True)
+    with torch.no_grad():
+        new[:, 45:] = torch.log(torch.tensor(9.0))
+    mask = (torch.arange(49) < causal_tokens).reshape(1, 49)
+
+    loss, _ = compute_token_ppo_surrogate(
+        new_token_logprobs=new,
+        old_token_logprobs=torch.zeros_like(new),
+        advantages=torch.ones(1),
+        ratio_clip_low=0.2,
+        ratio_clip_high=0.2,
+        is_padding=torch.zeros(1, dtype=torch.bool),
+        token_causality_mask=mask,
+    )
+    loss.backward()
+
+    assert float(loss.item()) == pytest.approx(expected_loss)
+    if causal_tokens == 45:
+        torch.testing.assert_close(new.grad[:, 45:], torch.zeros_like(new.grad[:, 45:]))
+
+
+def test_token_ratio_diagnostics_ignore_noncausal_tail(cosmos_stubs: None) -> None:
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer._grpo_ratio_clip_low = 0.2
+    trainer._grpo_ratio_clip_high = 0.2
+    ratio = torch.ones(1, 49)
+    ratio[:, 45:] = 9.0
+
+    metrics = trainer._ppo_minibatch_metrics(
+        loss=torch.tensor(0.0),
+        policy_loss=torch.tensor(0.0),
+        value_loss=torch.tensor(0.0),
+        kl_loss=torch.tensor(0.0),
+        ratio=ratio,
+        is_padding=torch.zeros(1, dtype=torch.bool),
+        advantages=torch.ones(1),
+        returns=torch.ones(1),
+        values=torch.zeros(1),
+        old_logprobs=torch.zeros(1),
+        new_logprobs=torch.zeros(1),
+        token_causality_mask=(torch.arange(49) < 45).reshape(1, 49),
+        grad_norm=0.0,
+    )
+
+    _loss, _kl, ratio_max, ratio_min, clip_fraction, _grad = metrics
+    assert ratio_max == 1.0
+    assert ratio_min == 1.0
+    assert clip_fraction == 0.0
+
+
+def test_ppo_post_update_diagnostics_weight_valid_causal_tokens_exactly(
+    cosmos_stubs: None,
+) -> None:
+    """Post-update reductions pool actions, not per-minibatch percentages."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer.device = torch.device("cpu")
+    trainer.model = _PresetTokenActorCritic()
+    trainer.data_packer = _StackingPpoPacker()
+    trainer._reference_model = None
+    trainer._mini_batch = 2
+    trainer._grpo_ratio_clip_low = 0.2
+    trainer._grpo_ratio_clip_high = 0.2
+    trainer.optimizers = SimpleNamespace(step_calls=0)
+    samples = [
+        _preset_token_sample(
+            ratios=(1.0, 1.3, 9.0, 9.0),
+            causal=(True, True, False, False),
+            is_padding=False,
+        ),
+        _preset_token_sample(
+            ratios=(0.7, 1.1, 1.5, 9.0),
+            causal=(True, True, True, False),
+            is_padding=False,
+        ),
+        _preset_token_sample(
+            ratios=(99.0, 99.0, 99.0, 99.0),
+            causal=(True, True, True, True),
+            is_padding=True,
+        ),
+    ]
+
+    metrics = trainer._post_update_diagnostics(samples)
+
+    valid_ratios = torch.tensor([1.0, 1.3, 0.7, 1.1, 1.5])
+    expected_quantiles = torch.quantile(valid_ratios, torch.tensor([0.01, 0.5, 0.99]))
+    expected_kl = ((valid_ratios - 1.0) - valid_ratios.log()).mean()
+    assert metrics["train/post_update_valid_tokens"] == 5
+    assert metrics["train/post_update_ratio_p01"] == pytest.approx(
+        float(expected_quantiles[0])
+    )
+    assert metrics["train/post_update_ratio_p50"] == pytest.approx(
+        float(expected_quantiles[1])
+    )
+    assert metrics["train/post_update_ratio_p99"] == pytest.approx(
+        float(expected_quantiles[2])
+    )
+    assert metrics["train/post_update_clip_fraction"] == pytest.approx(3.0 / 5.0)
+    assert metrics["train/post_update_approx_kl"] == pytest.approx(float(expected_kl))
+    assert trainer.model.forward_calls == 2
+    assert trainer.optimizers.step_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("learning_rate", "expected_clipped"),
+    ((0.01, False), (1.0, True)),
+)
+def test_ppo_full_episode_post_update_diagnostics_detect_optimizer_jump(
+    cosmos_stubs: None,
+    learning_rate: float,
+    expected_clipped: bool,
+) -> None:
+    """One 150-row update is measured after, without applying another step."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer.device = torch.device("cpu")
+    trainer.model = _TrainableTokenActorCritic()
+    trainer.data_packer = _StackingPpoPacker()
+    trainer._reference_model = None
+    trainer._mini_batch = 150
+    trainer._grpo_optimization_iterations = 1
+    trainer._grpo_ratio_clip_low = 0.2
+    trainer._grpo_ratio_clip_high = 0.2
+    trainer._kl_beta = 0.0
+    trainer._value_loss_coef = 0.0
+    trainer._value_clip_range = None
+    trainer.optimizers = _CountingSGD(
+        trainer.model.parameters(),
+        lr=learning_rate,
+    )
+    trainer.all_reduce_states = MethodType(_step_without_distributed, trainer)
+    sample = _trainable_token_sample()
+    samples = [sample for _ in range(150)]
+
+    trainer._run_training_loop(
+        samples,
+        torch.ones(150, dtype=torch.float32),
+        inter_policy_nccl=object(),
+    )
+    parameter_after_update = trainer.model.log_ratio_bias.detach().clone()
+    metrics = trainer._post_update_diagnostics(samples)
+    repeated_metrics = trainer._post_update_diagnostics(samples)
+
+    assert trainer.optimizers.step_calls == 1
+    torch.testing.assert_close(trainer.model.log_ratio_bias, parameter_after_update)
+    assert trainer.model.training
+    assert metrics == repeated_metrics
+    assert metrics["train/post_update_valid_tokens"] == 300
+    expected_ratio = torch.exp(torch.tensor(learning_rate)).item()
+    assert metrics["train/post_update_ratio_p50"] == pytest.approx(expected_ratio)
+    if expected_clipped:
+        assert metrics["train/post_update_clip_fraction"] == 1.0
+        assert metrics["train/post_update_approx_kl"] > 0.5
+    else:
+        assert metrics["train/post_update_clip_fraction"] == 0.0
+        assert metrics["train/post_update_approx_kl"] < 1.0e-3
 
 
 def test_compute_value_loss_masks_padding(cosmos_stubs: None) -> None:
@@ -432,7 +941,9 @@ def test_compute_kl_penalty_zero_when_disabled(cosmos_stubs: None) -> None:
     kl_div = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32)
     is_padding = torch.tensor([False, False, False, False])
 
-    kl_loss = compute_kl_penalty(kl_div, is_padding, kl_beta=0.0, device=torch.device("cpu"))
+    kl_loss = compute_kl_penalty(
+        kl_div, is_padding, kl_beta=0.0, device=torch.device("cpu")
+    )
 
     assert float(kl_loss.item()) == 0.0
 
@@ -442,7 +953,9 @@ def test_compute_kl_penalty_zero_when_kl_div_missing(cosmos_stubs: None) -> None
     del cosmos_stubs
     is_padding = torch.tensor([False, False])
 
-    kl_loss = compute_kl_penalty(None, is_padding, kl_beta=0.5, device=torch.device("cpu"))
+    kl_loss = compute_kl_penalty(
+        None, is_padding, kl_beta=0.5, device=torch.device("cpu")
+    )
 
     assert float(kl_loss.item()) == 0.0
 
@@ -453,7 +966,9 @@ def test_compute_kl_penalty_masks_padding(cosmos_stubs: None) -> None:
     kl_div = torch.tensor([1.0, 100.0, 3.0, 100.0], dtype=torch.float32)
     is_padding = torch.tensor([False, True, False, True])
 
-    kl_loss = compute_kl_penalty(kl_div, is_padding, kl_beta=2.0, device=torch.device("cpu"))
+    kl_loss = compute_kl_penalty(
+        kl_div, is_padding, kl_beta=2.0, device=torch.device("cpu")
+    )
 
     # mean(1.0, 3.0) * kl_beta = 2.0 * 2.0 = 4.0
     assert float(kl_loss.item()) == pytest.approx(4.0)
@@ -465,7 +980,9 @@ def test_compute_kl_penalty_zero_when_all_padding(cosmos_stubs: None) -> None:
     kl_div = torch.tensor([1.0, 2.0], dtype=torch.float32)
     is_padding = torch.tensor([True, True])
 
-    kl_loss = compute_kl_penalty(kl_div, is_padding, kl_beta=1.0, device=torch.device("cpu"))
+    kl_loss = compute_kl_penalty(
+        kl_div, is_padding, kl_beta=1.0, device=torch.device("cpu")
+    )
 
     assert float(kl_loss.item()) == 0.0
 
@@ -583,6 +1100,184 @@ def test_step_training_success_reports_scalar_scheduler_lr(
     assert scheduler.steps == 1
 
 
+@pytest.mark.parametrize(
+    (
+        "checkpoint_enabled",
+        "current_step",
+        "total_steps",
+        "requested",
+        "master",
+        "saved",
+    ),
+    (
+        # Regression: Cosmos colocated can omit do_save on its only/final
+        # DataFetchCommand. AlpaGym must still persist the applied update.
+        (True, 1, 1, False, True, True),
+        (False, 1, 1, False, True, False),
+        (True, 1, 2, False, True, False),
+        (True, 1, 2, True, True, True),
+        (True, 1, 1, False, False, False),
+    ),
+)
+def test_step_training_persists_enabled_final_checkpoint_when_cosmos_omits_request(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint_enabled: bool,
+    current_step: int,
+    total_steps: int,
+    requested: bool,
+    master: bool,
+    saved: bool,
+) -> None:
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
+    trainer.lr_schedulers = _ListLRScheduler(0.05)
+    trainer.parallel_dims = SimpleNamespace(
+        dp_replicate_enabled=False,
+        dp_shard_enabled=False,
+        cp_enabled=False,
+    )
+    trainer._group_size = 1
+    trainer._mini_batch = 1
+    trainer._grpo_optimization_iterations = 1
+    trainer._allowed_outdated_steps = 100
+    trainer.config = SimpleNamespace(
+        train=SimpleNamespace(
+            train_batch_per_replica=1,
+            ckpt=SimpleNamespace(enable_checkpoint=checkpoint_enabled),
+        )
+    )
+    monkeypatch.setattr(
+        trainer_module, "filter_trainable_rollouts", lambda rollouts, **kwargs: rollouts
+    )
+    trainer._prepare_training_data = lambda rollouts: (
+        [object()],
+        torch.tensor([0.5], dtype=torch.float32),
+    )
+    trainer._run_training_loop = lambda samples, advantages, nccl: (
+        1.0,
+        0.0,
+        1,
+        1.0,
+        1.0,
+        0.0,
+        0.0,
+    )
+    saves: list[tuple[int, int, int]] = []
+
+    def _record_save(step: int, steps: int, remaining: int) -> None:
+        saves.append((step, steps, remaining))
+
+    trainer._save_checkpoint = _record_save
+
+    trainer.step_training(
+        rollouts=[object()],
+        current_step=current_step,
+        total_steps=total_steps,
+        remain_samples_num=17,
+        inter_policy_nccl=object(),
+        is_master_replica=master,
+        do_save_checkpoint=requested,
+    )
+
+    assert saves == ([(current_step, total_steps, 17)] if saved else [])
+
+
+def test_final_checkpoint_writes_resume_state_and_safetensors(
+    cosmos_stubs: None,
+) -> None:
+    """A final save exports deployable weights and full optimizer resume state."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
+    trainer.config = SimpleNamespace(
+        train=SimpleNamespace(
+            output_dir="/tmp/alpagym-checkpoint-test",
+            param_dtype="float32",
+            ckpt=SimpleNamespace(export_safetensors=False),
+        )
+    )
+    trainer.model = object()
+    trainer.optimizers = object()
+    trainer.lr_schedulers = object()
+    exports: list[dict[str, object]] = []
+    manager_calls: list[tuple[str, dict[str, object]]] = []
+    trainer.export_safetensors = lambda **kwargs: exports.append(kwargs)
+
+    class _CheckpointManager:
+        def save_checkpoint(self, **kwargs: object) -> None:
+            manager_calls.append(("save_checkpoint", kwargs))
+
+        def save_check(self, **kwargs: object) -> None:
+            manager_calls.append(("save_check", kwargs))
+
+    trainer.ckpt_manager = _CheckpointManager()
+
+    trainer._save_checkpoint(current_step=1, total_steps=1, remain_samples_num=17)
+
+    assert exports == [
+        {
+            "output_dir": "/tmp/alpagym-checkpoint-test",
+            "rel_path": "safetensors/step_1",
+            "trainable_only": False,
+            "is_final": True,
+            "dtype": torch.float32,
+        }
+    ]
+    assert manager_calls[0] == (
+        "save_checkpoint",
+        {
+            "model": trainer.model,
+            "optimizer": trainer.optimizers,
+            "scheduler": trainer.lr_schedulers,
+            "step": 1,
+            "total_steps": 1,
+            "remain_samples_num": 17,
+            "is_final": True,
+        },
+    )
+    assert manager_calls[1] == ("save_check", {"step": 1})
+
+
+def test_final_checkpoint_uses_policy_native_export_hook(
+    cosmos_stubs: None,
+    tmp_path: Path,
+) -> None:
+    """Non-generative policies bypass Cosmos generation-config discovery."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
+    trainer.config = SimpleNamespace(
+        train=SimpleNamespace(
+            output_dir=str(tmp_path),
+            param_dtype="float32",
+            ckpt=SimpleNamespace(export_safetensors=False),
+        )
+    )
+    trainer.model = object()
+    trainer.optimizers = object()
+    trainer.lr_schedulers = object()
+    exported: list[tuple[object, Path]] = []
+    trainer._policy_bundle = SimpleNamespace(
+        export_model_checkpoint=lambda model, path: exported.append((model, path))
+    )
+
+    def reject_cosmos_export(**kwargs: object) -> None:
+        del kwargs
+        raise AssertionError("policy-native export must bypass Cosmos LLM exporter")
+
+    trainer.export_safetensors = reject_cosmos_export
+    trainer.ckpt_manager = SimpleNamespace(
+        save_checkpoint=lambda **kwargs: None,
+        save_check=lambda **kwargs: None,
+    )
+
+    trainer._save_checkpoint(current_step=1, total_steps=1, remain_samples_num=0)
+
+    assert exported == [(trainer.model, tmp_path / "safetensors" / "step_1")]
+
+
 def test_filter_rollouts_allows_empty_noop(cosmos_stubs: None) -> None:
     """No rollout completions can flow through the no-trainable-samples path."""
     del cosmos_stubs
@@ -647,10 +1342,16 @@ def test_filter_rollouts_keeps_fresh_rollouts_and_unlinks_dropped_artifacts(
     # so passing this proves per-rollout version selection, not chunk slicing.
     kept = filter_trainable_rollouts(
         [
-            _rollout(prompt="scene-newer", completion=newer_paths[0], weight_version=10),
+            _rollout(
+                prompt="scene-newer", completion=newer_paths[0], weight_version=10
+            ),
             _rollout(prompt="scene-older", completion=older_paths[0], weight_version=1),
-            _rollout(prompt="scene-other-newer", completion=newer_paths[1], weight_version=9),
-            _rollout(prompt="scene-other-older", completion=older_paths[1], weight_version=2),
+            _rollout(
+                prompt="scene-other-newer", completion=newer_paths[1], weight_version=9
+            ),
+            _rollout(
+                prompt="scene-other-older", completion=older_paths[1], weight_version=2
+            ),
         ],
         current_step=11,
         train_batch_per_replica=2,
@@ -696,7 +1397,9 @@ def test_trainer_rejects_logprob_shape_mismatch(cosmos_stubs: None) -> None:
     with pytest.raises(ValueError, match="new log_probs shape"):
         trainer._train_minibatch(
             minibatch_samples=[object(), object(), object(), object()],
-            minibatch_advantages=torch.tensor([1.0, 0.0, -2.0, -2.0], dtype=torch.float32),
+            minibatch_advantages=torch.tensor(
+                [1.0, 0.0, -2.0, -2.0], dtype=torch.float32
+            ),
             inter_policy_nccl=object(),
         )
 
@@ -710,17 +1413,23 @@ def test_trainer_rejects_kl_shape_mismatch(cosmos_stubs: None) -> None:
     with pytest.raises(ValueError, match="kl_div shape"):
         trainer._train_minibatch(
             minibatch_samples=[object(), object(), object(), object()],
-            minibatch_advantages=torch.tensor([1.0, 0.0, -2.0, -2.0], dtype=torch.float32),
+            minibatch_advantages=torch.tensor(
+                [1.0, 0.0, -2.0, -2.0], dtype=torch.float32
+            ),
             inter_policy_nccl=object(),
         )
 
 
-def test_reference_model_copy_is_frozen_and_reset(cosmos_stubs: None) -> None:
-    """KL reference models are frozen deep copies and reset from live weights."""
+def test_reference_model_copy_is_frozen_pre_resume_policy(cosmos_stubs: None) -> None:
+    """KL stays anchored to pre-resume weights instead of the restored live policy."""
     del cosmos_stubs
     trainer = _trainer_for_replay_test(_WrapperShapedModel())
     trainer._kl_beta = 0.1
-    trainer._reference_reset_interval = 1
+    with torch.no_grad():
+        trainer.model.policy.weight.fill_(2.0)
+    trainer.reference_state_dict = {
+        key: torch.ones_like(value) for key, value in trainer.model.state_dict().items()
+    }
 
     trainer._ensure_reference_model()
 
@@ -728,19 +1437,41 @@ def test_reference_model_copy_is_frozen_and_reset(cosmos_stubs: None) -> None:
     assert first_reference is not trainer.model
     assert first_reference.policy is not trainer.model.policy
     assert all(not param.requires_grad for param in first_reference.parameters())
-
-    with torch.no_grad():
-        trainer.model.policy.weight.fill_(3.0)
-    trainer._reference_reset(current_step=1)
-
-    second_reference = trainer._reference_model
-    assert second_reference is not first_reference
-    assert second_reference.policy is not trainer.model.policy
-    assert all(not param.requires_grad for param in second_reference.parameters())
     torch.testing.assert_close(
-        second_reference.policy.weight,
-        torch.full_like(second_reference.policy.weight, 3.0),
+        first_reference.policy.weight,
+        torch.ones_like(first_reference.policy.weight),
     )
+    torch.testing.assert_close(
+        trainer.model.policy.weight,
+        torch.full_like(trainer.model.policy.weight, 2.0),
+    )
+
+
+def test_reference_model_requires_cosmos_initial_weights(cosmos_stubs: None) -> None:
+    """KL fails closed if training starts before Cosmos establishes its anchor."""
+    del cosmos_stubs
+    trainer = _trainer_for_replay_test(_WrapperShapedModel())
+    trainer._kl_beta = 0.1
+    trainer.reference_state_dict = {}
+
+    with pytest.raises(RuntimeError, match="weight_resume"):
+        trainer._ensure_reference_model()
+
+
+@pytest.mark.parametrize("value", (1, 10))
+def test_replay_trainer_rejects_moving_kl_anchor(
+    cosmos_stubs: None,
+    value: int,
+) -> None:
+    """A moving reference cannot silently change meaning across Cosmos resume."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+
+    with pytest.raises(ValueError, match="reference_reset_interval=0"):
+        trainer_module._fixed_reference_reset_interval(value)
+
+    assert trainer_module._fixed_reference_reset_interval(None) == 0
+    assert trainer_module._fixed_reference_reset_interval(0) == 0
 
 
 def _rollout(
@@ -792,7 +1523,10 @@ def _clipped_grpo_policy_loss(
     """Compute the configured clipped PPO/GRPO objective."""
     ratio = torch.exp((new_logprobs - old_logprobs).clamp(min=-5.0, max=5.0))
     surr1 = ratio * advantages
-    surr2 = torch.clamp(ratio, 1.0 - grpo_ratio_clip_low, 1.0 + grpo_ratio_clip_high) * advantages
+    surr2 = (
+        torch.clamp(ratio, 1.0 - grpo_ratio_clip_low, 1.0 + grpo_ratio_clip_high)
+        * advantages
+    )
     return -torch.min(surr1, surr2).mean()
 
 
@@ -976,7 +1710,9 @@ class _SignalCapturingPacker:
         """Return a fixed 4-row, no-padding replay batch."""
         del samples
         return TrainerReplayDataBatch(
-            model_inputs={"ego_history_xyz": torch.arange(4, dtype=torch.float32).reshape(4, 1)},
+            model_inputs={
+                "ego_history_xyz": torch.arange(4, dtype=torch.float32).reshape(4, 1)
+            },
             training_signal=TrainingSignal(
                 old_logprobs=torch.zeros(4, dtype=torch.float32),
                 is_padding=torch.zeros(4, dtype=torch.bool),
@@ -993,7 +1729,9 @@ class _PaddingCapturingPacker:
         """Return a 4-row batch where row 1 is padding."""
         del samples
         return TrainerReplayDataBatch(
-            model_inputs={"ego_history_xyz": torch.arange(4, dtype=torch.float32).reshape(4, 1)},
+            model_inputs={
+                "ego_history_xyz": torch.arange(4, dtype=torch.float32).reshape(4, 1)
+            },
             training_signal=TrainingSignal(
                 old_logprobs=torch.zeros(4, dtype=torch.float32),
                 is_padding=torch.tensor([False, True, False, False]),
@@ -1048,7 +1786,9 @@ class _ActorCriticValueModel(torch.nn.Module):
 class _PpoPerStepPacker:
     """Packer returning configured raw-transition samples for flattening tests."""
 
-    def __init__(self, rows_by_prompt: dict[str, list[tuple[float, float, bool, bool]]]) -> None:
+    def __init__(
+        self, rows_by_prompt: dict[str, list[tuple[float, float, bool, bool]]]
+    ) -> None:
         """Map prompt to ``(reward, old_value, terminated, is_padding)`` rows."""
         self._rows_by_prompt = rows_by_prompt
 
@@ -1073,8 +1813,63 @@ class _PpoPerStepPacker:
                 rollout_id=prompt,
                 weight_version=torch.zeros((), dtype=torch.int64),
             )
-            for reward, old_value, terminated, is_padding in self._rows_by_prompt[prompt]
+            for reward, old_value, terminated, is_padding in self._rows_by_prompt[
+                prompt
+            ]
         ]
+
+
+def _direct_ppo_sample(
+    reward: float,
+    *,
+    old_value: float,
+    terminated: bool,
+) -> TrainerReplayData:
+    """Build one direct-policy transition for K=1 GAE comparisons."""
+    return TrainerReplayData(
+        model_inputs={"x": torch.zeros(1, dtype=torch.float32)},
+        training_signal=TrainingSignal(
+            old_logprobs=torch.zeros(1, dtype=torch.float32),
+            is_padding=torch.zeros(1, dtype=torch.bool),
+            rewards=torch.tensor([reward], dtype=torch.float32),
+            terminateds=torch.tensor([terminated], dtype=torch.bool),
+            truncateds=torch.zeros(1, dtype=torch.bool),
+            old_values=torch.tensor([old_value], dtype=torch.float32),
+        ),
+        rollout_id="direct",
+        weight_version=torch.zeros((), dtype=torch.int64),
+    )
+
+
+def _smdp_sample(
+    *,
+    rewards: tuple[float, ...],
+    old_value: float,
+    bootstrap_value: float,
+    terminated: bool,
+    width: int = 5,
+) -> TrainerReplayData:
+    """Build one fixed-width macro transition with a valid reward prefix."""
+    primitive_rewards = torch.zeros((1, width), dtype=torch.float32)
+    primitive_reward_mask = torch.zeros((1, width), dtype=torch.bool)
+    primitive_rewards[0, : len(rewards)] = torch.tensor(rewards, dtype=torch.float32)
+    primitive_reward_mask[0, : len(rewards)] = True
+    return TrainerReplayData(
+        model_inputs={"x": torch.zeros(1, dtype=torch.float32)},
+        training_signal=TrainingSignal(
+            old_logprobs=torch.zeros(1, dtype=torch.float32),
+            is_padding=torch.zeros(1, dtype=torch.bool),
+            terminateds=torch.tensor([terminated], dtype=torch.bool),
+            truncateds=torch.zeros(1, dtype=torch.bool),
+            old_values=torch.tensor([old_value], dtype=torch.float32),
+            bootstrap_values=torch.tensor([bootstrap_value], dtype=torch.float32),
+            primitive_rewards=primitive_rewards,
+            primitive_reward_mask=primitive_reward_mask,
+            duration_ticks=torch.tensor([len(rewards)], dtype=torch.int64),
+        ),
+        rollout_id="smdp",
+        weight_version=torch.zeros((), dtype=torch.int64),
+    )
 
 
 class _PpoSignalCapturingPacker:
@@ -1084,7 +1879,9 @@ class _PpoSignalCapturingPacker:
         """Return a 4-row PPO batch with one padding row."""
         del samples
         return TrainerReplayDataBatch(
-            model_inputs={"ego_history_xyz": torch.arange(4, dtype=torch.float32).reshape(4, 1)},
+            model_inputs={
+                "ego_history_xyz": torch.arange(4, dtype=torch.float32).reshape(4, 1)
+            },
             training_signal=TrainingSignal(
                 old_logprobs=torch.zeros(4, dtype=torch.float32),
                 is_padding=torch.tensor([False, True, False, False]),
@@ -1172,6 +1969,122 @@ class _PpoSmokePacker:
     def policy_collate_fn(self, samples: list[Any]) -> TrainerReplayDataBatch:
         """Use the production replay-batch stacker."""
         return TrainerReplayDataBatch.stack(samples)
+
+
+class _StackingPpoPacker:
+    """Minimal packer that preserves per-row token replay inputs."""
+
+    def policy_collate_fn(
+        self,
+        samples: list[TrainerReplayData],
+    ) -> TrainerReplayDataBatch:
+        return TrainerReplayDataBatch.stack(samples)
+
+
+class _PresetTokenActorCritic(torch.nn.Module):
+    """Return caller-provided token log-probabilities for mask oracles."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.forward_calls = 0
+
+    def forward(
+        self,
+        new_token_logprobs: torch.Tensor,
+        return_log_prob: bool = True,
+        teacher_model: Any = None,
+    ) -> dict[str, torch.Tensor | None]:
+        del return_log_prob, teacher_model
+        self.forward_calls += 1
+        return {
+            "token_log_probs": new_token_logprobs,
+            "log_probs": new_token_logprobs.sum(dim=-1),
+            "values": torch.zeros(new_token_logprobs.shape[0]),
+            "kl_div": None,
+        }
+
+
+class _TrainableTokenActorCritic(torch.nn.Module):
+    """Tiny token policy whose one parameter directly controls log-ratio."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.log_ratio_bias = torch.nn.Parameter(torch.tensor(0.0))
+
+    def forward(
+        self,
+        token_features: torch.Tensor,
+        return_log_prob: bool = True,
+        teacher_model: Any = None,
+    ) -> dict[str, torch.Tensor | None]:
+        del return_log_prob, teacher_model
+        token_logprobs = self.log_ratio_bias * token_features
+        return {
+            "token_log_probs": token_logprobs,
+            "log_probs": token_logprobs.sum(dim=-1),
+            "values": self.log_ratio_bias.expand(token_features.shape[0]) * 0.0,
+            "kl_div": None,
+        }
+
+
+class _CountingSGD(torch.optim.SGD):
+    """SGD optimizer exposing the exact number of parameter updates."""
+
+    def __init__(self, params: Any, *, lr: float) -> None:
+        super().__init__(params, lr=lr)
+        self.step_calls = 0
+
+    def step(self, closure: Any = None) -> Any:
+        self.step_calls += 1
+        return super().step(closure)
+
+
+def _preset_token_sample(
+    *,
+    ratios: tuple[float, ...],
+    causal: tuple[bool, ...],
+    is_padding: bool,
+) -> TrainerReplayData:
+    """Build one controlled token row for post-update diagnostics."""
+    if len(ratios) != len(causal):
+        raise ValueError("ratios and causal mask must have equal length")
+    old_tokens = torch.zeros(len(ratios), dtype=torch.float32)
+    return TrainerReplayData(
+        model_inputs={
+            "new_token_logprobs": torch.tensor(ratios, dtype=torch.float32).log(),
+            "old_token_logprobs": old_tokens,
+            "token_causality_mask": torch.tensor(causal, dtype=torch.bool),
+        },
+        training_signal=TrainingSignal(
+            old_logprobs=old_tokens.sum().reshape(1),
+            is_padding=torch.tensor([is_padding], dtype=torch.bool),
+            returns=torch.zeros(1, dtype=torch.float32),
+            old_values=torch.zeros(1, dtype=torch.float32),
+        ),
+        rollout_id="post-update-oracle",
+        weight_version=torch.zeros((), dtype=torch.int64),
+    )
+
+
+def _trainable_token_sample() -> TrainerReplayData:
+    """Build one two-token behavior row scored at zero log-probability."""
+    old_tokens = torch.zeros(2, dtype=torch.float32)
+    return TrainerReplayData(
+        model_inputs={
+            "token_features": torch.ones(2, dtype=torch.float32),
+            "old_token_logprobs": old_tokens,
+            "token_causality_mask": torch.ones(2, dtype=torch.bool),
+        },
+        training_signal=TrainingSignal(
+            old_logprobs=old_tokens.sum().reshape(1),
+            is_padding=torch.zeros(1, dtype=torch.bool),
+            advantages=torch.ones(1, dtype=torch.float32),
+            returns=torch.zeros(1, dtype=torch.float32),
+            old_values=torch.zeros(1, dtype=torch.float32),
+        ),
+        rollout_id="trainable-token",
+        weight_version=torch.zeros((), dtype=torch.int64),
+    )
 
 
 def _clone_parameters(module: torch.nn.Module) -> list[torch.Tensor]:

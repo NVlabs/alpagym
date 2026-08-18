@@ -16,7 +16,14 @@ from alpagym_host.alpasim_wizard import (
     start_wizard,
     wait_for_runtime_ready,
 )
-from alpagym_host.config import AlpaSimConfig, AlpaSimWizardArgs, DatasetConfig, ExecutionBackend
+from alpagym_host.config import (
+    AlpaSimConfig,
+    AlpaSimWizardArgs,
+    DatasetConfig,
+    ExecutionBackend,
+    HumanoidAlpaSimConfig,
+    HumanoidExecutionProfile,
+)
 
 
 def _alpasim_config(wizard_args: AlpaSimWizardArgs | None = None) -> AlpaSimConfig:
@@ -85,6 +92,129 @@ def test_wizard_command_can_select_test_suite(tmp_path: Path) -> None:
         "scenes.test_suite_id=alpagym_smoke",
     ]
     assert not any(override.startswith("scenes.scene_ids=") for override in command)
+
+
+@pytest.mark.parametrize(
+    ("n_sim_steps", "expected_max_control_ticks", "reward_profile_id"),
+    [
+        (150, 750, "reference_route_centered.v1"),
+        (200, 1000, "reference_route_centered.v2"),
+        (150, 750, "reference_route_centered.v3"),
+    ],
+)
+def test_wizard_command_selects_strict_motion_reference_profile(
+    tmp_path: Path,
+    n_sim_steps: int,
+    expected_max_control_ticks: int,
+    reward_profile_id: str,
+) -> None:
+    """Reference execution sends one frozen identity map and no direct-action knobs."""
+    config = _alpasim_config(
+        AlpaSimWizardArgs(
+            deploy="local",
+            topology="1gpu",
+            driver_source="external_dynamic",
+            force_gt_duration_us=0,
+            control_timestep_us=100_000,
+            n_sim_steps=n_sim_steps,
+            extra_overrides="cameras=motion_reference_debug",
+        )
+    )
+    config.simulation_domain = "humanoid"
+    config.humanoid = HumanoidAlpaSimConfig(
+        repo_path="/workspace/humanoid",
+        scene_store_path="/workspace/scenes",
+        scenario_ids_by_scene={"hq_stairs": "ascend"},
+        execution_profile=HumanoidExecutionProfile.motion_reference,
+        grail_root_path="/workspace/GRAIL",
+        reward_profile_id=reward_profile_id,
+        expected_scene_fingerprints={"hq_stairs": "a" * 64},
+    )
+
+    command = _build_wizard_command(
+        config=config,
+        execution_backend=ExecutionBackend.local_process,
+        dataset=DatasetConfig(scene_ids=["hq_stairs"], test_suite_id=None),
+        alpasim_run_dir=tmp_path / "alpasim",
+        checkout_root=tmp_path,
+    )
+
+    assert "runtime_domain=humanoid_reference" in command
+    assert "defines.humanoid_grail_root=/workspace/GRAIL" in command
+    assert (
+        'defines.humanoid_scene_fingerprints_json="{\\"hq_stairs\\":\\"'
+        + "a" * 64
+        + '\\"}"'
+    ) in command
+    assert not any("registration_options" in item for item in command)
+    assert (
+        f'+runtime.humanoid.controller.options.reward_profile_id="{reward_profile_id}"'
+    ) in command
+    assert '+runtime.humanoid.controller.options.route_center_soft_m="0.1"' in command
+    assert (
+        '+runtime.humanoid.controller.options.route_progress_credit_m="0.3"' in command
+    )
+    assert (
+        '+runtime.humanoid.controller.options.route_corridor_half_width_m="0.45"'
+        in command
+    )
+    derived_horizon_override = (
+        "runtime.humanoid.controller.options.max_control_ticks="
+        f'"{expected_max_control_ticks}"'
+    )
+    assert derived_horizon_override in command
+    assert "cameras=motion_reference_debug" in command
+
+
+@pytest.mark.parametrize(
+    "reserved_override",
+    [
+        'runtime.humanoid.controller.options.reward_profile_id="other"',
+        '+runtime.humanoid.controller.options.route_center_soft_m="0.2"',
+        '++runtime.humanoid.controller.options.max_control_ticks="1"',
+        "~runtime.humanoid.controller.options",
+        "runtime.humanoid.controller.module=untrusted_backend",
+        "runtime.humanoid.controller@runtime.humanoid.controller=untrusted_backend",
+        "runtime_domain=humanoid",
+    ],
+)
+def test_wizard_command_rejects_motion_reference_controller_overrides(
+    tmp_path: Path,
+    reserved_override: str,
+) -> None:
+    """Raw Hydra options cannot replace the trusted controller or reward contract."""
+    config = _alpasim_config(
+        AlpaSimWizardArgs(
+            deploy="local",
+            topology="1gpu",
+            driver_source="external_dynamic",
+            force_gt_duration_us=0,
+            control_timestep_us=100_000,
+            n_sim_steps=300,
+            extra_overrides=reserved_override,
+        )
+    )
+    config.simulation_domain = "humanoid"
+    config.humanoid = HumanoidAlpaSimConfig(
+        repo_path="/workspace/humanoid",
+        scene_store_path="/workspace/scenes",
+        scenario_ids_by_scene={"hq_stairs": "ascend"},
+        execution_profile=HumanoidExecutionProfile.motion_reference,
+        grail_root_path="/workspace/GRAIL",
+        reward_profile_id="reference_route_centered.v3",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="motion_reference extra_overrides cannot modify reserved controller",
+    ):
+        _build_wizard_command(
+            config=config,
+            execution_backend=ExecutionBackend.local_process,
+            dataset=DatasetConfig(scene_ids=["hq_stairs"], test_suite_id=None),
+            alpasim_run_dir=tmp_path / "alpasim",
+            checkout_root=tmp_path,
+        )
 
 
 def test_start_wizard_uses_separate_process_group(
@@ -179,7 +309,11 @@ def test_start_wizard_runs_checkout_interpreter_with_clean_env(
     )
 
     argv = captured["argv"]
-    assert argv[:3] == [str(checkout_root / ".venv" / "bin" / "python"), "-m", "alpasim_wizard"]
+    assert argv[:3] == [
+        str(checkout_root / ".venv" / "bin" / "python"),
+        "-m",
+        "alpasim_wizard",
+    ]
     env = captured["env"]
     assert env is not None
     assert "UV_PROJECT_ENVIRONMENT" not in env
@@ -204,7 +338,9 @@ def test_wait_for_runtime_ready_publishes_caller_host(
 ) -> None:
     """Use Wizard's port but publish the host selected by the lifecycle."""
     runtime_server_path = tmp_path / "generated-runtime-server.yaml"
-    runtime_server_path.write_text("host: wizard-internal\nport: 30051\n", encoding="utf-8")
+    runtime_server_path.write_text(
+        "host: wizard-internal\nport: 30051\n", encoding="utf-8"
+    )
     connection_attempts: list[tuple[str, int]] = []
 
     class FakeWizardProcess:
@@ -224,7 +360,9 @@ def test_wait_for_runtime_ready_publishes_caller_host(
         def __exit__(self, *args: object) -> None:
             """Exit the fake connection context."""
 
-    def fake_create_connection(address: tuple[str, int], timeout: float) -> FakeConnection:
+    def fake_create_connection(
+        address: tuple[str, int], timeout: float
+    ) -> FakeConnection:
         """Capture the probed endpoint."""
         del timeout
         connection_attempts.append(address)

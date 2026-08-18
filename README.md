@@ -116,4 +116,8 @@ cluster.
 ## Documentation
 
 - [Onboarding Guide](docs/ONBOARDING.md) — host setup, auth, getting a model, and running locally.
+- [G1 SceneStore RL handoff](docs/HUMANOID_ALPAGYM_ALPASIM_HANDOFF_YUXIAO.md) —
+  standalone AlpaGym/AlpaSim ownership, direct-V9 and VideoMimic-to-GRAIL
+  motion-reference PPO contracts, 30-second horizon, reward, and qualification
+  boundaries.
 - [Contributing](CONTRIBUTING.md) — code style and review process.

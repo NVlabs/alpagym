@@ -56,7 +56,9 @@ def test_cached_checkout_resolves_branch_ref_to_commit(tmp_path, monkeypatch) ->
     resolved = "c" * 40
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setattr(
-        alpasim_dependency.subprocess, "run", _recording_run(commands, ls_remote_sha=resolved)
+        alpasim_dependency.subprocess,
+        "run",
+        _recording_run(commands, ls_remote_sha=resolved),
     )
 
     dest = resolve_alpasim_checkout(_alpasim_config(repo_ref="main"))
@@ -66,7 +68,9 @@ def test_cached_checkout_resolves_branch_ref_to_commit(tmp_path, monkeypatch) ->
     assert dest.name == _content_key(REPO_URL, resolved)
 
 
-def test_cached_checkout_skips_build_when_already_published(tmp_path, monkeypatch) -> None:
+def test_cached_checkout_skips_build_when_already_published(
+    tmp_path, monkeypatch
+) -> None:
     """A second run on the same commit reuses the published checkout and builds nothing."""
     commands: list[list[str]] = []
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
@@ -105,7 +109,9 @@ def test_cached_checkout_reuses_winner_on_publish_race(tmp_path, monkeypatch) ->
     assert not build_dir.exists()  # our losing build was cleaned up
 
 
-def test_concurrent_checkout_publishes_once_without_corruption(tmp_path, monkeypatch) -> None:
+def test_concurrent_checkout_publishes_once_without_corruption(
+    tmp_path, monkeypatch
+) -> None:
     """Real concurrent resolves of one commit publish exactly one intact checkout.
 
     Several threads build the same content-addressed checkout into one shared cache at
@@ -153,16 +159,26 @@ def test_concurrent_checkout_publishes_once_without_corruption(tmp_path, monkeyp
         )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = [future.result() for future in [pool.submit(resolve) for _ in range(workers)]]
+        results = [
+            future.result() for future in [pool.submit(resolve) for _ in range(workers)]
+        ]
 
     published = checkout_cache_dir / _content_key(REPO_URL, commit)
-    assert all(result == published for result in results)  # every run got the published checkout
-    assert (published / "pyproject.toml").is_file()  # complete checkout, not a half-built temp dir
+    assert all(
+        result == published for result in results
+    )  # every run got the published checkout
+    assert (
+        published / "pyproject.toml"
+    ).is_file()  # complete checkout, not a half-built temp dir
     assert (published / "src" / "grpc" / "pyproject.toml").is_file()
     assert outcomes["won"] == 1  # exactly one builder won the publish
-    assert outcomes["lost"] == workers - 1  # the rest lost the rename race and reused the winner
+    assert (
+        outcomes["lost"] == workers - 1
+    )  # the rest lost the rename race and reused the winner
     assert all(e in (errno.ENOTEMPTY, errno.EEXIST) for e in lost_errnos)
-    assert [p for p in checkout_cache_dir.iterdir() if p.name.startswith(".build-")] == []
+    assert [
+        p for p in checkout_cache_dir.iterdir() if p.name.startswith(".build-")
+    ] == []
 
 
 def test_cached_checkout_isolates_by_commit(tmp_path, monkeypatch) -> None:
@@ -180,7 +196,7 @@ def test_cached_checkout_isolates_by_commit(tmp_path, monkeypatch) -> None:
 
 
 def test_cached_checkout_pins_uv_envs(tmp_path, monkeypatch) -> None:
-    """All uv build steps target the checkout venv, never the ambient runtime /opt/venv."""
+    """All uv build steps target and fully prepare the checkout environment."""
     calls: list[tuple[list[str], Path | None, dict[str, str] | None]] = []
 
     def run(command, cwd=None, env=None, check=True, text=True, capture_output=False):
@@ -195,6 +211,7 @@ def test_cached_checkout_pins_uv_envs(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/opt/venv")
     monkeypatch.setenv("VIRTUAL_ENV", "/opt/venv")
+    monkeypatch.setenv("UV_NO_SYNC", "1")
     monkeypatch.setattr(alpasim_dependency.subprocess, "run", run)
 
     resolve_alpasim_checkout(_alpasim_config(repo_ref="b" * 40))
@@ -205,8 +222,13 @@ def test_cached_checkout_pins_uv_envs(tmp_path, monkeypatch) -> None:
     for command, env in uv_calls:
         assert env is not None, command
         assert "VIRTUAL_ENV" not in env
-    compile_env = next(env for c, env in uv_calls if c == ["uv", "run", "compile-protos"])
-    assert compile_env["UV_PROJECT_ENVIRONMENT"] == str(build_dir / "src" / "grpc" / ".venv")
+        assert "UV_NO_SYNC" not in env
+    compile_env = next(
+        env for c, env in uv_calls if c == ["uv", "run", "compile-protos"]
+    )
+    assert compile_env["UV_PROJECT_ENVIRONMENT"] == str(
+        build_dir / "src" / "grpc" / ".venv"
+    )
     sync_env = next(env for c, env in uv_calls if c[:2] == ["uv", "sync"])
     assert sync_env["UV_PROJECT_ENVIRONMENT"] == str(build_dir / ".venv")
 
@@ -247,20 +269,27 @@ def test_cached_checkout_restores_plugin_configs_dropped_by_no_editable(
             (pkg / "configs").mkdir(parents=True)
             (pkg / "__init__.py").write_text("", encoding="utf-8")
             (pkg / "configs" / "__init__.py").write_text("", encoding="utf-8")
-        return SimpleNamespace(stdout="b" * 40 if command[:2] == ["git", "ls-remote"] else "")
+        return SimpleNamespace(
+            stdout="b" * 40 if command[:2] == ["git", "ls-remote"] else ""
+        )
 
     monkeypatch.setattr(alpasim_dependency.subprocess, "run", run)
 
     dest = resolve_alpasim_checkout(_alpasim_config(repo_ref="b" * 40))
 
-    restored = dest / ".venv/lib/python3.12/site-packages/alpasim_example/configs/deploy/cluster.yaml"
+    restored = (
+        dest
+        / ".venv/lib/python3.12/site-packages/alpasim_example/configs/deploy/cluster.yaml"
+    )
     assert (
         restored.is_file()
     )  # the Wizard can now resolve pkg://alpasim_example.configs deploy=cluster
 
 
-def test_local_checkout_syncs_editable_without_configs_install(tmp_path, monkeypatch) -> None:
-    """A local checkout syncs an editable env in place and installs no AlpaGym configs."""
+def test_local_checkout_compiles_protos_then_syncs_editable(
+    tmp_path, monkeypatch
+) -> None:
+    """Fresh local clones generate ignored stubs before Wizard/Cosmos can import them."""
     local_checkout = tmp_path / "alpasim"
     _write_alpasim_layout(local_checkout)
     commands: list[tuple[list[str], Path | None]] = []
@@ -275,7 +304,13 @@ def test_local_checkout_syncs_editable_without_configs_install(tmp_path, monkeyp
     checkout_root = resolve_alpasim_checkout(_local_config(local_checkout))
 
     assert checkout_root == local_checkout.resolve()
-    assert commands == [(["uv", "sync", "--all-extras"], local_checkout.resolve())]
+    assert commands == [
+        (
+            ["uv", "run", "compile-protos"],
+            local_checkout.resolve() / "src" / "grpc",
+        ),
+        (["uv", "sync", "--all-extras"], local_checkout.resolve()),
+    ]
 
 
 def test_cached_checkout_uses_configured_cache_dir(tmp_path, monkeypatch) -> None:
@@ -323,7 +358,9 @@ def _recording_run(commands: list, *, ls_remote_sha: str = "a" * 40):
     return run
 
 
-def _alpasim_config(repo_ref: str, checkout_cache_dir: str | None = None) -> AlpaSimConfig:
+def _alpasim_config(
+    repo_ref: str, checkout_cache_dir: str | None = None
+) -> AlpaSimConfig:
     """Build an AlpaSim config for the cached-checkout tests."""
     return AlpaSimConfig(
         repo_url=REPO_URL,

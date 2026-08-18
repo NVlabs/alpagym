@@ -3,6 +3,7 @@
 """Entry-point registry for policy-owned runtime hooks."""
 
 from dataclasses import dataclass, fields
+from pathlib import Path
 from typing import Any, Callable
 
 import torch
@@ -25,21 +26,30 @@ class PolicyBundle:
     replay payload into model-forward kwargs plus the rollout-time old logprob.
     Each policy owns its model input dialect; the runtime packer stays
     policy-agnostic by receiving that callable from the bundle.
+
+    ``export_model_checkpoint`` optionally replaces Cosmos's language-model
+    safetensors exporter. Non-generative policies use it to write a directly
+    loadable policy bundle without tokenizer or generation-config discovery.
     """
 
     setup_tokenizer: Callable[[Any], Any | None]
     build_data_packer: Callable[[RunConfig, str | None], AlpagymDataPacker]
     install_runtime_bridge: Callable[[], None]
-    load_inference_model: Callable[[RunConfig, torch.device, torch.dtype], InferenceModel]
+    load_inference_model: Callable[
+        [RunConfig, torch.device, torch.dtype], InferenceModel
+    ]
     build_model_inputs: Callable[
         [RunConfig],
         Callable[[PolicyReplayData], tuple[dict[str, Any], torch.Tensor]],
     ]
+    export_model_checkpoint: Callable[[torch.nn.Module, Path], None] | None = None
 
     def __post_init__(self) -> None:
         """Validate that every bundle hook is callable."""
         for field in fields(self):
             hook = getattr(self, field.name)
+            if field.name == "export_model_checkpoint" and hook is None:
+                continue
             if not callable(hook):
                 raise TypeError(f"PolicyBundle hook {field.name!r} must be callable")
 

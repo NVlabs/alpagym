@@ -1,0 +1,72 @@
+# @package _global_
+
+defaults:
+  - override /policy: g1_videomimic_planner
+  - override /topology: local_colocated_1gpu
+
+# 30 seconds at the 10 Hz outer planner rate.  Each macro transition contains
+# exactly five realized 50 Hz GRAIL/SONIC controller ticks (1500 total).
+expected_valid_steps: 300
+
+dataset:
+  test_suite_id: null
+  scene_ids: [hq_stairs]
+
+policy:
+  model:
+    path: ???
+    bundle_config:
+      # Do not censor sampled policy failures. A complete scratch-world
+      # reference is executed by frozen GRAIL and scored by realized MuJoCo.
+      shadow_fall_reference_mode: accept_for_training
+
+alpasim:
+  simulation_domain: humanoid
+  repo_path: ???
+  repo_url: null
+  repo_ref: null
+  humanoid:
+    repo_path: ???
+    scene_store_path: ???
+    scenario_ids_by_scene:
+      hq_stairs: ascend
+    execution_profile: motion_reference
+    grail_root_path: ???
+    num_envs: 1
+    # Set this to a uint64 for a reproducible evaluation panel.  Leave null for
+    # stochastic training, which derives each seed from its fresh session UUID.
+    rollout_seed_base: null
+    service_image: alpasim-humanoid:local
+    reward_profile_id: reference_route_centered.v3
+    route_center_soft_m: 0.10
+    route_progress_credit_m: 0.30
+    route_corridor_half_width_m: 0.45
+  wizard_args:
+    force_gt_duration_us: 0
+    control_timestep_us: 100_000
+
+cosmos:
+  train:
+    max_num_steps: 1
+    num_epochs: 1
+    optm_lr: 1.0e-6
+    optm_warmup_steps: 0
+    train_policy:
+      trainer_type: alpagym_ppo
+      mini_batch: 1
+      step_mini_batch: 300
+      grpo_optimization_iterations: 1
+      # Keep multi-update finetuning near the initial V9 policy.  A zero reset
+      # interval anchors the reference for the entire run rather than chasing
+      # the latest update.
+      kl_beta: 0.1
+      reference_reset_interval: 0
+      # SMDP replay interprets these per 50 Hz controller tick.  Fifth roots
+      # preserve the intended gamma=0.99 and lambda=0.95 per 10 Hz planner
+      # decision instead of applying either discount five times too strongly.
+      ppo_gamma: 0.9979919516614258
+      ppo_gae_lambda: 0.9897937816869885
+  rollout:
+    n_generation: 1
+    batch_size: 1
+    prefetch_rollout: false

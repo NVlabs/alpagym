@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import sys
 import types
 from types import SimpleNamespace
@@ -36,6 +37,29 @@ def install_alpasim_grpc_stubs() -> None:
             """Store version fields."""
             self.version_id = version_id
             self.git_hash = git_hash
+
+    class Vec3:
+        """Tiny stand-in for common.Vec3."""
+
+        def __init__(self, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> None:
+            self.x = x
+            self.y = y
+            self.z = z
+
+    class Quat:
+        """Tiny stand-in for common.Quat."""
+
+        def __init__(
+            self,
+            w: float = 0.0,
+            x: float = 0.0,
+            y: float = 0.0,
+            z: float = 0.0,
+        ) -> None:
+            self.w = w
+            self.x = x
+            self.y = y
+            self.z = z
 
     class PoseAtTime:
         """Tiny stand-in for common.PoseAtTime."""
@@ -165,11 +189,25 @@ def install_alpasim_grpc_stubs() -> None:
             terminate_session: bool = False,
             behavior_policy_version: str = "",
             value_estimates=None,
+            plan_updates=None,
         ) -> None:
             self.actions = list(actions or [])
             self.terminate_session = terminate_session
             self.behavior_policy_version = behavior_policy_version
             self.value_estimates = list(value_estimates or [])
+            self.plan_updates = list(plan_updates or [])
+
+    class HumanoidMotionFrame:
+        """Tiny stand-in for humanoid.HumanoidMotionFrame."""
+
+        def __init__(self, **kwargs: object) -> None:
+            self.__dict__.update(kwargs)
+
+    class HumanoidPlanUpdate:
+        """Tiny stand-in for humanoid.HumanoidPlanUpdate."""
+
+        def __init__(self, **kwargs: object) -> None:
+            self.__dict__.update(kwargs)
 
     class HumanoidEnvValue:
         """Tiny stand-in for humanoid.HumanoidEnvValue."""
@@ -187,7 +225,9 @@ def install_alpasim_grpc_stubs() -> None:
     class HumanoidPolicyServiceServicer:
         """Tiny stand-in for generated humanoid policy servicer base."""
 
-    def add_HumanoidPolicyServiceServicer_to_server(servicer: object, server: Any) -> None:
+    def add_HumanoidPolicyServiceServicer_to_server(
+        servicer: object, server: Any
+    ) -> None:
         """Attach a humanoid policy servicer to a fake server."""
         server.servicer = servicer
 
@@ -271,6 +311,8 @@ def install_alpasim_grpc_stubs() -> None:
     common_pb2.SessionRequestStatus = SessionRequestStatus
     common_pb2.Trajectory = Trajectory
     common_pb2.VersionId = VersionId
+    common_pb2.Vec3 = Vec3
+    common_pb2.Quat = Quat
     egodriver_pb2.DriveRequest = DriveRequest
     egodriver_pb2.DriveResponse = DriveResponse
     egodriver_pb2.DriveSessionCloseRequest = DriveSessionCloseRequest
@@ -285,10 +327,18 @@ def install_alpasim_grpc_stubs() -> None:
     humanoid_pb2.HumanoidAction = HumanoidAction
     humanoid_pb2.HumanoidEnvState = HumanoidEnvState
     humanoid_pb2.HumanoidEnvValue = HumanoidEnvValue
+    humanoid_pb2.HumanoidMotionFrame = HumanoidMotionFrame
+    humanoid_pb2.HumanoidPlanUpdate = HumanoidPlanUpdate
     humanoid_pb2.HumanoidPolicyRequest = HumanoidPolicyRequest
     humanoid_pb2.HumanoidPolicyResponse = HumanoidPolicyResponse
     humanoid_pb2.HumanoidPolicySessionRequest = HumanoidPolicySessionRequest
     humanoid_pb2.HumanoidSessionCloseRequest = HumanoidSessionCloseRequest
+    humanoid_pb2.HUMANOID_EXECUTION_MODE_DIRECT_ACTION = 1
+    humanoid_pb2.HUMANOID_EXECUTION_MODE_MOTION_REFERENCE = 2
+    humanoid_pb2.HUMANOID_POLICY_REQUEST_KIND_DIRECT_ACTION = 1
+    humanoid_pb2.HUMANOID_POLICY_REQUEST_KIND_INITIAL_PLAN = 2
+    humanoid_pb2.HUMANOID_POLICY_REQUEST_KIND_REPLAN_WITH_FEEDBACK = 3
+    humanoid_pb2.HUMANOID_POLICY_REQUEST_KIND_FINALIZE_WITH_FEEDBACK = 4
     humanoid_pb2_grpc.HumanoidPolicyServiceServicer = HumanoidPolicyServiceServicer
     humanoid_pb2_grpc.add_HumanoidPolicyServiceServicer_to_server = (
         add_HumanoidPolicyServiceServicer_to_server
@@ -318,6 +368,8 @@ def install_alpasim_grpc_stubs() -> None:
                 "scene_id",
                 "scenario_id",
                 "random_seed",
+                "execution_mode",
+                "reference_spec",
             ),
             "HumanoidEnvState": _descriptor_message(
                 "timestamp_us",
@@ -326,10 +378,37 @@ def install_alpasim_grpc_stubs() -> None:
                 "reset_id",
             ),
             "HumanoidPolicyRequest": _descriptor_message(
-                "bootstrap_only", "bootstrap_env_ids"
+                "bootstrap_only", "bootstrap_env_ids", "request_kind", "observation"
+            ),
+            "HumanoidObservation": _descriptor_message(
+                "decision_id", "feedback_traces"
             ),
             "HumanoidPolicyResponse": _descriptor_message(
-                "behavior_policy_version", "value_estimates"
+                "behavior_policy_version", "value_estimates", "plan_updates"
+            ),
+            "HumanoidPlanUpdate": _descriptor_message(
+                "reference_id",
+                "source_decision_id",
+                "frames",
+                "reference_sha256",
+                "root_z_alignment_offset_m",
+            ),
+            "HumanoidRealizedControlTick": _descriptor_message(
+                "control_tick_offset",
+                "state",
+                "active_reference_id",
+                "reference_action_index",
+                "active_reference_sha256",
+                "applied_reference_sha256",
+                "root_z_alignment_offset_m",
+                "reward",
+                "terminated",
+                "truncated",
+                "metrics",
+                "control_episode_step",
+            ),
+            "HumanoidRealizedFeedbackTrace": _descriptor_message(
+                "env_id", "source_decision_id", "ticks"
             ),
             "HumanoidStepResult": _descriptor_message(
                 "state",
@@ -338,8 +417,28 @@ def install_alpasim_grpc_stubs() -> None:
                 "truncated",
                 "final_state",
                 "episode_step",
+                "control_ticks",
+                "executed_control_ticks",
+                "active_reference_sha256",
+                "applied_reference_sha256",
             ),
-        }
+        },
+        enum_types_by_name={
+            "HumanoidExecutionMode": SimpleNamespace(
+                values_by_name={
+                    "HUMANOID_EXECUTION_MODE_DIRECT_ACTION": object(),
+                    "HUMANOID_EXECUTION_MODE_MOTION_REFERENCE": object(),
+                }
+            ),
+            "HumanoidPolicyRequestKind": SimpleNamespace(
+                values_by_name={
+                    "HUMANOID_POLICY_REQUEST_KIND_DIRECT_ACTION": object(),
+                    "HUMANOID_POLICY_REQUEST_KIND_INITIAL_PLAN": object(),
+                    "HUMANOID_POLICY_REQUEST_KIND_REPLAN_WITH_FEEDBACK": object(),
+                    "HUMANOID_POLICY_REQUEST_KIND_FINALIZE_WITH_FEEDBACK": object(),
+                }
+            ),
+        },
     )
     runtime_pb2.DESCRIPTOR = SimpleNamespace(
         message_types_by_name={
@@ -351,9 +450,7 @@ def install_alpasim_grpc_stubs() -> None:
                 "scene_id",
             ),
             "SimulationReturn": _descriptor_message(
-                nested={
-                    "RolloutReturn": _descriptor_message("behavior_policy_version")
-                }
+                nested={"RolloutReturn": _descriptor_message("behavior_policy_version")}
             ),
         }
     )
@@ -423,6 +520,46 @@ def test_simulation_request_carries_humanoid_policy_endpoint() -> None:
     assert request.rollout_specs[0].scene_id == "stairs_scene"
     assert request.rollout_specs[0].scenario_id == "ascend"
     assert list(request.rollout_specs[0].session_uuids) == ["humanoid-session"]
+    legacy_seed = (
+        int.from_bytes(
+            hashlib.sha256(b"alpagym-humanoid-v1:humanoid-session").digest()[:8],
+            "big",
+        )
+        or 1
+    )
+    assert request.rollout_specs[0].random_seed == legacy_seed
+
+
+def test_simulation_request_threads_explicit_humanoid_random_seed() -> None:
+    """An explicit panel seed bypasses the legacy session-UUID hash."""
+    request = build_simulation_request_proto(
+        scene_ids=("stairs_scene",),
+        n_generation=1,
+        humanoid_policy_host="localhost",
+        humanoid_policy_port=50057,
+        n_concurrent_per_humanoid_policy=1,
+        session_uuid="humanoid-session",
+        random_seed=0,
+        humanoid_scenario_ids=("ascend",),
+    )
+
+    assert request.rollout_specs[0].random_seed == 0
+
+
+@pytest.mark.parametrize("random_seed", [-1, 1 << 64, True, 1.5])
+def test_simulation_request_rejects_non_uint64_random_seed(random_seed: object) -> None:
+    """Explicit rollout seeds are strictly typed and bounded by the proto uint64 ABI."""
+    with pytest.raises(ValueError, match="random_seed must be a uint64"):
+        build_simulation_request_proto(
+            scene_ids=("stairs_scene",),
+            n_generation=1,
+            humanoid_policy_host="localhost",
+            humanoid_policy_port=50057,
+            n_concurrent_per_humanoid_policy=1,
+            session_uuid="humanoid-session",
+            random_seed=random_seed,  # type: ignore[arg-type]
+            humanoid_scenario_ids=("ascend",),
+        )
 
 
 def test_simulation_request_threads_session_uuid_for_per_rollout_dispatch() -> None:

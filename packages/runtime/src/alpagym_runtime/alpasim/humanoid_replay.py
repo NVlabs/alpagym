@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
 from alpagym_runtime.types import PolicyOutput
+
+_MOTION_CONTROLLER_TICKS = 5
 
 
 def attach_humanoid_transitions(
@@ -29,7 +31,11 @@ def attach_humanoid_transitions(
             "humanoid rollout row count must be in "
             f"[1, {max_transition_rows}], got {len(outputs)}"
         )
-    if behavior_policy_version < 0 or control_timestep_us <= 0 or expected_num_envs <= 0:
+    if (
+        behavior_policy_version < 0
+        or control_timestep_us <= 0
+        or expected_num_envs <= 0
+    ):
         raise ValueError("invalid humanoid replay version, timestep, or lane count")
 
     indexed: dict[int, list[tuple[int, PolicyOutput]]] = {}
@@ -68,7 +74,11 @@ def attach_humanoid_transitions(
     truncated_lanes: set[int] = set()
     for env_id, rows in indexed.items():
         rows.sort(key=lambda item: int(item[1].model_extra["humanoid_step_index"]))
-        step_indices = [int(row.model_extra["humanoid_step_index"]) for _, row in rows]
+        step_indices: list[int] = []
+        for _, row in rows:
+            if row.model_extra is None:
+                raise AssertionError("indexed humanoid row lost its model identity")
+            step_indices.append(int(row.model_extra["humanoid_step_index"]))
         if step_indices != list(range(len(rows))):
             raise ValueError(f"humanoid env_id={env_id} has non-contiguous steps")
         episode_length_name = f"humanoid_episode_length_env{env_id}"
@@ -94,24 +104,59 @@ def attach_humanoid_transitions(
             if valid and (len(valid) != len(rows) or not all(valid)):
                 raise ValueError("humanoid transition metric contains invalid samples")
             if len(metric["values"]) != len(rows):
-                raise ValueError("humanoid transition metric length differs from policy rows")
+                raise ValueError(
+                    "humanoid transition metric length differs from policy rows"
+                )
 
+        expected_control_episode_step = 1
         for position, (output_index, output) in enumerate(rows):
             extra = output.model_extra
             assert extra is not None
-            expected_timestamp = int(extra["humanoid_timestamp_us"]) + control_timestep_us
+            metric_reward = float(metrics[0]["values"][position])
+            metric_terminated = bool(metrics[1]["values"][position])
+            metric_truncated = bool(metrics[2]["values"][position])
+            replay_data = output.replay_data
+            assert replay_data is not None
+            payload = dict(replay_data.payload)
+            motion_reference = "reference_sha256" in payload
+            receipt_fields: dict[str, Any] = {}
+            if motion_reference:
+                (
+                    reward,
+                    terminated,
+                    truncated,
+                    expected_timestamp,
+                    expected_control_episode_step,
+                    receipt_fields,
+                ) = _motion_reference_receipt(
+                    payload,
+                    env_id=env_id,
+                    expected_source_decision_id=int(extra["humanoid_decision_id"]),
+                    expected_control_episode_step=expected_control_episode_step,
+                    metric_reward=metric_reward,
+                    metric_terminated=metric_terminated,
+                    metric_truncated=metric_truncated,
+                )
+            else:
+                expected_timestamp = (
+                    int(extra["humanoid_timestamp_us"]) + control_timestep_us
+                )
+                reward = metric_reward
+                terminated = metric_terminated
+                truncated = metric_truncated
             if timestamps[position] != expected_timestamp:
                 raise ValueError(
                     f"humanoid env_id={env_id} transition timestamp is misaligned"
                 )
-            reward = float(metrics[0]["values"][position])
-            terminated = bool(metrics[1]["values"][position])
-            truncated = bool(metrics[2]["values"][position])
             if not math.isfinite(reward) or (terminated and truncated):
-                raise ValueError("humanoid transition has invalid reward or terminal flags")
+                raise ValueError(
+                    "humanoid transition has invalid reward or terminal flags"
+                )
             is_last = position == len(rows) - 1
             if is_last != (terminated or truncated):
-                raise ValueError("humanoid terminal boundary does not match the final policy row")
+                raise ValueError(
+                    "humanoid terminal boundary does not match the final policy row"
+                )
             old_value = float(extra["humanoid_value"])
             if terminated:
                 bootstrap_value = 0.0
@@ -145,9 +190,6 @@ def attach_humanoid_transitions(
             if not math.isfinite(old_value) or not math.isfinite(bootstrap_value):
                 raise ValueError("humanoid transition contains non-finite values")
 
-            replay_data = output.replay_data
-            assert replay_data is not None
-            payload = dict(replay_data.payload)
             if "transition" in payload:
                 raise ValueError("humanoid replay already contains a transition block")
             payload["transition"] = {
@@ -161,6 +203,7 @@ def attach_humanoid_transitions(
                 "old_value": old_value,
                 "bootstrap_value": bootstrap_value,
                 "behavior_policy_version": behavior_policy_version,
+                **receipt_fields,
             }
             patched[output_index] = replace(
                 output,
@@ -170,6 +213,142 @@ def attach_humanoid_transitions(
     if set(final_bootstrap_values) != truncated_lanes:
         raise ValueError("final-state values do not match truncated humanoid lanes")
     return tuple(patched)
+
+
+def _motion_reference_receipt(
+    payload: Mapping[str, Any],
+    *,
+    env_id: int,
+    expected_source_decision_id: int,
+    expected_control_episode_step: int,
+    metric_reward: float,
+    metric_terminated: bool,
+    metric_truncated: bool,
+) -> tuple[float, bool, bool, int, int, dict[str, Any]]:
+    """Validate one exact controller trace and derive its SMDP transition."""
+    trace = payload.get("feedback_trace")
+    if not isinstance(trace, Mapping):
+        raise ValueError("motion-reference replay row is missing feedback_trace")
+    if int(trace.get("env_id", -1)) != env_id:
+        raise ValueError("motion-reference feedback env_id does not match replay lane")
+    source_decision_id = int(trace.get("source_decision_id", -1))
+    if source_decision_id != expected_source_decision_id or source_decision_id != int(
+        payload.get("source_decision_id", -2)
+    ):
+        raise ValueError(
+            "motion-reference feedback source decision does not match plan"
+        )
+    reference_id = int(payload.get("reference_id", -1))
+    reference_sha256 = _require_sha256(
+        "motion-reference replay reference_sha256",
+        payload.get("reference_sha256"),
+    )
+    root_z_offset = float(payload.get("root_z_alignment_offset_m", math.nan))
+    if reference_id <= 0 or not math.isfinite(root_z_offset):
+        raise ValueError("motion-reference replay has invalid reference identity")
+    ticks = trace.get("ticks")
+    if not isinstance(ticks, list) or not 1 <= len(ticks) <= _MOTION_CONTROLLER_TICKS:
+        raise ValueError("motion-reference feedback ticks must be a non-empty K-prefix")
+
+    primitive_rewards = [0.0] * _MOTION_CONTROLLER_TICKS
+    primitive_mask = [False] * _MOTION_CONTROLLER_TICKS
+    previous_timestamp: int | None = None
+    applied_hashes: list[str] = []
+    for action_index, tick in enumerate(ticks):
+        if not isinstance(tick, Mapping):
+            raise TypeError("motion-reference feedback tick must be a mapping")
+        tick = cast(Mapping[str, Any], tick)
+        expected_offset = action_index + 1
+        if int(tick.get("control_tick_offset", -1)) != expected_offset:
+            raise ValueError("feedback control_tick_offset must be contiguous from one")
+        if int(tick.get("reference_action_index", -1)) != action_index:
+            raise ValueError(
+                "feedback reference_action_index must be contiguous from zero"
+            )
+        if int(tick.get("active_reference_id", -1)) != reference_id:
+            raise ValueError("feedback active_reference_id does not match plan")
+        if (
+            _require_sha256(
+                "feedback active_reference_sha256",
+                tick.get("active_reference_sha256"),
+            )
+            != reference_sha256
+        ):
+            raise ValueError("feedback active reference digest does not match plan")
+        applied_hashes.append(
+            _require_sha256(
+                "feedback applied_reference_sha256",
+                tick.get("applied_reference_sha256"),
+            )
+        )
+        if not math.isclose(
+            float(tick.get("root_z_alignment_offset_m", math.nan)),
+            root_z_offset,
+            rel_tol=0.0,
+            abs_tol=1.0e-6,
+        ):
+            raise ValueError("feedback root Z alignment does not match plan")
+        timestamp_us = int(tick.get("timestamp_us", -1))
+        if (
+            previous_timestamp is not None
+            and timestamp_us != previous_timestamp + 20_000
+        ):
+            raise ValueError("feedback tick timestamps are not a contiguous 20 ms grid")
+        previous_timestamp = timestamp_us
+        control_episode_step = int(tick.get("control_episode_step", -1))
+        if control_episode_step != expected_control_episode_step:
+            raise ValueError("feedback control_episode_step is not contiguous")
+        expected_control_episode_step += 1
+        reward = float(tick.get("reward", math.nan))
+        if not math.isfinite(reward):
+            raise ValueError("feedback tick reward is non-finite")
+        primitive_rewards[action_index] = reward
+        primitive_mask[action_index] = True
+        tick_terminated = bool(tick.get("terminated", False))
+        tick_truncated = bool(tick.get("truncated", False))
+        if tick_terminated and tick_truncated:
+            raise ValueError("feedback tick cannot terminate and truncate together")
+        if action_index < len(ticks) - 1 and (tick_terminated or tick_truncated):
+            raise ValueError("only the final feedback tick may end a macro transition")
+    assert previous_timestamp is not None
+    final_tick = ticks[-1]
+    terminated = bool(final_tick.get("terminated", False))
+    truncated = bool(final_tick.get("truncated", False)) or bool(
+        payload.get("outer_truncated", False)
+    )
+    if terminated and truncated:
+        raise ValueError("terminated motion lane cannot be outer-truncated")
+    if len(ticks) < _MOTION_CONTROLLER_TICKS and not (terminated or truncated):
+        raise ValueError("short motion-reference trace must end the transition")
+    reward = float(sum(primitive_rewards))
+    if not math.isclose(reward, metric_reward, rel_tol=1.0e-6, abs_tol=1.0e-6):
+        raise ValueError("controller tick rewards do not sum to ScenarioEval reward")
+    if (terminated, truncated) != (metric_terminated, metric_truncated):
+        raise ValueError("controller receipt terminal flags disagree with ScenarioEval")
+    return (
+        reward,
+        terminated,
+        truncated,
+        previous_timestamp,
+        expected_control_episode_step,
+        {
+            "primitive_rewards": primitive_rewards,
+            "primitive_reward_mask": primitive_mask,
+            "duration_ticks": len(ticks),
+            "reference_id": reference_id,
+            "source_decision_id": source_decision_id,
+            "reference_sha256": reference_sha256,
+            "applied_reference_sha256": applied_hashes,
+            "root_z_alignment_offset_m": root_z_offset,
+        },
+    )
+
+
+def _require_sha256(name: str, value: Any) -> str:
+    digest = str(value)
+    if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+        raise ValueError(f"{name} must be a lowercase SHA256 digest")
+    return digest
 
 
 def _final_bootstrap_from_metrics(
@@ -182,7 +361,9 @@ def _final_bootstrap_from_metrics(
     """Cross-check the final-state value echoed by both AlpaSim metric paths."""
     name = f"humanoid_final_bootstrap_value_env{env_id}"
     if name not in dense_metrics:
-        raise ValueError(f"humanoid env_id={env_id} is missing final bootstrap metric {name!r}")
+        raise ValueError(
+            f"humanoid env_id={env_id} is missing final bootstrap metric {name!r}"
+        )
     metric = dense_metrics[name]
     timestamps = tuple(int(value) for value in metric.get("timestamps_us", ()))
     values = tuple(float(value) for value in metric.get("values", ()))

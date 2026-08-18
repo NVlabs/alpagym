@@ -5,11 +5,38 @@ import logging
 from pathlib import Path
 from subprocess import CompletedProcess
 
+import pytest
 import yaml
-from alpagym_host.config import RunConfig, register_config_schema
+from alpagym_host.config import ExecutionBackend, RunConfig, register_config_schema
 from alpagym_host.run_artifacts import build_artifact_paths, build_run_config
-from alpagym_host.run_lifecycle import execute_run
+from alpagym_host.run_lifecycle import execute_run, validate_local_process_config
 from hydra import compose, initialize_config_module
+
+
+def test_local_process_preflight_requires_redis_server(monkeypatch) -> None:
+    """Fail before Wizard startup when Cosmos-RL cannot launch its Redis process."""
+
+    def fake_which(executable: str) -> str | None:
+        return "/usr/bin/docker" if executable == "docker" else None
+
+    monkeypatch.setattr("alpagym_host.run_lifecycle.shutil.which", fake_which)
+
+    with pytest.raises(ValueError, match="requires redis-server in PATH"):
+        validate_local_process_config(ExecutionBackend.local_process)
+
+
+def test_local_process_preflight_requires_redis_cli(monkeypatch) -> None:
+    """Do not launch a Redis server that Cosmos-RL cannot cleanly shut down."""
+
+    def fake_which(executable: str) -> str | None:
+        if executable in {"docker", "redis-server"}:
+            return f"/usr/bin/{executable}"
+        return None
+
+    monkeypatch.setattr("alpagym_host.run_lifecycle.shutil.which", fake_which)
+
+    with pytest.raises(ValueError, match="requires redis-cli in PATH"):
+        validate_local_process_config(ExecutionBackend.local_process)
 
 
 def test_execute_run_runs_local_process_lifecycle(
@@ -46,7 +73,9 @@ def test_execute_run_runs_local_process_lifecycle(
     commands: list[list[str]] = []
     captured_paths: dict[str, Path] = {}
 
-    monkeypatch.setattr(run_lifecycle, "validate_local_process_config", lambda backend: None)
+    monkeypatch.setattr(
+        run_lifecycle, "validate_local_process_config", lambda backend: None
+    )
     monkeypatch.setattr(
         run_lifecycle,
         "resolve_alpasim_checkout",
@@ -57,7 +86,9 @@ def test_execute_run_runs_local_process_lifecycle(
         captured_paths["runtime_server_path"] = kwargs["runtime_server_path"]
         return kwargs["published_host"], 30051
 
-    monkeypatch.setattr(run_lifecycle, "wait_for_runtime_ready", fake_wait_for_runtime_ready)
+    monkeypatch.setattr(
+        run_lifecycle, "wait_for_runtime_ready", fake_wait_for_runtime_ready
+    )
     monkeypatch.setattr(
         run_lifecycle,
         "fetch_runtime_info",
@@ -111,7 +142,9 @@ def test_execute_run_runs_local_process_lifecycle(
     caplog.set_level(logging.INFO)
     execute_run(config)
 
-    assert captured_paths["alpasim_run_dir"] == artifact_paths.alpasim_log_dir / "wizard_0"
+    assert (
+        captured_paths["alpasim_run_dir"] == artifact_paths.alpasim_log_dir / "wizard_0"
+    )
     assert (
         captured_paths["runtime_server_path"]
         == artifact_paths.alpasim_log_dir / "wizard_0" / "generated-runtime-server.yaml"
@@ -274,7 +307,9 @@ def test_execute_run_runs_distributed_slurm_topology(
     runtime_files = sorted(
         (artifact_paths.topology_registry_dir / "alpasim_runtimes").glob("*.yaml")
     )
-    runtime_hosts = [runtime_file.read_text(encoding="utf-8") for runtime_file in runtime_files]
+    runtime_hosts = [
+        runtime_file.read_text(encoding="utf-8") for runtime_file in runtime_files
+    ]
     assert len(runtime_hosts) == 1
     assert any("host: alpasim-0" in runtime_host for runtime_host in runtime_hosts)
     assert any("capacity: 9" in runtime_host for runtime_host in runtime_hosts)
@@ -337,7 +372,9 @@ def test_execute_run_resolves_relative_slurm_wizard_paths(
         captured_paths["alpasim_run_dir"] = kwargs["alpasim_run_dir"]
         return ["uv", "run", "alpasim_wizard"]
 
-    monkeypatch.setattr(run_lifecycle, "_build_wizard_command", fake_build_wizard_command)
+    monkeypatch.setattr(
+        run_lifecycle, "_build_wizard_command", fake_build_wizard_command
+    )
 
     def fake_build_wizard_srun_command(**kwargs: object) -> list[str]:
         captured_paths["log_path"] = kwargs["log_path"]
@@ -353,7 +390,9 @@ def test_execute_run_resolves_relative_slurm_wizard_paths(
         captured_paths["runtime_server_path"] = kwargs["runtime_server_path"]
         return kwargs["published_host"], 30051
 
-    monkeypatch.setattr(run_lifecycle, "wait_for_runtime_ready", fake_wait_for_runtime_ready)
+    monkeypatch.setattr(
+        run_lifecycle, "wait_for_runtime_ready", fake_wait_for_runtime_ready
+    )
     monkeypatch.setattr(
         run_lifecycle,
         "fetch_runtime_info",

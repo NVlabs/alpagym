@@ -68,9 +68,13 @@ class TrainingSignal:
     Shape notes:
         ``old_logprobs`` is ``[BT]`` trajectory-level rollout-policy logprob.
         ``is_padding`` is ``[BT]`` and masks packer-added rows.
-        Transition fields are optional ``[BT]`` tensors used by actor-critic
-        trainers. ``rewards`` and terminal flags are rollout facts; ``old_values``
-        and ``bootstrap_values`` are rollout-policy value estimates.
+        Transition fields are optional tensors used by actor-critic trainers.
+        Scalar ``rewards`` and terminal/value fields are ``[BT]``. A
+        semi-Markov action may additionally carry the controller-tick rewards
+        it committed as ``primitive_rewards`` plus a same-shaped validity mask
+        ``[BT, K]`` and an integer ``duration_ticks`` vector ``[BT]``.
+        ``old_values`` and ``bootstrap_values`` are rollout-policy value
+        estimates at macro decision boundaries.
         ``advantages`` and ``returns`` are trainer-derived and are never required
         in rollout replay payloads.
     """
@@ -84,6 +88,9 @@ class TrainingSignal:
     truncateds: torch.Tensor | None = None
     old_values: torch.Tensor | None = None
     bootstrap_values: torch.Tensor | None = None
+    primitive_rewards: torch.Tensor | None = None
+    primitive_reward_mask: torch.Tensor | None = None
+    duration_ticks: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         """Require aligned flattened trainer rows."""
@@ -112,13 +119,58 @@ class TrainingSignal:
             "old_values",
             "bootstrap_values",
         ):
-            _validate_optional_signal_tensor(field_name, getattr(self, field_name), expected)
+            _validate_optional_signal_tensor(
+                field_name, getattr(self, field_name), expected
+            )
         for field_name in ("terminateds", "truncateds"):
             tensor = getattr(self, field_name)
             _validate_optional_signal_tensor(field_name, tensor, expected)
             if tensor is not None and tensor.dtype != torch.bool:
                 raise ValueError(
                     f"TrainingSignal {field_name} dtype must be bool, got {tensor.dtype}"
+                )
+        primitive_fields = (
+            self.primitive_rewards,
+            self.primitive_reward_mask,
+            self.duration_ticks,
+        )
+        if any(value is not None for value in primitive_fields) and any(
+            value is None for value in primitive_fields
+        ):
+            raise ValueError(
+                "TrainingSignal primitive_rewards, primitive_reward_mask, and "
+                "duration_ticks must be present together"
+            )
+        if self.primitive_rewards is not None:
+            assert self.primitive_reward_mask is not None
+            assert self.duration_ticks is not None
+            if self.primitive_rewards.ndim != 2:
+                raise ValueError(
+                    "TrainingSignal primitive_rewards must be [BT, K], got "
+                    f"{tuple(self.primitive_rewards.shape)}"
+                )
+            if self.primitive_reward_mask.shape != self.primitive_rewards.shape:
+                raise ValueError(
+                    "TrainingSignal primitive_reward_mask shape must match "
+                    "primitive_rewards"
+                )
+            if self.primitive_rewards.shape[0] != expected:
+                raise ValueError(
+                    "TrainingSignal primitive_rewards leading dimension "
+                    f"{self.primitive_rewards.shape[0]} != old_logprobs length {expected}"
+                )
+            if self.primitive_reward_mask.dtype != torch.bool:
+                raise ValueError(
+                    "TrainingSignal primitive_reward_mask dtype must be bool, got "
+                    f"{self.primitive_reward_mask.dtype}"
+                )
+            _validate_optional_signal_tensor(
+                "duration_ticks", self.duration_ticks, expected
+            )
+            if self.duration_ticks.dtype != torch.int64:
+                raise ValueError(
+                    "TrainingSignal duration_ticks dtype must be int64, got "
+                    f"{self.duration_ticks.dtype}"
                 )
 
 
@@ -171,10 +223,16 @@ class TrainerReplayDataBatch:
             samples: ``B`` single-step replay samples.
         """
         if not samples:
-            raise ValueError("TrainerReplayDataBatch.stack called with empty samples list")
+            raise ValueError(
+                "TrainerReplayDataBatch.stack called with empty samples list"
+            )
 
-        old_logprobs = torch.cat([sample.training_signal.old_logprobs for sample in samples], dim=0)
-        is_padding = torch.cat([sample.training_signal.is_padding for sample in samples], dim=0)
+        old_logprobs = torch.cat(
+            [sample.training_signal.old_logprobs for sample in samples], dim=0
+        )
+        is_padding = torch.cat(
+            [sample.training_signal.is_padding for sample in samples], dim=0
+        )
         model_inputs = {
             **stack_step_model_inputs([sample.model_inputs for sample in samples]),
             "return_log_prob": True,
@@ -191,10 +249,18 @@ class TrainerReplayDataBatch:
                 truncateds=_cat_optional_signal(samples, "truncateds"),
                 old_values=_cat_optional_signal(samples, "old_values"),
                 bootstrap_values=_cat_optional_signal(samples, "bootstrap_values"),
+                primitive_rewards=_cat_optional_signal(samples, "primitive_rewards"),
+                primitive_reward_mask=_cat_optional_signal(
+                    samples, "primitive_reward_mask"
+                ),
+                duration_ticks=_cat_optional_signal(samples, "duration_ticks"),
             ),
             rollout_ids=tuple(sample.rollout_id for sample in samples),
             weight_versions=torch.stack(
-                [sample.weight_version.to(dtype=torch.int64).reshape(()) for sample in samples],
+                [
+                    sample.weight_version.to(dtype=torch.int64).reshape(())
+                    for sample in samples
+                ],
                 dim=0,
             ),
         )
@@ -237,7 +303,9 @@ def parse_policy_replay_data(raw: Mapping[str, Any]) -> PolicyReplayData:
         raise ValueError("PolicyReplayData payload_schema_version must be positive")
     payload = raw["payload"]
     if not isinstance(payload, Mapping):
-        raise TypeError(f"PolicyReplayData payload must be a mapping, got {type(payload).__name__}")
+        raise TypeError(
+            f"PolicyReplayData payload must be a mapping, got {type(payload).__name__}"
+        )
     old_logprob = raw["old_logprob"]
     old_logprob = (
         None
@@ -309,7 +377,9 @@ def stack_step_model_inputs(step_inputs: list[dict[str, Any]]) -> dict[str, Any]
     keys = set(step_inputs[0])
     if any(set(item) != keys for item in step_inputs):
         raise ValueError("Replay model input keys differ across steps")
-    return {key: _stack_values([item[key] for item in step_inputs], key) for key in keys}
+    return {
+        key: _stack_values([item[key] for item in step_inputs], key) for key in keys
+    }
 
 
 def clone_model_inputs(model_inputs: Any) -> Any:
@@ -334,7 +404,8 @@ def _dataclass_to_plain(value: Any) -> Any:
     """Convert dataclasses to dicts while preserving tensor leaves."""
     if is_dataclass(value) and not isinstance(value, type):
         return {
-            field.name: _dataclass_to_plain(getattr(value, field.name)) for field in fields(value)
+            field.name: _dataclass_to_plain(getattr(value, field.name))
+            for field in fields(value)
         }
     if isinstance(value, dict):
         return {key: _dataclass_to_plain(item) for key, item in value.items()}
@@ -356,10 +427,14 @@ def _stack_values(values: list[Any], key: str) -> Any:
         return torch.stack(values, dim=0)
     if isinstance(first, dict):
         dict_keys = set(first)
-        if any(not isinstance(value, dict) or set(value) != dict_keys for value in values):
+        if any(
+            not isinstance(value, dict) or set(value) != dict_keys for value in values
+        ):
             raise ValueError(f"Nested model input keys differ for {key}")
         return {
-            nested_key: _stack_values([value[nested_key] for value in values], nested_key)
+            nested_key: _stack_values(
+                [value[nested_key] for value in values], nested_key
+            )
             for nested_key in dict_keys
         }
     if all(value == first for value in values):

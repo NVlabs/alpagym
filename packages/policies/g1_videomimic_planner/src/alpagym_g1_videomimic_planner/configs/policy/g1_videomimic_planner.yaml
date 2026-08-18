@@ -1,0 +1,44 @@
+# @package policy
+kind: humanoid
+
+model:
+  kind: g1_videomimic_planner
+  path: ???
+  device: cuda
+  dtype: float32
+  use_cameras: []
+  input_size: [1, 1]
+  num_context_frames: 1
+  num_historical_waypoints: 1
+  num_future_waypoints: 1
+  # Outer planner decisions are 10 Hz.  The emitted reference remains 50 Hz.
+  step_dt_us: 100_000
+  bundle_config:
+    humanoid_policy_factory: alpagym_g1_videomimic_planner.humanoid_policy:build_humanoid_policy_factory
+    # Run preparation injects humanoid_repo_path, scene_store_path, and the
+    # canonical expected_scene_fingerprints_json from alpasim.humanoid.
+    deterministic: false
+    # Deployment-equivalent default. Training presets must opt in explicitly
+    # when scratch-world falls should be realized and scored by outer physics.
+    shadow_fall_reference_mode: reject
+    lookahead_m: 0.35
+
+inference:
+  max_batch_size: 1
+  sampling:
+    top_p: 1.0
+    top_k: null
+    temperature: 1.0
+    num_traj_samples: 1
+    num_traj_sets: 1
+    max_generation_length: null
+    force_determinism: false
+    retry_on_nonfinite: false
+    diffusion_kwargs:
+      int_method: sde
+      noise_level: 0.0
+      inference_step: 1
+      temperature: null
+  return_trace_for_rl: true
+
+trajectory_selector: identity

@@ -64,6 +64,12 @@ _BOOL_TRANSITION_SIGNAL_ALIASES = {
     "terminateds": ("terminated", "terminateds"),
     "truncateds": ("truncated", "truncateds"),
 }
+_PRIMITIVE_REWARD_ALIASES = ("primitive_rewards", "controller_tick_rewards")
+_PRIMITIVE_REWARD_MASK_ALIASES = (
+    "primitive_reward_mask",
+    "controller_tick_reward_mask",
+)
+_DURATION_TICK_ALIASES = ("duration_ticks", "controller_ticks")
 
 
 class AlpagymDataPacker(DataPacker):
@@ -79,7 +85,9 @@ class AlpagymDataPacker(DataPacker):
     def __init__(
         self,
         config: DataPackerConfig,
-        build_model_inputs: Callable[[PolicyReplayData], tuple[dict[str, Any], torch.Tensor]],
+        build_model_inputs: Callable[
+            [PolicyReplayData], tuple[dict[str, Any], torch.Tensor]
+        ],
         writer: EpisodeWriter | None = None,
     ) -> None:
         """Store replay collation settings and the optional rollout writer.
@@ -123,7 +131,9 @@ class AlpagymDataPacker(DataPacker):
         GPU-tensor completions.
         """
         if self._writer is None:
-            raise RuntimeError("get_rollout_output requires a rollout writer; this packer has none")
+            raise RuntimeError(
+                "get_rollout_output requires a rollout writer; this packer has none"
+            )
         if not self.config.train.non_text:
             raise RuntimeError(
                 "AlpaGym rollout egress carries in-memory EpisodeOutputs to "
@@ -244,9 +254,18 @@ class AlpagymDataPacker(DataPacker):
                 TrainerReplayData(
                     model_inputs=clone_model_inputs(template_model_inputs),
                     training_signal=TrainingSignal(
-                        old_logprobs=torch.zeros(1, dtype=torch.float32),
+                        # Padding clones the first row's model inputs.  Some
+                        # policies carry a token-level behavior trace in those
+                        # inputs, so keep its scalar audit log-prob consistent
+                        # as well.  The padding mask still makes this row a
+                        # strict no-op for every loss and return calculation.
+                        old_logprobs=(
+                            step_samples[0].training_signal.old_logprobs.clone()
+                        ),
                         is_padding=torch.ones(1, dtype=torch.bool),
-                        **_zero_padding_transition_signal(step_samples[0].training_signal),
+                        **_zero_padding_transition_signal(
+                            step_samples[0].training_signal
+                        ),
                     ),
                     rollout_id=episode.session_uuid,
                     weight_version=step_samples[0].weight_version.clone(),
@@ -292,8 +311,10 @@ class AlpagymDataPacker(DataPacker):
         return batch
 
 
-def _extract_transition_training_signal(replay_data: PolicyReplayData) -> dict[str, torch.Tensor]:
-    """Extract optional scalar transition facts from one replay payload.
+def _extract_transition_training_signal(
+    replay_data: PolicyReplayData,
+) -> dict[str, torch.Tensor]:
+    """Extract optional transition facts from one replay payload.
 
     Policy bundles own the observation/action dialect in ``payload``. This
     runtime-level convention carries rollout facts needed by actor-critic
@@ -312,15 +333,43 @@ def _extract_transition_training_signal(replay_data: PolicyReplayData) -> dict[s
             if alias in transition_payload:
                 value = transition_payload[alias]
                 if value is not None:
-                    signals[field_name] = torch.as_tensor(value, dtype=torch.float32).reshape(1)
+                    signals[field_name] = torch.as_tensor(
+                        value, dtype=torch.float32
+                    ).reshape(1)
                 break
     for field_name, aliases in _BOOL_TRANSITION_SIGNAL_ALIASES.items():
         for alias in aliases:
             if alias in transition_payload:
                 value = transition_payload[alias]
                 if value is not None:
-                    signals[field_name] = torch.as_tensor(value, dtype=torch.bool).reshape(1)
+                    signals[field_name] = torch.as_tensor(
+                        value, dtype=torch.bool
+                    ).reshape(1)
                 break
+    for alias in _PRIMITIVE_REWARD_ALIASES:
+        if alias in transition_payload:
+            value = transition_payload[alias]
+            if value is not None:
+                signals["primitive_rewards"] = torch.as_tensor(
+                    value, dtype=torch.float32
+                ).reshape(1, -1)
+            break
+    for alias in _PRIMITIVE_REWARD_MASK_ALIASES:
+        if alias in transition_payload:
+            value = transition_payload[alias]
+            if value is not None:
+                signals["primitive_reward_mask"] = torch.as_tensor(
+                    value, dtype=torch.bool
+                ).reshape(1, -1)
+            break
+    for alias in _DURATION_TICK_ALIASES:
+        if alias in transition_payload:
+            value = transition_payload[alias]
+            if value is not None:
+                signals["duration_ticks"] = torch.as_tensor(
+                    value, dtype=torch.int64
+                ).reshape(1)
+            break
     return signals
 
 
@@ -339,10 +388,23 @@ def _transition_weight_version(replay_data: PolicyReplayData) -> int:
     return value
 
 
-def _zero_padding_transition_signal(template: TrainingSignal) -> dict[str, torch.Tensor]:
+def _zero_padding_transition_signal(
+    template: TrainingSignal,
+) -> dict[str, torch.Tensor]:
     """Return neutral transition signals for a padding row when transition data is active."""
     signals: dict[str, torch.Tensor] = {}
-    for field_name in (*_FLOAT_TRANSITION_SIGNAL_ALIASES, *_BOOL_TRANSITION_SIGNAL_ALIASES):
+    for field_name in (
+        *_FLOAT_TRANSITION_SIGNAL_ALIASES,
+        *_BOOL_TRANSITION_SIGNAL_ALIASES,
+    ):
+        value = getattr(template, field_name)
+        if value is not None:
+            signals[field_name] = torch.zeros_like(value)
+    for field_name in (
+        "primitive_rewards",
+        "primitive_reward_mask",
+        "duration_ticks",
+    ):
         value = getattr(template, field_name)
         if value is not None:
             signals[field_name] = torch.zeros_like(value)
@@ -352,7 +414,9 @@ def _zero_padding_transition_signal(template: TrainingSignal) -> dict[str, torch
 def build_alpagym_data_packer(
     run_config: RunConfig,
     cosmos_role: str | None,
-    build_model_inputs: Callable[[PolicyReplayData], tuple[dict[str, Any], torch.Tensor]],
+    build_model_inputs: Callable[
+        [PolicyReplayData], tuple[dict[str, Any], torch.Tensor]
+    ],
 ) -> AlpagymDataPacker:
     """Construct the role's packer with its transport endpoint wired in.
 
@@ -405,7 +469,12 @@ def _build_episode_writer(run_config: RunConfig, is_nccl: bool) -> EpisodeWriter
         return DiskEpisodeWriter(Path(run_config.artifact_paths.artifacts_dir))
 
     from alpagym_host.endpoint_registry import FileTopologyRegistry
-    from cosmos_rl.utils.pynccl import create_nccl_comm, create_nccl_uid, nccl_abort, nccl_send
+    from cosmos_rl.utils.pynccl import (
+        create_nccl_comm,
+        create_nccl_uid,
+        nccl_abort,
+        nccl_send,
+    )
 
     from alpagym_runtime.transport.nccl.comm_init import CommInitConfig
     from alpagym_runtime.transport.nccl.endpoints import NcclEpisodeWriter
@@ -473,10 +542,17 @@ def _build_episode_writer(run_config: RunConfig, is_nccl: bool) -> EpisodeWriter
     )
 
 
-def _build_nccl_receiver(run_config: RunConfig) -> tuple[TCPStore, NcclReceiver, torch.device]:
+def _build_nccl_receiver(
+    run_config: RunConfig,
+) -> tuple[TCPStore, NcclReceiver, torch.device]:
     """Build the policy worker's NCCL receiver and its TCPStore connection."""
     from alpagym_host.endpoint_registry import FileTopologyRegistry
-    from cosmos_rl.utils.pynccl import create_nccl_comm, create_nccl_uid, nccl_abort, nccl_recv
+    from cosmos_rl.utils.pynccl import (
+        create_nccl_comm,
+        create_nccl_uid,
+        nccl_abort,
+        nccl_recv,
+    )
 
     from alpagym_runtime.transport.nccl.comm_init import CommInitConfig
     from alpagym_runtime.transport.nccl.receiver import NcclReceiver, NcclReceiverConfig

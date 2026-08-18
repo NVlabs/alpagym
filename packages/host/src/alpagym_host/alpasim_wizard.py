@@ -13,7 +13,33 @@ from pathlib import Path
 
 import yaml
 
-from alpagym_host.config import AlpaSimConfig, DatasetConfig, ExecutionBackend, alpagym_project_root
+from alpagym_host.config import (
+    AlpaSimConfig,
+    DatasetConfig,
+    ExecutionBackend,
+    HumanoidExecutionProfile,
+    alpagym_project_root,
+)
+
+
+_MOTION_REFERENCE_RESERVED_OVERRIDE_PREFIXES = (
+    "runtime_domain",
+    "runtime.humanoid.controller",
+)
+
+
+def _reject_motion_reference_reserved_overrides(overrides: list[str]) -> None:
+    """Reject raw Hydra overrides of Host-owned motion-reference settings."""
+    for override in overrides:
+        key = override.split("=", 1)[0].lstrip("+~").split("@", 1)[0]
+        if any(
+            key == prefix or key.startswith(f"{prefix}.")
+            for prefix in _MOTION_REFERENCE_RESERVED_OVERRIDE_PREFIXES
+        ):
+            raise ValueError(
+                "motion_reference extra_overrides cannot modify reserved "
+                f"controller settings: {key}"
+            )
 
 
 def _build_wizard_command(
@@ -25,6 +51,7 @@ def _build_wizard_command(
 ) -> list[str]:
     """Build argv that runs the AlpaSim Wizard from the checkout venv's interpreter."""
     wizard_args = config.wizard_args
+    reference_mode = False
     # AlpaGym ships its Wizard config groups (e.g. topology=alpagym_4gpu) as plain
     # YAML in this package. Supply them through Hydra's config search path at launch
     # rather than installing them into the checkout venv, so the shared checkout stays
@@ -68,7 +95,9 @@ def _build_wizard_command(
         argv.append(f"renderer={wizard_args.renderer}")
     if config.humanoid is not None:
         if dataset.scene_ids is None:
-            raise ValueError("humanoid Wizard launch requires explicit dataset.scene_ids")
+            raise ValueError(
+                "humanoid Wizard launch requires explicit dataset.scene_ids"
+            )
         missing_scenarios = set(dataset.scene_ids) - set(
             config.humanoid.scenario_ids_by_scene
         )
@@ -77,25 +106,78 @@ def _build_wizard_command(
                 "alpasim.humanoid.scenario_ids_by_scene is missing dataset scenes: "
                 f"{sorted(missing_scenarios)}"
             )
+        reference_mode = (
+            config.humanoid.execution_profile
+            is HumanoidExecutionProfile.motion_reference
+        )
         argv.extend(
             (
-                "runtime_domain=humanoid",
+                f"runtime_domain={'humanoid_reference' if reference_mode else 'humanoid'}",
                 f"defines.humanoid_repo={config.humanoid.repo_path}",
                 f"defines.humanoid_scene_store={config.humanoid.scene_store_path}",
                 f"defines.humanoid_image={config.humanoid.service_image}",
                 "defines.humanoid_dynamics_gpus=[0]",
                 f"runtime.humanoid.num_envs={config.humanoid.num_envs}",
-                "+runtime.humanoid.registration_options.reward_profile_id="
+            )
+        )
+        # Direct-action tasks consume these through registration_options;
+        # motion-reference tasks consume them in the trusted controller plugin.
+        # Keep the authored reward identity in the generated Wizard config so
+        # resolved_config.yaml and the physics-side evaluator cannot diverge.
+        reward_options_path = (
+            "runtime.humanoid.controller.options"
+            if reference_mode
+            else "runtime.humanoid.registration_options"
+        )
+        argv.extend(
+            (
+                f"+{reward_options_path}.reward_profile_id="
                 f"{json.dumps(config.humanoid.reward_profile_id)}",
-                "+runtime.humanoid.registration_options.route_center_soft_m="
+                f"+{reward_options_path}.route_center_soft_m="
                 f"{json.dumps(str(config.humanoid.route_center_soft_m))}",
-                "+runtime.humanoid.registration_options.route_progress_credit_m="
+                f"+{reward_options_path}.route_progress_credit_m="
                 f"{json.dumps(str(config.humanoid.route_progress_credit_m))}",
-                "+runtime.humanoid.registration_options.route_corridor_half_width_m="
+                f"+{reward_options_path}.route_corridor_half_width_m="
                 f"{json.dumps(str(config.humanoid.route_corridor_half_width_m))}",
             )
         )
-    argv.extend(shlex.split(wizard_args.extra_overrides))
+        if config.humanoid.expected_scene_fingerprints:
+            fingerprint_json = json.dumps(
+                config.humanoid.expected_scene_fingerprints,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            argv.append(
+                "defines.humanoid_scene_fingerprints_json="
+                + json.dumps(fingerprint_json)
+            )
+        if reference_mode:
+            assert config.humanoid.grail_root_path is not None
+            argv.append(
+                f"defines.humanoid_grail_root={config.humanoid.grail_root_path}"
+            )
+    extra_overrides = shlex.split(wizard_args.extra_overrides)
+    if reference_mode:
+        _reject_motion_reference_reserved_overrides(extra_overrides)
+    argv.extend(extra_overrides)
+    if reference_mode:
+        # The motion-reference wire contract advances the trusted controller at
+        # 20 ms inside each host-authored outer policy step. Derive its terminal
+        # horizon from the outer rollout horizon so the two cannot drift.
+        controller_ticks_per_policy_step, remainder_us = divmod(
+            wizard_args.control_timestep_us,
+            20_000,
+        )
+        if remainder_us:
+            raise ValueError(
+                "motion_reference control_timestep_us must contain an integral "
+                "number of 20000us controller ticks"
+            )
+        max_control_ticks = wizard_args.n_sim_steps * controller_ticks_per_policy_step
+        argv.append(
+            "runtime.humanoid.controller.options.max_control_ticks="
+            + json.dumps(str(max_control_ticks))
+        )
     argv.append(f"wizard.log_dir={alpasim_run_dir}")
     if dataset.scene_ids is not None:
         argv.append(f"scenes.scene_ids={json.dumps(list(dataset.scene_ids))}")
@@ -188,12 +270,16 @@ def wait_for_runtime_ready(
     Returns:
         The host and port that should be published to rollout workers.
     """
-    logging.info("Waiting for AlpaSim RuntimeService endpoint at %s", runtime_server_path)
+    logging.info(
+        "Waiting for AlpaSim RuntimeService endpoint at %s", runtime_server_path
+    )
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         return_code = wizard_process.poll()
         if return_code is not None:
-            raise RuntimeError(f"AlpaSim Wizard exited before readiness with code {return_code}")
+            raise RuntimeError(
+                f"AlpaSim Wizard exited before readiness with code {return_code}"
+            )
 
         endpoint = _read_runtime_endpoint(runtime_server_path)
         if endpoint is not None:
@@ -211,7 +297,9 @@ def wait_for_runtime_ready(
 
         time.sleep(1.0)
 
-    raise TimeoutError(f"Timed out waiting for AlpaSim RuntimeService at {runtime_server_path}")
+    raise TimeoutError(
+        f"Timed out waiting for AlpaSim RuntimeService at {runtime_server_path}"
+    )
 
 
 def _read_runtime_endpoint(runtime_server_path: Path) -> tuple[str, int] | None:

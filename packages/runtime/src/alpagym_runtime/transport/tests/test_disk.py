@@ -31,7 +31,9 @@ def _make_replay_data(payload: dict[str, object] | None = None) -> PolicyReplayD
         model_family="alpamayo_r1",
         action_selection=ActionSelection(set_ix=0, sample_ix=1),
         old_logprob=torch.tensor(-0.25, dtype=torch.float32),
-        payload=payload if payload is not None else {"scene_id": "scene_001", "step": 7},
+        payload=payload
+        if payload is not None
+        else {"scene_id": "scene_001", "step": 7},
     )
 
 
@@ -58,7 +60,9 @@ def _make_full_episode_output() -> EpisodeOutput:
         chosen_dt_us=torch.tensor([0, 100_000, 200_000], dtype=torch.int64),
         chosen_logprob=torch.tensor([-0.5], dtype=torch.float32),
         replay_data=_make_replay_data(),
-        all_pred_xyz=torch.tensor([[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]], dtype=torch.float32),
+        all_pred_xyz=torch.tensor(
+            [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]], dtype=torch.float32
+        ),
         all_pred_quat=torch.tensor(
             [[[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]], dtype=torch.float32
         ),
@@ -69,6 +73,7 @@ def _make_full_episode_output() -> EpisodeOutput:
         session_uuid="session_001",
         num_steps=1,
         policy_outputs=(policy_output,),
+        rollout_seed=(1 << 64) - 1,
         executed_ego_trajectory=Trajectory(
             poses=(
                 EgoPose(
@@ -135,11 +140,15 @@ def _assert_policy_output_equal(actual: PolicyOutput, expected: PolicyOutput) ->
         assert actual.replay_data is not None
         assert actual.replay_data.model_family == expected.replay_data.model_family
         assert actual.replay_data.payload_schema == expected.replay_data.payload_schema
-        assert actual.replay_data.action_selection == expected.replay_data.action_selection
+        assert (
+            actual.replay_data.action_selection == expected.replay_data.action_selection
+        )
         assert actual.replay_data.payload == expected.replay_data.payload
         assert actual.replay_data.old_logprob is not None
         assert expected.replay_data.old_logprob is not None
-        assert torch.equal(actual.replay_data.old_logprob, expected.replay_data.old_logprob)
+        assert torch.equal(
+            actual.replay_data.old_logprob, expected.replay_data.old_logprob
+        )
     assert actual.model_extra == expected.model_extra
 
 
@@ -167,23 +176,34 @@ def test_rollout_artifact_round_trips_full_episode_output(tmp_path: Path) -> Non
     assert loaded.scene_id == episode.scene_id
     assert loaded.session_uuid == episode.session_uuid
     assert loaded.num_steps == episode.num_steps
+    assert loaded.rollout_seed == (1 << 64) - 1
+    assert (
+        json.loads(target_path.read_text(encoding="utf-8"))["rollout_seed"]
+        == (1 << 64) - 1
+    )
     assert loaded.is_valid == episode.is_valid
     assert loaded.route_waypoints == episode.route_waypoints
     assert loaded.executed_ego_trajectory == episode.executed_ego_trajectory
     assert loaded.metrics == episode.metrics
     assert loaded.reward == episode.reward
     assert len(loaded.policy_outputs) == len(episode.policy_outputs)
-    for actual_output, expected_output in zip(loaded.policy_outputs, episode.policy_outputs):
+    for actual_output, expected_output in zip(
+        loaded.policy_outputs, episode.policy_outputs
+    ):
         _assert_policy_output_equal(actual_output, expected_output)
 
 
 def test_write_episode_json_handles_tensor_replay_payload(tmp_path: Path) -> None:
     """Trace-mode payloads serialize to JSON-safe lists."""
-    source_logprobs = torch.tensor([[-0.1, -0.2]], dtype=torch.float32, requires_grad=True)
+    source_logprobs = torch.tensor(
+        [[-0.1, -0.2]], dtype=torch.float32, requires_grad=True
+    )
     non_leaf_logprobs = source_logprobs * 1.0
     model_input = ModelInput(
         ego_history_xyz=torch.zeros((1, 2, 3), dtype=torch.float32),
-        ego_history_rot=torch.eye(3, dtype=torch.float32).reshape(1, 1, 3, 3).expand(1, 2, 3, 3),
+        ego_history_rot=torch.eye(3, dtype=torch.float32)
+        .reshape(1, 1, 3, 3)
+        .expand(1, 2, 3, 3),
         camera_frames=torch.zeros((0, 3, 1, 1), dtype=torch.uint8),
         camera_indices=torch.zeros((0,), dtype=torch.int64),
         relative_timestamps=torch.zeros((0,), dtype=torch.int64),
@@ -225,7 +245,9 @@ def test_write_episode_json_handles_tensor_replay_payload(tmp_path: Path) -> Non
     assert "cot_tensor" in payload
 
 
-def test_disk_round_trip_restores_model_input_uint8_via_from_payload(tmp_path: Path) -> None:
+def test_disk_round_trip_restores_model_input_uint8_via_from_payload(
+    tmp_path: Path,
+) -> None:
     """JSON disk drops tensor dtype to lists; ``ModelInput.from_payload`` restores it.
 
     The disk transport flattens tensor leaves to plain lists (dtype dropped). The
@@ -236,7 +258,9 @@ def test_disk_round_trip_restores_model_input_uint8_via_from_payload(tmp_path: P
     """
     model_input = ModelInput(
         ego_history_xyz=torch.zeros((1, 2, 3), dtype=torch.float32),
-        ego_history_rot=torch.eye(3, dtype=torch.float32).reshape(1, 1, 3, 3).expand(1, 2, 3, 3),
+        ego_history_rot=torch.eye(3, dtype=torch.float32)
+        .reshape(1, 1, 3, 3)
+        .expand(1, 2, 3, 3),
         camera_frames=torch.ones((2, 3, 4, 5), dtype=torch.uint8),
         camera_indices=torch.tensor([0, 1], dtype=torch.int64),
         relative_timestamps=torch.tensor([0, 1], dtype=torch.int64),
@@ -270,11 +294,15 @@ def test_disk_round_trip_restores_model_input_uint8_via_from_payload(tmp_path: P
     assert restored.camera_indices.dtype == torch.int64
 
 
-def test_replay_data_round_trips_as_typed_envelope_with_json_payload(tmp_path: Path) -> None:
+def test_replay_data_round_trips_as_typed_envelope_with_json_payload(
+    tmp_path: Path,
+) -> None:
     """`replay_data` reads back typed while payload leaves remain JSON values."""
     model_input = ModelInput(
         ego_history_xyz=torch.zeros((1, 2, 3), dtype=torch.float32),
-        ego_history_rot=torch.eye(3, dtype=torch.float32).reshape(1, 1, 3, 3).expand(1, 2, 3, 3),
+        ego_history_rot=torch.eye(3, dtype=torch.float32)
+        .reshape(1, 1, 3, 3)
+        .expand(1, 2, 3, 3),
         camera_frames=torch.zeros((0, 3, 1, 1), dtype=torch.uint8),
         camera_indices=torch.zeros((0,), dtype=torch.int64),
         relative_timestamps=torch.zeros((0,), dtype=torch.int64),
@@ -322,7 +350,9 @@ def test_replay_data_round_trips_as_typed_envelope_with_json_payload(tmp_path: P
     rehydrated_model_input = actual_policy.replay_data.payload["model_input"]
     assert isinstance(rehydrated_model_input, dict)
     assert isinstance(rehydrated_model_input["ego_history_xyz"], list)
-    assert rehydrated_model_input["ego_history_xyz"] == [[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]]
+    assert rehydrated_model_input["ego_history_xyz"] == [
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    ]
 
     rehydrated_logprob = actual_policy.replay_data.payload["per_traj_logprob"]
     assert isinstance(rehydrated_logprob, list)
@@ -361,6 +391,7 @@ def test_rollout_artifact_round_trips_minimal_episode_output(tmp_path: Path) -> 
     assert loaded.scene_id == "scene_minimal"
     assert loaded.session_uuid == "session_minimal"
     assert loaded.num_steps == 1
+    assert loaded.rollout_seed is None
     assert loaded.is_valid is True
     assert loaded.route_waypoints == ()
     assert loaded.executed_ego_trajectory == Trajectory(poses=())

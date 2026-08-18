@@ -51,7 +51,9 @@ class PerfConfig:
     def __post_init__(self) -> None:
         """Reject non-positive counts and durations before any run work starts."""
         if self.sample_every_n <= 0:
-            raise ValueError(f"perf.sample_every_n must be > 0, got {self.sample_every_n}")
+            raise ValueError(
+                f"perf.sample_every_n must be > 0, got {self.sample_every_n}"
+            )
         if self.max_samples_per_series <= 0:
             raise ValueError(
                 f"perf.max_samples_per_series must be > 0, got {self.max_samples_per_series}"
@@ -106,7 +108,9 @@ class SamplingParamsConfig:
     num_traj_samples: int
     num_traj_sets: int
     max_generation_length: int | None = None
-    diffusion_kwargs: DiffusionSamplingConfig = field(default_factory=DiffusionSamplingConfig)
+    diffusion_kwargs: DiffusionSamplingConfig = field(
+        default_factory=DiffusionSamplingConfig
+    )
     # Seed stochastic sampling, run per-row forwards, and enable deterministic runtime settings.
     force_determinism: bool = False
     # Re-run the forward when it returns a non-finite trajectory. The AR1.5 VLM
@@ -138,6 +142,13 @@ class LoggingLevel(StrEnum):
     WARNING = "WARNING"
     ERROR = "ERROR"
     CRITICAL = "CRITICAL"
+
+
+class HumanoidExecutionProfile(StrEnum):
+    """Wire/control ABI selected for a humanoid AlpaSim rollout."""
+
+    direct_action = "direct_action"
+    motion_reference = "motion_reference"
 
 
 @dataclass
@@ -215,6 +226,8 @@ class CosmosRLTrainPolicyConfig:
     ppo_normalize_advantages: bool = True
     ppo_gamma: float = 0.99
     ppo_gae_lambda: float = 0.95
+    ppo_min_action_std: float = 0.02
+    ppo_max_action_std: float = 2.0
     # Number of flattened transition rows per PPO optimizer update. This is
     # deliberately independent from Cosmos's rollout/shard ``mini_batch``.
     step_mini_batch: int | None = None
@@ -342,7 +355,9 @@ class RewardTermConfig:
                 raise ValueError("RewardTermConfig.kind='metric' requires metric_name")
         elif self.kind == "distance_to_gt":
             if self.metric_name is not None:
-                raise ValueError("RewardTermConfig.kind='distance_to_gt' must not set metric_name")
+                raise ValueError(
+                    "RewardTermConfig.kind='distance_to_gt' must not set metric_name"
+                )
         else:
             raise ValueError(f"Unknown RewardTermConfig.kind: {self.kind!r}")
 
@@ -405,6 +420,18 @@ class HumanoidAlpaSimConfig:
     repo_path: str
     scene_store_path: str
     scenario_ids_by_scene: dict[str, str]
+    execution_profile: HumanoidExecutionProfile = HumanoidExecutionProfile.direct_action
+    # Required by the fixed GRAIL/SONIC controller image in reference mode.
+    grail_root_path: str | None = None
+    # Host-frozen identity snapshot.  Authored configs leave this empty; run
+    # preparation fills it from every selected SceneStore manifest before the
+    # resolved config is written.
+    expected_scene_fingerprints: dict[str, str] = field(default_factory=dict)
+    # Optional deterministic rollout panel.  When set, fresh rollout jobs use
+    # ``rollout_seed_base + creation_ordinal``; retries keep the original job's
+    # seed.  ``None`` preserves the legacy session-UUID hash behavior used by
+    # stochastic training.
+    rollout_seed_base: int | None = None
     num_envs: int = 1
     service_image: str = "alpasim-humanoid:local"
     reward_profile_id: str = "direct_v9_shaped.v1"
@@ -416,6 +443,36 @@ class HumanoidAlpaSimConfig:
         """Reject ambiguous scene routing and invalid centerline thresholds."""
         if not self.repo_path or not self.scene_store_path:
             raise ValueError("HumanoidAlpaSimConfig paths must be non-empty")
+        if self.rollout_seed_base is not None and (
+            isinstance(self.rollout_seed_base, bool)
+            or not isinstance(self.rollout_seed_base, int)
+            or not 0 <= self.rollout_seed_base <= (1 << 64) - 1
+        ):
+            raise ValueError(
+                "HumanoidAlpaSimConfig.rollout_seed_base must be a uint64 or null"
+            )
+        if (
+            self.execution_profile is HumanoidExecutionProfile.motion_reference
+            and not self.grail_root_path
+        ):
+            raise ValueError(
+                "HumanoidAlpaSimConfig.grail_root_path is required for motion_reference"
+            )
+        if self.execution_profile is HumanoidExecutionProfile.motion_reference:
+            if self.reward_profile_id not in (
+                "reference_route_centered.v1",
+                "reference_route_centered.v2",
+                "reference_route_centered.v3",
+            ):
+                raise ValueError(
+                    "motion_reference reward_profile_id must be one of "
+                    "reference_route_centered.v1, reference_route_centered.v2, or "
+                    "reference_route_centered.v3"
+                )
+        elif self.reward_profile_id != "direct_v9_shaped.v1":
+            raise ValueError(
+                "direct_action requires reward_profile_id='direct_v9_shaped.v1'"
+            )
         if not self.scenario_ids_by_scene or any(
             not scene_id or not scenario_id
             for scene_id, scenario_id in self.scenario_ids_by_scene.items()
@@ -435,9 +492,9 @@ class HumanoidAlpaSimConfig:
         )
         if not all(math.isfinite(value) for value in thresholds):
             raise ValueError("Humanoid route thresholds must be finite")
-        if not 0 <= thresholds[0] < thresholds[1] < thresholds[2]:
+        if not 0 < thresholds[0] < thresholds[1] < thresholds[2]:
             raise ValueError(
-                "Humanoid route thresholds must satisfy 0 <= center_soft < "
+                "Humanoid route thresholds must satisfy 0 < center_soft < "
                 "progress_credit < corridor_half_width"
             )
 
@@ -465,8 +522,12 @@ class AlpaSimConfig:
         repo_path is set, so rejecting it would break `repo_path=` overrides on those
         presets.
         """
-        if self.repo_path is not None and (self.repo_url is not None or self.repo_ref is not None):
-            raise ValueError("AlpaSimConfig.repo_path is mutually exclusive with repo_url/repo_ref")
+        if self.repo_path is not None and (
+            self.repo_url is not None or self.repo_ref is not None
+        ):
+            raise ValueError(
+                "AlpaSimConfig.repo_path is mutually exclusive with repo_url/repo_ref"
+            )
         if self.humanoid is not None and self.simulation_domain != "humanoid":
             raise ValueError(
                 "alpasim.humanoid requires alpasim.simulation_domain='humanoid'"
@@ -680,7 +741,9 @@ def load_run_config(path: str | Path) -> RunConfig:
     return merge_run_config_schema(RunConfig, raw_data)
 
 
-def merge_run_config_schema(schema_type: type[RunConfigT], raw_data: object) -> RunConfigT:
+def merge_run_config_schema(
+    schema_type: type[RunConfigT], raw_data: object
+) -> RunConfigT:
     """Merge raw run config data into a typed schema."""
     raw_config = OmegaConf.create(cast(Any, raw_data))
     raw_config.execution.slurm.topology = OmegaConf.merge(

@@ -99,16 +99,26 @@ def _policy_output_to_dict(output: PolicyOutput) -> dict[str, Any]:
         "chosen_quat": _tensor_to_list(output.chosen_quat),
         "chosen_dt_us": _tensor_to_list(output.chosen_dt_us),
         "chosen_logprob": (
-            _tensor_to_list(output.chosen_logprob) if output.chosen_logprob is not None else None
+            _tensor_to_list(output.chosen_logprob)
+            if output.chosen_logprob is not None
+            else None
         ),
-        "replay_data": output.replay_data.to_dict() if output.replay_data is not None else None,
+        "replay_data": output.replay_data.to_dict()
+        if output.replay_data is not None
+        else None,
         "all_pred_xyz": (
-            _tensor_to_list(output.all_pred_xyz) if output.all_pred_xyz is not None else None
+            _tensor_to_list(output.all_pred_xyz)
+            if output.all_pred_xyz is not None
+            else None
         ),
         "all_pred_quat": (
-            _tensor_to_list(output.all_pred_quat) if output.all_pred_quat is not None else None
+            _tensor_to_list(output.all_pred_quat)
+            if output.all_pred_quat is not None
+            else None
         ),
-        "model_extra": dict(output.model_extra) if output.model_extra is not None else None,
+        "model_extra": dict(output.model_extra)
+        if output.model_extra is not None
+        else None,
     }
 
 
@@ -128,12 +138,18 @@ def _policy_output_from_dict(payload: Mapping[str, Any]) -> PolicyOutput:
             if chosen_logprob is not None
             else None
         ),
-        replay_data=parse_policy_replay_data(replay_data) if replay_data is not None else None,
+        replay_data=parse_policy_replay_data(replay_data)
+        if replay_data is not None
+        else None,
         all_pred_xyz=(
-            torch.tensor(all_pred_xyz, dtype=torch.float32) if all_pred_xyz is not None else None
+            torch.tensor(all_pred_xyz, dtype=torch.float32)
+            if all_pred_xyz is not None
+            else None
         ),
         all_pred_quat=(
-            torch.tensor(all_pred_quat, dtype=torch.float32) if all_pred_quat is not None else None
+            torch.tensor(all_pred_quat, dtype=torch.float32)
+            if all_pred_quat is not None
+            else None
         ),
         model_extra=dict(model_extra) if model_extra is not None else None,
     )
@@ -141,12 +157,15 @@ def _policy_output_from_dict(payload: Mapping[str, Any]) -> PolicyOutput:
 
 def _episode_to_artifact_dict(episode: EpisodeOutput) -> dict[str, Any]:
     """Return the JSON-serializable artifact payload for one episode."""
-    policy_outputs = [_policy_output_to_dict(output) for output in episode.policy_outputs]
+    policy_outputs = [
+        _policy_output_to_dict(output) for output in episode.policy_outputs
+    ]
     executed_ego_trajectory = [
         _ego_pose_to_dict(pose) for pose in episode.executed_ego_trajectory.poses
     ]
     route_waypoints = [
-        {"x": waypoint.x, "y": waypoint.y, "z": waypoint.z} for waypoint in episode.route_waypoints
+        {"x": waypoint.x, "y": waypoint.y, "z": waypoint.z}
+        for waypoint in episode.route_waypoints
     ]
 
     metrics = None
@@ -167,6 +186,7 @@ def _episode_to_artifact_dict(episode: EpisodeOutput) -> dict[str, Any]:
         "scene_id": episode.scene_id,
         "session_uuid": episode.session_uuid,
         "num_steps": episode.num_steps,
+        "rollout_seed": episode.rollout_seed,
         "policy_outputs": policy_outputs,
         "executed_ego_trajectory": executed_ego_trajectory,
         "route_waypoints": route_waypoints,
@@ -182,7 +202,9 @@ def _episode_from_artifact_dict(artifact: Mapping[str, Any]) -> EpisodeOutput:
         _policy_output_from_dict(output) for output in artifact["policy_outputs"]
     )
     executed_ego_trajectory = Trajectory(
-        poses=tuple(_ego_pose_from_dict(pose) for pose in artifact["executed_ego_trajectory"])
+        poses=tuple(
+            _ego_pose_from_dict(pose) for pose in artifact["executed_ego_trajectory"]
+        )
     )
 
     metrics = None
@@ -204,6 +226,7 @@ def _episode_from_artifact_dict(artifact: Mapping[str, Any]) -> EpisodeOutput:
         session_uuid=artifact["session_uuid"],
         num_steps=artifact["num_steps"],
         policy_outputs=policy_outputs,
+        rollout_seed=artifact.get("rollout_seed"),
         executed_ego_trajectory=executed_ego_trajectory,
         route_waypoints=tuple(
             RouteWaypoint(
