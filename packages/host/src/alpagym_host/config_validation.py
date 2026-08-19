@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-import math
 import json
+import math
 import re
 from pathlib import Path
 
@@ -23,6 +23,7 @@ from alpagym_host.config import (
     TransportKind,
 )
 from alpagym_host.run_artifacts import is_supported_hf_bundle_dir
+from alpagym_host.humanoid_scene_identity import validate_frozen_policy_model_bundle
 from alpagym_host.run_topology import build_slurm_topology
 from alpagym_host.slurm import validate_slurm_config
 
@@ -45,6 +46,7 @@ def validate_run_config(
         dataset=config.dataset,
     )
     _validate_humanoid_config(config)
+    validate_frozen_policy_model_bundle(config)
     _validate_training_policy_config(config)
     _validate_cosmos_grpo_batch_geometry(config.cosmos)
     _validate_transport_config(config)
@@ -188,10 +190,36 @@ def _validate_humanoid_config(config: RunConfig) -> None:
                     f"motion_reference policy bundle {key} must come from "
                     "alpasim.humanoid"
                 )
-        if config.alpasim.wizard_args.control_timestep_us != 100_000:
-            raise ValueError("motion_reference requires a 100000us outer policy period")
-        if config.policy.model.step_dt_us != 100_000:
-            raise ValueError("motion_reference policy.model.step_dt_us must be 100000")
+        planner_mode = str(
+            config.policy.model.bundle_config.get("planner_mode", "shadow_rollout")
+        )
+        if planner_mode != "shadow_rollout":
+            raise ValueError(
+                "VideoMimic fake plans require planner_mode='shadow_rollout' so "
+                "all H70 actions come from the current policy"
+            )
+        if any(
+            key in config.policy.model.bundle_config
+            for key in ("completion_policy_path", "completion_policy_sha256")
+        ):
+            raise ValueError(
+                "VideoMimic fake plans must not configure a frozen completion policy"
+            )
+        if humanoid.reference_frame_count != 70:
+            raise ValueError(
+                f"planner_mode={planner_mode!r} requires motion-reference H=70"
+            )
+        outer_period_us = int(config.alpasim.wizard_args.control_timestep_us)
+        if outer_period_us != 500_000:
+            raise ValueError(
+                "motion_reference outer policy period is unsupported for "
+                f"planner_mode={planner_mode!r}; expected 500000us"
+            )
+        if config.policy.model.step_dt_us != outer_period_us:
+            raise ValueError(
+                "motion_reference policy.model.step_dt_us must equal the "
+                "AlpaSim outer policy period"
+            )
         if config.alpasim.wizard_args.force_gt_duration_us != 0:
             raise ValueError("motion_reference requires force_gt_duration_us=0")
         if config.alpasim.wizard_args.n_sim_steps != config.expected_valid_steps:
@@ -387,6 +415,27 @@ def _validate_training_policy_config(config: RunConfig) -> None:
             "entrypoint."
         )
     train_policy = config.cosmos.train.train_policy
+    if train_policy.step_mini_batch is not None and (
+        isinstance(train_policy.step_mini_batch, bool)
+        or train_policy.step_mini_batch <= 0
+    ):
+        raise ValueError("PPO step_mini_batch must be a positive integer when set")
+    if (
+        not math.isfinite(train_policy.ppo_value_loss_coef)
+        or train_policy.ppo_value_loss_coef < 0.0
+    ):
+        raise ValueError("PPO ppo_value_loss_coef must be finite and non-negative")
+    if train_policy.ppo_value_clip_range is not None and (
+        not math.isfinite(train_policy.ppo_value_clip_range)
+        or train_policy.ppo_value_clip_range <= 0.0
+    ):
+        raise ValueError(
+            "PPO ppo_value_clip_range must be finite and positive when set"
+        )
+    if not 0.0 <= train_policy.ppo_gamma <= 1.0:
+        raise ValueError("PPO ppo_gamma must be in [0, 1]")
+    if not 0.0 <= train_policy.ppo_gae_lambda <= 1.0:
+        raise ValueError("PPO ppo_gae_lambda must be in [0, 1]")
     if not (
         math.isfinite(train_policy.ppo_min_action_std)
         and math.isfinite(train_policy.ppo_max_action_std)

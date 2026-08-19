@@ -24,6 +24,7 @@ from alpagym_runtime.alpasim.driver_server import EgodriverServer
 from alpagym_runtime.alpasim.humanoid_replay import attach_humanoid_transitions
 from alpagym_runtime.alpasim.humanoid_policy_server import HumanoidPolicyServer
 from alpagym_runtime.alpasim.proto_conversion import build_simulation_request_proto
+from alpagym_runtime.inference.inference_engine import InferenceModelLease
 from alpagym_runtime.perf.instrument.scope import measure_perf, timed_scope
 from alpagym_runtime.rewards.compute import compute_reward
 from alpagym_runtime.types import EpisodeMetrics, EpisodeOutput, RewardResult
@@ -45,6 +46,7 @@ class SharedPayloadState:
     future: Future[list[EpisodeOutput]]
     retries_left: int
     behavior_policy_version: int = 0
+    model_lease: InferenceModelLease | None = None
     collected: list[EpisodeOutput] = field(default_factory=list)
     permanently_failed: bool = False
     future_resolved: bool = False
@@ -203,6 +205,7 @@ class StreamingRolloutWorker:
         payload: RLPayload,
         *,
         behavior_policy_version: int | None = None,
+        model_lease: InferenceModelLease | None = None,
     ) -> SharedPayloadState:
         """Return the running state for `payload`; dispatch at most once per `prompt_idx`.
 
@@ -228,6 +231,10 @@ class StreamingRolloutWorker:
                     raise ValueError(
                         "duplicate payload submission changed behavior_policy_version"
                     )
+                if model_lease is not None and model_lease is not existing.model_lease:
+                    raise ValueError(
+                        "duplicate payload submission changed its immutable model lease"
+                    )
                 return existing
 
             # Otherwise, create a new state and enqueue the rollout jobs.
@@ -242,6 +249,16 @@ class StreamingRolloutWorker:
                     raise ValueError(
                         "humanoid payload submission requires a scenario resolver"
                     )
+                if (
+                    model_lease is not None
+                    and model_lease.behavior_policy_version != behavior_policy_version
+                ):
+                    raise ValueError(
+                        "humanoid payload model lease version differs from its "
+                        "behavior_policy_version"
+                    )
+            elif model_lease is not None:
+                raise ValueError("AV payloads must not carry humanoid model leases")
             frozen_version = (
                 0 if behavior_policy_version is None else behavior_policy_version
             )
@@ -262,6 +279,7 @@ class StreamingRolloutWorker:
                 future=Future(),
                 retries_left=self._max_scene_retries,
                 behavior_policy_version=frozen_version,
+                model_lease=model_lease,
             )
             self._active_payload_states[payload.prompt_idx] = payload_state
             for _ in range(self._rollouts_per_payload):
@@ -276,6 +294,7 @@ class StreamingRolloutWorker:
                     self._humanoid_policy_server.servicer.reserve_session(
                         session_uuid,
                         frozen_version,
+                        model_lease,
                     )
                 self._rollout_job_queue.put(
                     (
@@ -295,7 +314,10 @@ class StreamingRolloutWorker:
         """Stop accepting payloads, resolve every unresolved future with `[]`, dismiss workers.
 
         Workers in mid-`simulate()` finish their RPC and exit on the next
-        queue read; daemon threads do not block process exit.
+        queue read; daemon threads do not block process exit. Humanoid sessions
+        that are still queued have never started, so their reservations are
+        released while draining the queue. In-flight sessions are deliberately
+        left alone and clean themselves up when their RPC finishes.
         """
         with self._lock:
             self._closed = True
@@ -310,9 +332,11 @@ class StreamingRolloutWorker:
             self._active_payload_states.clear()
         while True:
             try:
-                self._rollout_job_queue.get_nowait()
+                _, _, rollout_job = self._rollout_job_queue.get_nowait()
             except queue.Empty:
                 break
+            if rollout_job is not None:
+                self._discard_humanoid_session(rollout_job.session_uuid)
         for _ in self._rollout_workers:
             # priority 2 = shutdown sentinel; the lowest-priority.
             self._rollout_job_queue.put((2, next(self._rollout_job_seq), None))
@@ -328,6 +352,10 @@ class StreamingRolloutWorker:
             if rollout_job is None:
                 return
             if rollout_job.shared_payload_state.permanently_failed:
+                # The job was reserved when it was enqueued but never started.
+                # A sibling may have exhausted the shared retry budget while it
+                # was waiting, so release that now-unreachable reservation.
+                self._discard_humanoid_session(rollout_job.session_uuid)
                 continue
             self._run_rollout(rollout_job)
 
@@ -491,6 +519,10 @@ class StreamingRolloutWorker:
         should_drop = False
         with self._lock:
             if payload_state.permanently_failed:
+                # This job was already in flight when a sibling failed
+                # permanently (or shutdown began). It owns its session until
+                # this failure callback, so only now is it safe to discard it.
+                self._discard_humanoid_session(rollout_job.session_uuid)
                 return
             payload_state.retries_left -= 1
             if payload_state.retries_left >= 0:
@@ -502,6 +534,7 @@ class StreamingRolloutWorker:
                     self._humanoid_policy_server.servicer.reserve_session(
                         retry_session_uuid,
                         payload_state.behavior_policy_version,
+                        payload_state.model_lease,
                     )
                 self._rollout_job_queue.put(
                     (
@@ -544,3 +577,8 @@ class StreamingRolloutWorker:
                 )
         if should_drop:
             payload_state.future.set_result([])
+
+    def _discard_humanoid_session(self, session_uuid: str) -> None:
+        """Release one never-started or failed humanoid session reservation."""
+        if self._humanoid_policy_server is not None:
+            self._humanoid_policy_server.servicer.discard_session(session_uuid)

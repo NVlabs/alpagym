@@ -26,7 +26,9 @@ from alpagym_runtime.alpasim.humanoid_policy_server import (  # noqa: E402
     HumanoidPolicyGrpcServicer,
     HumanoidPolicyStepOutput,
     ZeroHumanoidPolicy,
+    _validate_motion_reference_session,
 )
+from alpagym_runtime.inference.inference_engine import InferenceModelLease  # noqa: E402
 from alpagym_runtime.replay import ActionSelection, PolicyReplayData  # noqa: E402
 from alpagym_runtime.types import (  # noqa: E402
     EgoPose,
@@ -552,6 +554,9 @@ def test_humanoid_policy_server_saves_camera_images_from_policy_options(
 class _MotionPlannerPolicy:
     """Deterministic reference planner used to exercise the full RPC lifecycle."""
 
+    def __init__(self, frame_count: int = 70) -> None:
+        self.frame_count = frame_count
+
     def step(self, policy_inputs, *, sample_actions: bool = True):
         outputs = []
         for item in policy_inputs:
@@ -574,7 +579,7 @@ class _MotionPlannerPolicy:
                     root_position=root.clone(),
                     root_quaternion_wxyz=item.qpos[3:7].clone(),
                 )
-                for index in range(50)
+                for index in range(self.frame_count)
             )
             reference = HumanoidMotionReference(
                 reference_id=100 + item.decision_id,
@@ -636,9 +641,13 @@ def _motion_feedback(
     digest: str,
     start_timestamp_us: int,
     first_control_step: int,
+    duration: int = 25,
+    applied_digest: str | None = None,
+    terminated: bool = False,
+    truncated: bool = False,
 ) -> SimpleNamespace:
     ticks = []
-    for index in range(5):
+    for index in range(duration):
         timestamp_us = start_timestamp_us + index * 20_000
         ticks.append(
             SimpleNamespace(
@@ -647,11 +656,11 @@ def _motion_feedback(
                 state=_motion_state(timestamp_us),
                 active_reference_id=reference_id,
                 active_reference_sha256=digest,
-                applied_reference_sha256=digest,
+                applied_reference_sha256=applied_digest or digest,
                 root_z_alignment_offset_m=0.125,
                 reward=0.1,
-                terminated=False,
-                truncated=False,
+                terminated=terminated and index == duration - 1,
+                truncated=truncated and index == duration - 1,
                 metrics={},
                 control_episode_step=first_control_step + index,
             )
@@ -683,104 +692,6 @@ def _motion_act_request(
             feedback_traces=feedback_traces,
         ),
     )
-
-
-def test_motion_reference_policy_rpc_joins_feedback_and_finalizes_without_extra_plan() -> (
-    None
-):
-    servicer = HumanoidPolicyGrpcServicer(
-        policy_factory=lambda session_uuid, request: _MotionPlannerPolicy()
-    )
-    servicer.reserve_session("motion-session", behavior_policy_version=11)
-    servicer.start_session(
-        SimpleNamespace(
-            session_uuid="motion-session",
-            random_seed=7,
-            action_size=0,
-            execution_mode=2,
-            joint_names=list(MOTION_REFERENCE_JOINT_NAMES),
-            observation_schema="videomimic_motion_planner_state.v1",
-            action_schema="g1_motion_reference_29d_50hz_h50.v1",
-            observation_terms=[SimpleNamespace(name="navigation_position_xy", size=2)],
-            reference_spec=SimpleNamespace(
-                schema="g1_motion_reference_29d_50hz_h50.v1",
-                joint_names=list(MOTION_REFERENCE_JOINT_NAMES),
-                frame_count=50,
-                sample_period_us=20_000,
-                control_ticks_per_policy_step=5,
-            ),
-            policy_options={},
-            attempt_id="attempt",
-            scene_id="hq_stairs",
-            scenario_id="ascend",
-        ),
-        context=None,
-    )
-
-    initial = servicer.act(
-        _motion_act_request(
-            decision_id=0,
-            timestamp_us=0,
-            request_kind=2,
-            feedback_traces=[],
-        ),
-        context=None,
-    )
-    assert len(initial.plan_updates) == 1
-    assert len(initial.actions) == 0
-    first = initial.plan_updates[0]
-
-    replanned = servicer.act(
-        _motion_act_request(
-            decision_id=1,
-            timestamp_us=100_000,
-            request_kind=3,
-            feedback_traces=[
-                _motion_feedback(
-                    source_decision_id=0,
-                    reference_id=first.reference_id,
-                    digest=first.reference_sha256,
-                    start_timestamp_us=20_000,
-                    first_control_step=1,
-                )
-            ],
-        ),
-        context=None,
-    )
-    assert len(replanned.plan_updates) == 1
-    second = replanned.plan_updates[0]
-
-    finalized = servicer.act(
-        _motion_act_request(
-            decision_id=2,
-            timestamp_us=200_000,
-            request_kind=4,
-            feedback_traces=[
-                _motion_feedback(
-                    source_decision_id=1,
-                    reference_id=second.reference_id,
-                    digest=second.reference_sha256,
-                    start_timestamp_us=120_000,
-                    first_control_step=6,
-                )
-            ],
-            bootstrap_env_ids=[0],
-        ),
-        context=None,
-    )
-    assert len(finalized.plan_updates) == 0
-    assert finalized.value_estimates[0].value == pytest.approx(3.0)
-
-    servicer.close_session(
-        SimpleNamespace(session_uuid="motion-session"),
-        context=None,
-    )
-    record = servicer.pop_session_record("motion-session")
-    assert len(record.outputs) == 2
-    assert record.final_bootstrap_values == {0: 3.0}
-    assert "feedback_trace" in record.outputs[0].replay_data.payload
-    assert "feedback_trace" in record.outputs[1].replay_data.payload
-    assert record.outputs[1].replay_data.payload["outer_truncated"] is True
 
 
 def test_session_record_step_appends_outputs_and_dedupes_executed_poses() -> None:
@@ -862,3 +773,252 @@ def test_close_session_freezes_session_record_for_runner_to_drain() -> None:
             servicer.pop_session_record("session-1")
     finally:
         server.stop()
+
+
+@pytest.mark.parametrize("control_ticks", (25,))
+def test_h70_motion_reference_abi_accepts_valid_control_prefix(
+    control_ticks: int,
+) -> None:
+    """The generic H70 wire requires the production K25 consumer."""
+    request = SimpleNamespace(
+        action_schema="g1_motion_reference_29d_50hz_h70.v1",
+        joint_names=list(MOTION_REFERENCE_JOINT_NAMES),
+        reference_spec=SimpleNamespace(
+            schema="g1_motion_reference_29d_50hz_h70.v1",
+            joint_names=list(MOTION_REFERENCE_JOINT_NAMES),
+            frame_count=70,
+            sample_period_us=20_000,
+            control_ticks_per_policy_step=control_ticks,
+        ),
+    )
+
+    joint_names, frame_count, sample_period_us, control_ticks = (
+        _validate_motion_reference_session(request)
+    )
+
+    assert joint_names == MOTION_REFERENCE_JOINT_NAMES
+    assert (frame_count, sample_period_us, control_ticks) == (
+        70,
+        20_000,
+        request.reference_spec.control_ticks_per_policy_step,
+    )
+
+    request.reference_spec.schema = "g1_motion_reference_29d_50hz_h50.v1"
+    with pytest.raises(ValueError, match="requires the H70"):
+        _validate_motion_reference_session(request)
+
+
+def test_humanoid_policy_session_registers_and_releases_model_lease() -> None:
+    """The gRPC session owns its immutable behavior model until close."""
+
+    class _LeaseRegistry:
+        def __init__(self) -> None:
+            self.leases: dict[str, InferenceModelLease] = {}
+            self.released: list[str] = []
+
+        def register_session_model_lease(
+            self,
+            session_uuid: str,
+            lease: InferenceModelLease,
+        ) -> None:
+            self.leases[session_uuid] = lease
+
+        def release_session_model_lease(self, session_uuid: str) -> None:
+            self.released.append(session_uuid)
+            self.leases.pop(session_uuid)
+
+    registry = _LeaseRegistry()
+    servicer = HumanoidPolicyGrpcServicer(
+        policy_factory=lambda session_uuid, request: ZeroHumanoidPolicy(
+            int(request.action_size)
+        ),
+        model_lease_registry=registry,
+    )
+    lease = InferenceModelLease(
+        behavior_policy_version=7,
+        model=torch.nn.Linear(1, 1),
+    )
+
+    servicer.reserve_session(
+        "leased-session",
+        behavior_policy_version=7,
+        model_lease=lease,
+    )
+    assert registry.leases == {"leased-session": lease}
+    servicer.start_session(
+        SimpleNamespace(
+            session_uuid="leased-session",
+            action_size=1,
+            observation_schema="test.v1",
+            observation_terms=[SimpleNamespace(name="test", size=1)],
+            policy_options={},
+        ),
+        context=None,
+    )
+    servicer.close_session(
+        SimpleNamespace(session_uuid="leased-session"),
+        context=None,
+    )
+
+    assert registry.leases == {}
+    assert registry.released == ["leased-session"]
+
+
+@pytest.mark.parametrize(
+    ("terminated", "truncated", "bootstrap_env_ids", "expected_bootstrap"),
+    (
+        (True, False, [], {}),
+        (False, True, [0], {0: 3.0}),
+    ),
+)
+def test_motion_reference_finalize_records_terminal_k_prefix_without_replan(
+    terminated: bool,
+    truncated: bool,
+    bootstrap_env_ids: list[int],
+    expected_bootstrap: dict[int, float],
+) -> None:
+    """A partial macro is retained; only truncation requests a final value."""
+    servicer = HumanoidPolicyGrpcServicer(
+        policy_factory=lambda session_uuid, request: _MotionPlannerPolicy(
+            frame_count=int(request.reference_spec.frame_count)
+        )
+    )
+    servicer.reserve_session("motion-session", behavior_policy_version=11)
+    servicer.start_session(
+        SimpleNamespace(
+            session_uuid="motion-session",
+            random_seed=7,
+            action_size=0,
+            execution_mode=2,
+            joint_names=list(MOTION_REFERENCE_JOINT_NAMES),
+            observation_schema="videomimic_motion_planner_state.v1",
+            action_schema="g1_motion_reference_29d_50hz_h70.v1",
+            observation_terms=[SimpleNamespace(name="navigation_position_xy", size=2)],
+            reference_spec=SimpleNamespace(
+                schema="g1_motion_reference_29d_50hz_h70.v1",
+                joint_names=list(MOTION_REFERENCE_JOINT_NAMES),
+                frame_count=70,
+                sample_period_us=20_000,
+                control_ticks_per_policy_step=25,
+            ),
+            policy_options={},
+            attempt_id="attempt",
+            scene_id="hq_stairs",
+            scenario_id="ascend",
+        ),
+        context=None,
+    )
+    initial = servicer.act(
+        _motion_act_request(
+            decision_id=0,
+            timestamp_us=0,
+            request_kind=2,
+            feedback_traces=[],
+        ),
+        context=None,
+    )
+    first = initial.plan_updates[0]
+    duration = 7
+    finalized = servicer.act(
+        _motion_act_request(
+            decision_id=1,
+            timestamp_us=duration * 20_000,
+            request_kind=4,
+            feedback_traces=[
+                _motion_feedback(
+                    source_decision_id=0,
+                    reference_id=first.reference_id,
+                    digest=first.reference_sha256,
+                    start_timestamp_us=20_000,
+                    first_control_step=1,
+                    duration=duration,
+                    terminated=terminated,
+                    truncated=truncated,
+                )
+            ],
+            bootstrap_env_ids=bootstrap_env_ids,
+        ),
+        context=None,
+    )
+
+    assert len(finalized.plan_updates) == 0
+    assert {
+        int(item.env_id): float(item.value) for item in finalized.value_estimates
+    } == expected_bootstrap
+
+    servicer.close_session(
+        SimpleNamespace(session_uuid="motion-session"),
+        context=None,
+    )
+    record = servicer.pop_session_record("motion-session")
+    assert len(record.outputs) == 1
+    assert record.final_bootstrap_values == expected_bootstrap
+    replay_payload = record.outputs[0].replay_data.payload
+    assert len(replay_payload["feedback_trace"]["ticks"]) == duration
+    assert bool(replay_payload.get("outer_truncated", False)) is truncated
+
+
+def test_policy_server_rejects_rewritten_applied_reference_hash() -> None:
+    """The canonical H70 wire is direct playback with exact hash identity."""
+    schema = "g1_motion_reference_29d_50hz_h70.v1"
+    frame_count = 70
+    control_ticks = 25
+    servicer = HumanoidPolicyGrpcServicer(
+        policy_factory=lambda session_uuid, request: _MotionPlannerPolicy(
+            frame_count=int(request.reference_spec.frame_count)
+        )
+    )
+    servicer.reserve_session("motion-session", behavior_policy_version=11)
+    servicer.start_session(
+        SimpleNamespace(
+            session_uuid="motion-session",
+            random_seed=7,
+            action_size=0,
+            execution_mode=2,
+            joint_names=list(MOTION_REFERENCE_JOINT_NAMES),
+            observation_schema="videomimic_motion_planner_state.v1",
+            action_schema=schema,
+            observation_terms=[SimpleNamespace(name="navigation_position_xy", size=2)],
+            reference_spec=SimpleNamespace(
+                schema=schema,
+                joint_names=list(MOTION_REFERENCE_JOINT_NAMES),
+                frame_count=frame_count,
+                sample_period_us=20_000,
+                control_ticks_per_policy_step=control_ticks,
+            ),
+            policy_options={},
+            attempt_id="attempt",
+            scene_id="hq_stairs",
+            scenario_id="ascend",
+        ),
+        context=None,
+    )
+    initial = servicer.act(
+        _motion_act_request(
+            decision_id=0,
+            timestamp_us=0,
+            request_kind=2,
+            feedback_traces=[],
+        ),
+        context=None,
+    )
+    first = initial.plan_updates[0]
+    request = _motion_act_request(
+        decision_id=1,
+        timestamp_us=control_ticks * 20_000,
+        request_kind=3,
+        feedback_traces=[
+            _motion_feedback(
+                source_decision_id=0,
+                reference_id=first.reference_id,
+                digest=first.reference_sha256,
+                applied_digest="c" * 64,
+                start_timestamp_us=20_000,
+                first_control_step=1,
+                duration=control_ticks,
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="applied_reference_sha256"):
+        servicer.act(request, context=None)
+    servicer.discard_session("motion-session")

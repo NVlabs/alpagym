@@ -28,6 +28,7 @@ from alpagym_runtime.episode_runner.streaming_worker import (  # noqa: E402
     StreamingRolloutWorker,
     _RolloutJob,
 )
+from alpagym_runtime.inference.inference_engine import InferenceModelLease  # noqa: E402
 from alpagym_runtime.replay import ActionSelection, PolicyReplayData  # noqa: E402
 from alpagym_runtime.types import EpisodeOutput, PolicyOutput, Trajectory  # noqa: E402
 
@@ -85,6 +86,8 @@ class _StubWorker(StreamingRolloutWorker):
         self._outcomes_by_uuid: dict[str, str] = dict(outcomes_by_uuid or {})
         self._call_log: list[str] = []  # list of session_uuid in dispatch order
         self._random_seed_log: list[int | None] = []
+        self._lease_reservations: list[tuple[str, int, InferenceModelLease | None]] = []
+        self._discarded_sessions: list[str] = []
         self._in_flight = 0
         self._max_in_flight = 0
         self._in_flight_lock = threading.Lock()
@@ -98,13 +101,22 @@ class _StubWorker(StreamingRolloutWorker):
 
             class _Servicer:
                 def reserve_session(
-                    self, session_uuid: str, behavior_policy_version: int
+                    self,
+                    session_uuid: str,
+                    behavior_policy_version: int,
+                    model_lease: InferenceModelLease | None = None,
                 ) -> None:
-                    del session_uuid, behavior_policy_version
+                    self_reservation = (
+                        session_uuid,
+                        behavior_policy_version,
+                        model_lease,
+                    )
+                    self_outer._lease_reservations.append(self_reservation)
 
                 def discard_session(self, session_uuid: str) -> None:
-                    del session_uuid
+                    self_outer._discarded_sessions.append(session_uuid)
 
+            self_outer = self
             humanoid_policy_server = SimpleNamespace(
                 topology_endpoint=SimpleNamespace(host="localhost", port=0),
                 servicer=_Servicer(),
@@ -500,7 +512,7 @@ def test_fixed_seed_panel_is_sequential_across_siblings_and_episodes(
 
 
 def test_fixed_seed_retry_reuses_seed_while_minting_fresh_uuid(tmp_path: Path) -> None:
-    """Infrastructure retry changes session identity but not panel identity."""
+    """Retry changes UUID but retains seed, behavior version, and model lease."""
     worker = _StubWorker(
         tmp_path=tmp_path,
         outcomes_by_scene={"scene-0": "success"},
@@ -509,9 +521,17 @@ def test_fixed_seed_retry_reuses_seed_while_minting_fresh_uuid(tmp_path: Path) -
         simulation_domain="humanoid",
         rollout_seed_base=42,
     )
+    lease = InferenceModelLease(
+        behavior_policy_version=3,
+        model=torch.nn.Linear(1, 1),
+    )
     worker._gate.clear()
     try:
-        payload_state = worker.submit_payload(_payload(0), behavior_policy_version=3)
+        payload_state = worker.submit_payload(
+            _payload(0),
+            behavior_policy_version=3,
+            model_lease=lease,
+        )
         for _ in range(200):
             if worker._call_log:
                 break
@@ -525,6 +545,12 @@ def test_fixed_seed_retry_reuses_seed_while_minting_fresh_uuid(tmp_path: Path) -
         assert len(artifacts) == 1
         assert artifacts[0].session_uuid != first_uuid
         assert worker._random_seed_log == [42, 42]
+        assert len(worker._lease_reservations) == 2
+        assert {version for _, version, _ in worker._lease_reservations} == {3}
+        assert all(
+            reserved_lease is lease
+            for _, _, reserved_lease in worker._lease_reservations
+        )
     finally:
         worker._gate.set()
         _drain_pool(worker)
@@ -602,6 +628,33 @@ def test_retry_exhaustion_drops_pending_siblings(tmp_path: Path) -> None:
         assert result == []
         # Only the first sibling reaches _run_rollout; the other two are dropped.
         assert len(worker._call_log) == 1
+    finally:
+        _drain_pool(worker)
+
+
+def test_retry_exhaustion_discards_skipped_humanoid_sibling_reservations(
+    tmp_path: Path,
+) -> None:
+    """Skipped siblings release reservations after one sibling permanently fails."""
+    worker = _StubWorker(
+        tmp_path=tmp_path,
+        outcomes_by_scene={"scene-0": "fail"},
+        max_concurrent_rollouts=1,
+        rollouts_per_payload=3,
+        max_scene_retries=0,
+        simulation_domain="humanoid",
+    )
+    try:
+        payload_state = worker.submit_payload(_payload(0), behavior_policy_version=4)
+        assert payload_state.future.result(timeout=5.0) == []
+        for _ in range(200):
+            if len(worker._discarded_sessions) == 3:
+                break
+            threading.Event().wait(0.01)
+
+        reserved = {session_uuid for session_uuid, _, _ in worker._lease_reservations}
+        assert len(worker._call_log) == 1
+        assert set(worker._discarded_sessions) == reserved
     finally:
         _drain_pool(worker)
 
@@ -702,6 +755,47 @@ def test_shutdown_rejects_subsequent_submits(tmp_path: Path) -> None:
     worker.shutdown()
     with pytest.raises(RuntimeError, match="shut down"):
         worker.submit_payload(_payload(0))
+
+
+@pytest.mark.parametrize("running_outcome", ["success", "fail"])
+def test_shutdown_discards_only_queued_humanoid_sessions(
+    tmp_path: Path,
+    running_outcome: str,
+) -> None:
+    """Shutdown drains queued reservations without touching an in-flight session."""
+    worker = _StubWorker(
+        tmp_path=tmp_path,
+        outcomes_by_scene={"scene-0": running_outcome},
+        max_concurrent_rollouts=1,
+        rollouts_per_payload=3,
+        max_scene_retries=0,
+        simulation_domain="humanoid",
+    )
+    worker._gate.clear()
+    payload_state = worker.submit_payload(_payload(0), behavior_policy_version=5)
+    for _ in range(200):
+        if worker._call_log:
+            break
+        threading.Event().wait(0.01)
+    assert len(worker._call_log) == 1
+    running_session = worker._call_log[0]
+    reserved = {session_uuid for session_uuid, _, _ in worker._lease_reservations}
+    queued_sessions = reserved - {running_session}
+
+    worker.shutdown()
+
+    assert payload_state.future.result(timeout=5.0) == []
+    assert set(worker._discarded_sessions) == queued_sessions
+    assert running_session not in worker._discarded_sessions
+
+    worker._gate.set()
+    for rollout_worker in worker._rollout_workers:
+        rollout_worker.join(timeout=5.0)
+
+    if running_outcome == "fail":
+        assert set(worker._discarded_sessions) == reserved
+    else:
+        assert set(worker._discarded_sessions) == queued_sessions
 
 
 # ---------- internal dataclasses ----------

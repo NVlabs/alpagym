@@ -35,7 +35,9 @@ def filter_trainable_rollouts(
             ``completion`` (artifact path) and ``weight_version``.
         current_step: Current trainer policy step. ``weight_version`` is the
             policy step whose weights generated the rollout, so
-            ``current_step - weight_version`` is the rollout's policy lag.
+            ``(current_step - 1) - weight_version`` is the rollout's policy
+            lag. Cosmos numbers the first optimizer update as step 1, while
+            the behavior policy that generated its input rollouts is version 0.
         train_batch_per_replica: Number of rollouts to keep per replica.
         allowed_outdated_steps: Staleness tolerance in policy steps. A kept
             rollout whose ``weight_version`` is below
@@ -52,16 +54,21 @@ def filter_trainable_rollouts(
     # Empty completions are skipped by that unlink loop, so ignore them here too.
     paths = [str(rollout.completion) for rollout in rollouts if rollout.completion]
     if len(set(paths)) != len(paths):
-        raise ValueError(f"Rollouts from Cosmos-RL have duplicate completion paths: {paths}")
+        raise ValueError(
+            f"Rollouts from Cosmos-RL have duplicate completion paths: {paths}"
+        )
 
     ordered = sorted(rollouts, key=lambda rollout: rollout.weight_version, reverse=True)
     keep = ordered[:train_batch_per_replica]
     drop = ordered[train_batch_per_replica:]
 
-    # weight_version is the policy step whose weights generated the rollout;
-    # current_step is the trainer's policy step (same unit), so
-    # current_step - weight_version is the rollout's policy lag in steps.
-    min_allowed = current_step - allowed_outdated_steps
+    # ``current_step`` names the optimizer update being produced. The freshest
+    # behavior weights available before that update are therefore
+    # ``current_step - 1`` (update 1 consumes policy version 0). Treating the
+    # update number itself as an already-published policy version produced a
+    # false stale warning for every synchronous on-policy rollout.
+    freshest_behavior_version = max(current_step - 1, 0)
+    min_allowed = max(freshest_behavior_version - allowed_outdated_steps, 0)
     stale_kept = sum(1 for rollout in keep if rollout.weight_version < min_allowed)
     if stale_kept:
         logger.warning(

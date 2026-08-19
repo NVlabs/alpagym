@@ -1,14 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import json
 import tarfile
 import tomllib
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import alpagym_host.cli as host_cli
 import pytest
+import torch
 import yaml
 from alpagym_host.cli import load_or_create_run_config
 from alpagym_host.config import (
@@ -32,6 +35,7 @@ from alpagym_host.run_artifacts import (
     write_run_artifacts,
 )
 from hydra import compose, initialize_config_module
+from safetensors.torch import save_file
 
 
 def test_host_writes_and_loads_handoff_artifacts(
@@ -113,6 +117,7 @@ def test_host_writes_and_loads_handoff_artifacts(
     assert "grpo_optimization_iterations" not in cosmos_config["train"]["train_policy"]
     assert cosmos_config["train"]["train_batch_per_replica"] == 3
     assert cosmos_config["train"]["epoch"] == 5
+    assert "seed" not in cosmos_config["train"]
     assert cosmos_config["logging"]["log_interval"] == 7
     assert cosmos_config["policy"]["model_name_or_path"] == model_path.as_posix()
     assert cosmos_config["policy"]["parallelism"]["tp_size"] == 2
@@ -697,6 +702,12 @@ def test_humanoid_config_accepts_uint64_rollout_seed_boundaries(
             "direct_action requires",
         ),
         (
+            HumanoidExecutionProfile.direct_action,
+            "videomimic_v9_formula_grail_target_equivalent.v1",
+            None,
+            "direct_action requires",
+        ),
+        (
             HumanoidExecutionProfile.motion_reference,
             "reference_route_centered.v4",
             "/tmp/GRAIL",
@@ -725,6 +736,7 @@ def test_humanoid_config_rejects_reward_profiles_outside_execution_abi(
 def test_motion_reference_freeze_injects_single_source_paths_and_fingerprint(
     tmp_path: Path,
 ) -> None:
+    model_path = _write_h70_planner_bundle_dir(tmp_path)
     scene_store = tmp_path / "scene_store"
     scene_root = scene_store / "scenes" / "stairs"
     scene_root.mkdir(parents=True)
@@ -743,6 +755,7 @@ def test_motion_reference_freeze_injects_single_source_paths_and_fingerprint(
         "alpasim.simulation_domain=humanoid",
         "dataset.scene_ids=[stairs]",
         "alpasim.wizard_args.force_gt_duration_us=0",
+        "alpasim.wizard_args.control_timestep_us=500000",
         "cosmos.rollout.prefetch_rollout=false",
     )
     run_config.alpasim.humanoid = HumanoidAlpaSimConfig(
@@ -752,6 +765,19 @@ def test_motion_reference_freeze_injects_single_source_paths_and_fingerprint(
         execution_profile=HumanoidExecutionProfile.motion_reference,
         grail_root_path="/tmp/GRAIL",
         reward_profile_id="reference_route_centered.v1",
+    )
+    run_config = replace(
+        run_config,
+        policy=replace(
+            run_config.policy,
+            model=replace(
+                run_config.policy.model,
+                kind="g1_videomimic_planner",
+                path=str(model_path),
+                bundle_config={"planner_mode": "shadow_rollout"},
+                step_dt_us=500_000,
+            ),
+        ),
     )
 
     frozen = freeze_humanoid_scene_fingerprints(run_config)
@@ -789,7 +815,7 @@ def test_motion_reference_experiment_resolves_seed_panel_and_horizon(
     expected_reward_profile_id: str,
 ) -> None:
     """The preset resolves its horizon, panel seed, and opt-in reward profile."""
-    model_path = _write_hf_bundle_dir(tmp_path)
+    model_path = _write_h70_planner_bundle_dir(tmp_path)
     scene_root = tmp_path / "scene_store" / "scenes" / "hq_stairs"
     scene_root.mkdir(parents=True)
     (scene_root / "manifest.json").write_text(
@@ -806,7 +832,7 @@ def test_motion_reference_experiment_resolves_seed_panel_and_horizon(
         cfg = compose(
             config_name="default",
             overrides=[
-                "experiment=g1_videomimic_planner_hq_stairs_local_1gpu",
+                "experiment=g1_videomimic_planner_hq_stairs_current_policy",
                 f"run_root={tmp_path.as_posix()}",
                 f"policy.model.path={model_path.as_posix()}",
                 f"alpasim.repo_path={(tmp_path / 'alpasim').as_posix()}",
@@ -833,16 +859,22 @@ def test_motion_reference_experiment_resolves_seed_panel_and_horizon(
     assert (
         run_config.alpasim.wizard_args.n_sim_steps
         == run_config.expected_valid_steps
-        == 300
+        == 60
     )
-    assert run_config.alpasim.wizard_args.control_timestep_us == 100_000
+    assert run_config.alpasim.wizard_args.control_timestep_us == 500_000
     assert run_config.cosmos.train.optm_lr == pytest.approx(1.0e-6)
-    assert run_config.cosmos.train.train_policy.step_mini_batch == 300
+    assert run_config.cosmos.train.train_policy.step_mini_batch == 60
     assert run_config.cosmos.train.train_policy.grpo_optimization_iterations == 1
     assert run_config.cosmos.train.train_policy.kl_beta == pytest.approx(0.1)
     assert run_config.cosmos.train.train_policy.reference_reset_interval == 0
-    assert run_config.cosmos.train.train_policy.ppo_gamma**5 == pytest.approx(0.99)
-    assert run_config.cosmos.train.train_policy.ppo_gae_lambda**5 == pytest.approx(0.95)
+    assert run_config.cosmos.train.train_policy.ppo_gamma == pytest.approx(0.99)
+    assert run_config.cosmos.train.train_policy.ppo_gae_lambda == pytest.approx(0.95)
+    assert run_config.cosmos.train.train_policy.ppo_min_action_std == pytest.approx(
+        0.05
+    )
+    assert run_config.cosmos.train.train_policy.ppo_max_action_std == pytest.approx(
+        0.15
+    )
     assert run_config.alpasim.humanoid is not None
     assert run_config.alpasim.humanoid.rollout_seed_base == 9000
     assert resolved_config["alpasim"]["humanoid"]["rollout_seed_base"] == 9000
@@ -1213,6 +1245,62 @@ def _model_overrides(tmp_path: Path) -> list[str]:
         "policy.model.kind=alpamayo_r1",
         f"policy.model.path={(tmp_path / 'model_bundle').as_posix()}",
     ]
+
+
+def _write_h70_planner_bundle_dir(tmp_path: Path) -> Path:
+    """Create a minimal provenance-valid current-policy H70 actor bundle."""
+
+    bundle_dir = tmp_path / "model_bundle"
+    bundle_dir.mkdir()
+    weights_path = bundle_dir / "model.safetensors"
+    save_file(
+        {
+            "actor.0.weight": torch.tensor([[1.0]], dtype=torch.float32),
+            "std": torch.tensor([0.15], dtype=torch.float32),
+            "critic.0.weight": torch.tensor([[2.0]], dtype=torch.float32),
+        },
+        str(weights_path),
+    )
+    weights_sha256 = hashlib.sha256(weights_path.read_bytes()).hexdigest()
+    initialization = {
+        "schema": "videomimic_v9_actor_initialization.v1",
+        "source_v9_checkpoint_sha256": "b" * 64,
+        "source_v9_actor_parity_samples": 16,
+        "source_v9_actor_parity_max_abs": 0.0,
+        "planner_critic_seed": 0,
+    }
+    initialization_sha256 = hashlib.sha256(
+        json.dumps(initialization, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    lineage = {
+        "schema": "videomimic_planner_actor_update_lineage.v1",
+        "current_actor_status": "v9_initialized_unmodified",
+        "initialization_attestation_sha256": initialization_sha256,
+        "current_model_weights_sha256": weights_sha256,
+        "parent_model_weights_sha256": None,
+        "parent_update_lineage_sha256": None,
+        "training_export_step": 0,
+    }
+    config = {
+        "model_type": "g1_videomimic_planner_actor_critic",
+        "shadow_action_steps": 69,
+        "checkpoint_path": "model.safetensors",
+        **{
+            key: initialization[key]
+            for key in (
+                "source_v9_checkpoint_sha256",
+                "source_v9_actor_parity_samples",
+                "source_v9_actor_parity_max_abs",
+                "planner_critic_seed",
+            )
+        },
+        "actor_initialization_attestation": initialization,
+        "actor_update_lineage": lineage,
+    }
+    (bundle_dir / "config.json").write_text(
+        json.dumps(config, sort_keys=True), encoding="utf-8"
+    )
+    return bundle_dir
 
 
 def _write_hf_bundle_dir(

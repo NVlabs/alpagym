@@ -7,9 +7,12 @@ from importlib import import_module
 from typing import Any, Callable
 
 import torch
-from alpagym_host.config import RunConfig
+from alpagym_host.config import CosmosRLMode, RunConfig
 
-from alpagym_runtime.alpasim.humanoid_policy_server import HumanoidPolicy, ZeroHumanoidPolicy
+from alpagym_runtime.alpasim.humanoid_policy_server import (
+    HumanoidPolicy,
+    ZeroHumanoidPolicy,
+)
 from alpagym_runtime.inference.inference_engine import InferenceEngine
 from alpagym_runtime.policies.alpamayo.determinism import set_deterministic
 from alpagym_runtime.policies.alpamayo.policy import AlpamayoPolicy
@@ -46,6 +49,9 @@ def build_inference_engine(run_config: RunConfig) -> InferenceEngine:
         sampling=inference_cfg.sampling,
         return_trace_for_rl=inference_cfg.return_trace_for_rl,
         max_batch_size=inference_cfg.max_batch_size,
+        require_session_model_leases=_requires_humanoid_session_model_leases(
+            run_config
+        ),
     )
 
 
@@ -82,6 +88,15 @@ def build_policy_factory(
 
     return policy_factory
 
+
+def _requires_humanoid_session_model_leases(run_config: RunConfig) -> bool:
+    """Return whether this rollout uses separate policy and rollout processes."""
+
+    alpasim_config = getattr(run_config, "alpasim", None)
+    cosmos_config = getattr(run_config, "cosmos", None)
+    simulation_domain = str(getattr(alpasim_config, "simulation_domain", "av"))
+    mode = CosmosRLMode(getattr(cosmos_config, "mode", CosmosRLMode.colocated))
+    return simulation_domain == "humanoid" and mode is CosmosRLMode.disaggregated
 
 
 def build_humanoid_policy_factory(

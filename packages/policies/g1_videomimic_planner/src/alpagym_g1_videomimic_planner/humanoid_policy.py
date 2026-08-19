@@ -29,14 +29,13 @@ from alpagym_runtime.replay import ActionSelection, PolicyReplayData
 
 from alpagym_g1_videomimic_planner._tensor_conversion import as_float32_tensor
 from alpagym_g1_videomimic_planner.model import (
-    ACTION_SCHEMA,
     OBSERVATION_SCHEMA,
     OBS_DIMS,
     OBS_KEYS,
     REPLAY_SCHEMA,
-    REFERENCE_FRAME_COUNT,
-    SHADOW_ACTION_STEPS,
     G1VideoMimicPlannerActorCriticModel,
+    PLANNER_MODE_SHADOW_ROLLOUT,
+    planner_mode_contract,
 )
 
 _OBSERVATION_TERMS = (("navigation_position_xy", 2),)
@@ -58,6 +57,7 @@ class G1VideoMimicPlannerHumanoidPolicy:
         self,
         inference_engine: InferenceEngine,
         *,
+        session_uuid: str,
         request: Any,
         humanoid_repo_path: Path,
         scene_store_path: Path,
@@ -66,8 +66,10 @@ class G1VideoMimicPlannerHumanoidPolicy:
         deterministic: bool,
         lookahead_m: float,
         accept_shadow_fall_reference: bool,
+        planner_mode: str,
     ) -> None:
         self._inference_engine = inference_engine
+        self._session_uuid = session_uuid
         self._request = request
         self._repo_path = humanoid_repo_path
         self._scene_store_path = scene_store_path
@@ -83,6 +85,17 @@ class G1VideoMimicPlannerHumanoidPolicy:
         self._deterministic = deterministic
         self._lookahead_m = lookahead_m
         self._accept_shadow_fall_reference = bool(accept_shadow_fall_reference)
+        self._planner_mode = str(planner_mode)
+        reference_spec = request.reference_spec
+        self._contract = planner_mode_contract(
+            self._planner_mode,
+            macro_period_us=(
+                int(reference_spec.sample_period_us)
+                * int(reference_spec.control_ticks_per_policy_step)
+            ),
+        )
+        self._actor_steps_per_plan = self._contract.actor_steps
+        self._controller_ticks_per_plan = self._contract.controller_ticks
         self._lanes: dict[int, _Lane] = {}
         self._sample_actions = True
         self._active_model: G1VideoMimicPlannerActorCriticModel | None = None
@@ -121,10 +134,7 @@ class G1VideoMimicPlannerHumanoidPolicy:
             if not sample_actions:
                 value = None
                 if policy_input.bootstrap_requested:
-                    self._plan_with_current_model(lane, observation)
-                    if self._first_sample_value is None:
-                        raise ValueError("truncated planner boundary produced no value")
-                    value = torch.tensor(self._first_sample_value, dtype=torch.float32)
+                    value = self._critic_value(lane, observation)
                 outputs.append(
                     HumanoidPolicyStepOutput(env_id=policy_input.env_id, value=value)
                 )
@@ -138,12 +148,11 @@ class G1VideoMimicPlannerHumanoidPolicy:
                 )
             replay = lane.policy.active_replay
             if replay is None or not replay.trainable:
+                raise ValueError("VideoMimic plan has no trainable replay trace")
+            if len(replay.steps) != self._actor_steps_per_plan:
                 raise ValueError(
-                    "VideoMimic plan has no trainable 49-step replay trace"
-                )
-            if len(replay.steps) != SHADOW_ACTION_STEPS:
-                raise ValueError(
-                    f"VideoMimic replay must contain {SHADOW_ACTION_STEPS} actions"
+                    "VideoMimic replay must contain "
+                    f"{self._actor_steps_per_plan} actions in {self._planner_mode!r} mode"
                 )
             if replay.reference_sha256 != plan.reference.sha256:
                 raise ValueError("VideoMimic replay/reference digest mismatch")
@@ -162,6 +171,14 @@ class G1VideoMimicPlannerHumanoidPolicy:
             old_logprob = replay_data.old_logprob
             value = torch.tensor(float(replay.initial_value), dtype=torch.float32)
             diagnostics = dict(plan.diagnostics)
+            model_extra: dict[str, object] = {
+                "humanoid_value": float(value),
+                "humanoid_shadow_fell": bool(diagnostics.get("shadow_fell", False)),
+                "humanoid_shadow_fall_reference_accepted": bool(
+                    diagnostics.get("shadow_fall_reference_accepted", False)
+                ),
+                "humanoid_generated_reference_frames": len(plan.reference),
+            }
             outputs.append(
                 HumanoidPolicyStepOutput(
                     env_id=policy_input.env_id,
@@ -169,16 +186,7 @@ class G1VideoMimicPlannerHumanoidPolicy:
                     logprob=old_logprob,
                     value=value,
                     replay_data=replay_data,
-                    model_extra={
-                        "humanoid_value": float(value),
-                        "humanoid_shadow_fell": bool(
-                            diagnostics.get("shadow_fell", False)
-                        ),
-                        "humanoid_shadow_fall_reference_accepted": bool(
-                            diagnostics.get("shadow_fall_reference_accepted", False)
-                        ),
-                        "humanoid_generated_reference_frames": len(plan.reference),
-                    },
+                    model_extra=model_extra,
                 )
             )
         return tuple(outputs)
@@ -187,19 +195,25 @@ class G1VideoMimicPlannerHumanoidPolicy:
         self._lanes.clear()
 
     def _plan_with_current_model(self, lane: _Lane, observation: Any) -> Any:
-        model = self._inference_engine.get_model()
+        model = self._inference_engine.get_model_for_session(self._session_uuid)
         if not isinstance(model, G1VideoMimicPlannerActorCriticModel):
             raise TypeError(
                 "expected G1VideoMimicPlannerActorCriticModel, got "
                 f"{type(model).__name__}"
             )
         self._active_model = model
+        if int(model.config.shadow_action_steps) != self._actor_steps_per_plan:
+            raise ValueError(
+                "planner checkpoint shadow_action_steps does not match planner_mode: "
+                f"expected {self._actor_steps_per_plan}, got "
+                f"{model.config.shadow_action_steps}"
+            )
         self._active_generator = lane.generator
         self._first_sample_value = None
         try:
             return lane.policy.plan(
                 observation,
-                horizon_steps=REFERENCE_FRAME_COUNT,
+                horizon_steps=self._contract.reference_frames,
             )
         finally:
             self._active_model = None
@@ -237,6 +251,29 @@ class G1VideoMimicPlannerHumanoidPolicy:
             mean=mean[0].detach().cpu().numpy().astype(np.float32, copy=True),
         )
 
+    def _critic_value(self, lane: _Lane, observation: Any) -> torch.Tensor:
+        """Evaluate the macro-boundary critic without generating a fake plan."""
+
+        model = self._inference_engine.get_model_for_session(self._session_uuid)
+        if not isinstance(model, G1VideoMimicPlannerActorCriticModel):
+            raise TypeError(
+                "expected G1VideoMimicPlannerActorCriticModel, got "
+                f"{type(model).__name__}"
+            )
+        critic_observation = lane.policy.critic_observation(observation)
+        obs = {
+            key: as_float32_tensor(
+                critic_observation[key], device=self._device
+            ).reshape(1, OBS_DIMS[key])
+            for key in OBS_KEYS
+        }
+        model.eval()
+        with torch.no_grad():
+            value = model._head(obs, actor=False).reshape(())
+        if not torch.isfinite(value):
+            raise ValueError("planner bootstrap value is non-finite")
+        return value.detach().to(device="cpu", dtype=torch.float32)
+
     def _require_active_generator(self) -> torch.Generator:
         if self._active_generator is None:
             raise RuntimeError("planner action sampler has no active lane RNG")
@@ -262,26 +299,27 @@ class G1VideoMimicPlannerHumanoidPolicy:
         heading_index = min(2, len(route) - 1)
         heading = route[heading_index] - route[0]
         root_yaw = math.atan2(float(heading[1]), float(heading[0]))
-        policy = self._support.VideoMimicMotionPolicy.create(
-            root_z_offset_m=0.0,
-            default_horizon_steps=REFERENCE_FRAME_COUNT,
-            minimum_action_steps=5,
-            # A scratch VideoMimic fall is a property of the sampled reference,
-            # not an infrastructure failure.  Complete the 50-frame candidate
-            # and let frozen GRAIL + realized MuJoCo state produce the actual
-            # terminal reward.  The generic/deployment facade keeps rejection
-            # as its default.
-            accept_shadow_fall_reference=self._accept_shadow_fall_reference,
-            model=runtime.model,
-            data=runtime.data,
-            action_sampler=self._sample_shadow_action,
-            route_xy=route,
-            grail_joint_names=tuple(str(name) for name in self._request.joint_names),
-            terrain_group_index=int(
+        common_policy_args = {
+            "root_z_offset_m": 0.0,
+            "model": runtime.model,
+            "data": runtime.data,
+            "action_sampler": self._sample_shadow_action,
+            "route_xy": route,
+            "grail_joint_names": tuple(str(name) for name in self._request.joint_names),
+            "terrain_group_index": int(
                 runtime.profile_abi["reserved_groups"]["terrain_heightmap"]
             ),
-            lookahead_m=self._lookahead_m,
-            device=str(self._device),
+            "lookahead_m": self._lookahead_m,
+            "device": str(self._device),
+        }
+        if self._planner_mode != PLANNER_MODE_SHADOW_ROLLOUT:
+            raise AssertionError(f"unhandled planner mode {self._planner_mode!r}")
+        policy = self._support.VideoMimicH70MotionPolicy.create(
+            # A scratch VideoMimic fall is a property of the sampled reference,
+            # not an infrastructure failure. Complete H70 and score it in the
+            # realized outer physics.
+            accept_shadow_fall_reference=self._accept_shadow_fall_reference,
+            **common_policy_args,
         )
         initial_shadow = policy.initialize_standalone(
             spawn_xyz=spawn, root_yaw=root_yaw
@@ -382,12 +420,19 @@ def build_humanoid_policy_factory(
     lookahead_m = float(config.get("lookahead_m", 0.35))
     if not math.isfinite(lookahead_m) or lookahead_m <= 0.0:
         raise ValueError("bundle_config.lookahead_m must be finite and positive")
+    planner_mode = str(config.get("planner_mode", PLANNER_MODE_SHADOW_ROLLOUT))
+    planner_mode_contract(planner_mode)
+    if "completion_policy_path" in config or "completion_policy_sha256" in config:
+        raise ValueError(
+            "VideoMimic fake plans must use the current actor for all H70 steps; "
+            "a separate completion policy is not supported"
+        )
 
     def _factory(session_uuid: str, request: Any) -> G1VideoMimicPlannerHumanoidPolicy:
-        del session_uuid
-        _validate_session_request(request)
+        _validate_session_request(request, planner_mode=planner_mode)
         return G1VideoMimicPlannerHumanoidPolicy(
             inference_engine,
+            session_uuid=session_uuid,
             request=request,
             humanoid_repo_path=repo_path,
             scene_store_path=scene_store_path,
@@ -398,18 +443,27 @@ def build_humanoid_policy_factory(
             accept_shadow_fall_reference=(
                 shadow_fall_reference_mode == "accept_for_training"
             ),
+            planner_mode=planner_mode,
         )
 
     return _factory
 
 
-def _validate_session_request(request: Any) -> None:
+def _validate_session_request(request: Any, *, planner_mode: str) -> None:
     if int(request.execution_mode) != HUMANOID_EXECUTION_MODE_MOTION_REFERENCE:
         raise ValueError("VideoMimic planner requires motion-reference execution mode")
     if str(request.observation_schema) != OBSERVATION_SCHEMA:
         raise ValueError(f"planner observation_schema must be {OBSERVATION_SCHEMA!r}")
-    if str(request.action_schema) != ACTION_SCHEMA:
-        raise ValueError(f"planner action_schema must be {ACTION_SCHEMA!r}")
+    reference_spec = request.reference_spec
+    contract = planner_mode_contract(
+        planner_mode,
+        macro_period_us=(
+            int(reference_spec.sample_period_us)
+            * int(reference_spec.control_ticks_per_policy_step)
+        ),
+    )
+    if str(request.action_schema) != contract.action_schema:
+        raise ValueError(f"planner action_schema must be {contract.action_schema!r}")
     if int(request.action_size) != 0:
         raise ValueError("motion-reference planner action_size must be zero")
     joint_names = tuple(str(name) for name in request.joint_names)
@@ -420,17 +474,24 @@ def _validate_session_request(request: Any) -> None:
     )
     if terms != _OBSERVATION_TERMS:
         raise ValueError(f"planner observation terms must be {_OBSERVATION_TERMS!r}")
-    if str(request.reference_spec.schema) != ACTION_SCHEMA:
+    if str(request.reference_spec.schema) != contract.action_schema:
         raise ValueError("planner reference_spec schema does not match action schema")
-    reference_spec = request.reference_spec
     if tuple(str(name) for name in reference_spec.joint_names) != joint_names:
         raise ValueError("planner reference_spec joint_names do not match session")
     if (
         int(reference_spec.frame_count),
         int(reference_spec.sample_period_us),
         int(reference_spec.control_ticks_per_policy_step),
-    ) != (50, 20_000, 5):
-        raise ValueError("planner reference_spec must be H=50, period=20ms, K=5")
+    ) != (
+        contract.reference_frames,
+        20_000,
+        contract.controller_ticks,
+    ):
+        raise ValueError(
+            f"planner reference_spec must be H={contract.reference_frames}, "
+            f"period=20ms, K={contract.controller_ticks} for "
+            f"planner_mode={planner_mode!r}"
+        )
     for field in ("attempt_id", "scene_id", "scenario_id"):
         if not str(getattr(request, field)):
             raise ValueError(f"planner session requires non-empty {field}")
@@ -463,6 +524,7 @@ def _wire_reference(
 
 
 def _policy_replay_data(replay: Any) -> PolicyReplayData:
+    """Serialize all current-policy decisions in one H70 fake plan."""
     observations = {
         key: torch.stack(
             [as_float32_tensor(step.observation[key]) for step in replay.steps]
@@ -478,6 +540,13 @@ def _policy_replay_data(replay: Any) -> PolicyReplayData:
     token_logprobs = torch.tensor(
         [float(step.old_logprob) for step in replay.steps], dtype=torch.float32
     )
+    payload = {
+        "shadow_observations": observations,
+        "raw_actions": raw_actions,
+        "executed_actions": executed_actions,
+        "old_token_logprobs": token_logprobs,
+        "reference_sha256": str(replay.reference_sha256),
+    }
     return PolicyReplayData(
         replay_schema_version=1,
         payload_schema=REPLAY_SCHEMA,
@@ -485,13 +554,7 @@ def _policy_replay_data(replay: Any) -> PolicyReplayData:
         model_family="g1_videomimic_planner",
         action_selection=ActionSelection(set_ix=0, sample_ix=0),
         old_logprob=token_logprobs.sum(),
-        payload={
-            "shadow_observations": observations,
-            "raw_actions": raw_actions,
-            "executed_actions": executed_actions,
-            "old_token_logprobs": token_logprobs,
-            "reference_sha256": str(replay.reference_sha256),
-        },
+        payload=payload,
     )
 
 
@@ -542,7 +605,7 @@ def _parse_scene_fingerprints(config: Mapping[str, Any]) -> dict[str, str]:
 
 @dataclass(frozen=True)
 class _HumanoidSupport:
-    VideoMimicMotionPolicy: Any
+    VideoMimicH70MotionPolicy: Any
     ShadowActionSample: Any
     PolicyObservation: Any
     RobotKinematicState: Any
@@ -586,7 +649,7 @@ def _import_humanoid_support(repo_path: Path) -> _HumanoidSupport:
                 f"humanoid support module {module.__name__} resolved outside {repo_path}"
             )
     return _HumanoidSupport(
-        VideoMimicMotionPolicy=planner_module.VideoMimicMotionPolicy,
+        VideoMimicH70MotionPolicy=planner_module.VideoMimicH70MotionPolicy,
         ShadowActionSample=shadow_module.ShadowActionSample,
         PolicyObservation=policy_api.PolicyObservation,
         RobotKinematicState=policy_api.RobotKinematicState,

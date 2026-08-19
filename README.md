@@ -1,9 +1,10 @@
 # AlpaGym
 
-AlpaGym is a reinforcement-learning framework for end-to-end autonomous-driving
-policies. It runs a policy in closed loop inside a simulator, scores the
-resulting drives, and trains on them — so the policy learns from the
-consequences of its own steering rather than from logged ground truth alone.
+AlpaGym is a reinforcement-learning framework for closed-loop embodied
+policies. It runs a policy inside a simulator, scores realized behavior, and
+trains on those consequences rather than logged ground truth alone. The main
+upstream use case is end-to-end autonomous driving; this branch also carries a
+standalone SceneStore-backed G1 humanoid integration.
 
 It stands on two systems: [AlpaSim](https://github.com/NVlabs/alpasim) provides
 the closed-loop simulator (the environment), and
@@ -12,10 +13,11 @@ rollout and training orchestration (the trainer). AlpaGym is the harness that
 wires them to a driving policy and keeps the interfaces small enough to swap any
 one piece.
 
-AlpaGym is in early but active development. It currently supports the
-[Alpamayo 1.5](https://github.com/NVlabs/alpamayo1.5) model with 10b parameters.
-Current work focuses on throughput and scaling, and on supporting more models and
-training algorithms.
+AlpaGym is in early but active development. It supports the
+[Alpamayo 1.5](https://github.com/NVlabs/alpamayo1.5) model with 10b parameters;
+the humanoid integration adds direct VideoMimic and current-policy
+VideoMimic-to-GRAIL actor-critic bundles. Current work focuses on throughput,
+scaling, and additional models and training algorithms.
 
 ## Table of Contents
 
@@ -82,8 +84,8 @@ workspace is designed to make adding new packages straightforward.
   gRPC egodriver (`alpasim/`), batched GPU inference (`inference/`), the
   policies and model adapters (`policies/`), the reward terms (`rewards/`), and
   the episode transport (`transport/`).
-- **`packages/policies`** — the driving policies. Currently the Alpamayo 1.5
-  policy bundle, configs, tokenizer, and checkpoint conversion script.
+- **`packages/policies`** — policy-owned bundles, replay parsers, configs, and
+  checkpoint tools for Alpamayo 1.5 and the G1 direct/planner actors.
 - **`packages/alpasim_configs`** — AlpaSim topology configs used by AlpaGym.
 - **`packages/plugins`** — utilities for discovering optioninal plugin packages.
 
@@ -106,8 +108,8 @@ In the runtime (GPU):
    gRPC server; the policy steps and returns a trajectory; AlpaSim advances the
    ego car and asks again.
 6. Completed episodes are scored and written as artifacts.
-7. The trainer consumes the artifacts and takes a GRPO step; updated weights
-   sync back to the rollout workers.
+7. The trainer consumes the artifacts and applies the configured GRPO or PPO
+   update; updated weights sync back to the rollout workers.
 
 Local runs do all of this on one machine. Slurm runs prepare steps 1–4 on the
 login node, then re-load the frozen config and run the same lifecycle on the
@@ -117,7 +119,8 @@ cluster.
 
 - [Onboarding Guide](docs/ONBOARDING.md) — host setup, auth, getting a model, and running locally.
 - [G1 SceneStore RL handoff](docs/HUMANOID_ALPAGYM_ALPASIM_HANDOFF_YUXIAO.md) —
-  standalone AlpaGym/AlpaSim ownership, direct-V9 and VideoMimic-to-GRAIL
-  motion-reference PPO contracts, 30-second horizon, reward, and qualification
+  standalone AlpaGym/AlpaSim ownership, direct V9, and the canonical
+  current-actor H70-to-GRAIL PPO contract, including token-level causal credit,
+  immutable checkpoint lineage, the 30-second horizon, and qualification
   boundaries.
 - [Contributing](CONTRIBUTING.md) — code style and review process.

@@ -80,7 +80,8 @@ def _make_fake_bundle(
         setup_tokenizer=lambda config: None,
         build_data_packer=lambda run_config, cosmos_role: None,
         install_runtime_bridge=lambda: None,
-        load_inference_model=load_inference_model or (lambda run_config, device, dtype: None),
+        load_inference_model=load_inference_model
+        or (lambda run_config, device, dtype: None),
         build_model_inputs=lambda run_config: None,
     )
 
@@ -129,6 +130,28 @@ def test_build_inference_engine_accepts_batch_size_greater_than_one(
 
     assert engine._inference_model is fake_model
     assert engine._max_batch_size == 2
+
+
+def test_disaggregated_humanoid_engine_requires_session_model_leases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only separate humanoid rollout processes enable immutable snapshots."""
+
+    fake_model = _FakeInferenceModel()
+    monkeypatch.setattr(
+        factory,
+        "get_policy_bundle",
+        lambda kind: _make_fake_bundle(
+            load_inference_model=lambda *args, **kwargs: fake_model
+        ),
+    )
+    config = _make_resolved_config()
+    config.alpasim = SimpleNamespace(simulation_domain="humanoid")
+    config.cosmos = SimpleNamespace(mode="disaggregated")
+
+    engine = factory.build_inference_engine(config)
+
+    assert engine.requires_session_model_leases
 
 
 def test_build_inference_engine_unknown_kind_raises(

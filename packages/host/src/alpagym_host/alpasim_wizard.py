@@ -24,7 +24,15 @@ from alpagym_host.config import (
 
 _MOTION_REFERENCE_RESERVED_OVERRIDE_PREFIXES = (
     "runtime_domain",
+    "runtime.humanoid.reference",
     "runtime.humanoid.controller",
+    "runtime.humanoid.num_envs",
+    "defines.humanoid_repo",
+    "defines.humanoid_scene_store",
+    "defines.humanoid_scene_fingerprints_json",
+    "defines.humanoid_grail_root",
+    "defines.humanoid_image",
+    "defines.humanoid_dynamics_gpus",
 )
 
 
@@ -37,8 +45,8 @@ def _reject_motion_reference_reserved_overrides(overrides: list[str]) -> None:
             for prefix in _MOTION_REFERENCE_RESERVED_OVERRIDE_PREFIXES
         ):
             raise ValueError(
-                "motion_reference extra_overrides cannot modify reserved "
-                f"controller settings: {key}"
+                "motion_reference extra_overrides cannot modify host-owned "
+                f"reference/controller settings: {key}"
             )
 
 
@@ -110,9 +118,14 @@ def _build_wizard_command(
             config.humanoid.execution_profile
             is HumanoidExecutionProfile.motion_reference
         )
+        runtime_domain = "humanoid"
+        if reference_mode:
+            if config.humanoid.reference_frame_count != 70:
+                raise ValueError("motion_reference frame count must be H70")
+            runtime_domain = "humanoid_reference_h70"
         argv.extend(
             (
-                f"runtime_domain={'humanoid_reference' if reference_mode else 'humanoid'}",
+                f"runtime_domain={runtime_domain}",
                 f"defines.humanoid_repo={config.humanoid.repo_path}",
                 f"defines.humanoid_scene_store={config.humanoid.scene_store_path}",
                 f"defines.humanoid_image={config.humanoid.service_image}",
@@ -174,6 +187,10 @@ def _build_wizard_command(
                 "number of 20000us controller ticks"
             )
         max_control_ticks = wizard_args.n_sim_steps * controller_ticks_per_policy_step
+        argv.append(
+            "runtime.humanoid.reference.control_ticks_per_policy_step="
+            + str(controller_ticks_per_policy_step)
+        )
         argv.append(
             "runtime.humanoid.controller.options.max_control_ticks="
             + json.dumps(str(max_control_ticks))

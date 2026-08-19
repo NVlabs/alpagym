@@ -77,6 +77,7 @@ class AlpagymRollout(RolloutBase):
         self._engine_thread: threading.Thread | None = None
         self._engine_initialized = False
         self._shutdown_done = False
+        self._humanoid_session_model_leases = False
 
     @measure_perf("rollout/engine_init", category="orchestration", cpu_snapshot=True)
     def init_engine(
@@ -102,6 +103,9 @@ class AlpagymRollout(RolloutBase):
 
         self._inference_engine = build_inference_engine(self._run_config)
         self._model = self._inference_engine.get_model()
+        self._humanoid_session_model_leases = (
+            self._inference_engine.requires_session_model_leases
+        )
         record_perf_marker("rollout/model_ready", cpu_snapshot=True, gpu_snapshot=True)
         distributed = ExecutionBackend(self._run_config.execution.backend).is_slurm_run
         simulation_domain = str(
@@ -135,6 +139,11 @@ class AlpagymRollout(RolloutBase):
                 max_concurrent_rollouts=max_concurrent_rollouts,
                 policy_factory=humanoid_policy_factory,
                 publish_host=publish_host,
+                model_lease_registry=(
+                    self._inference_engine
+                    if self._humanoid_session_model_leases
+                    else None
+                ),
             )
             self._humanoid_policy_server.start()
         elif simulation_domain == "av":
@@ -291,7 +300,7 @@ class AlpagymRollout(RolloutBase):
         """
         # `current_weight_version` is forwarded by Cosmos-RL's
         # `_call_rollout_generation` so async weight sync can tag in-flight
-        # rollouts; AlpaGym does not consume it. `data_packer` is the egress
+        # rollouts. `data_packer` is the egress
         # path used later in `get_rollout_output`, not here. Declaring and
         # deleting the unused kwargs is preferred over a `**kwargs` shim so a
         # new Cosmos kwarg surfaces as a loud TypeError instead of being
@@ -311,10 +320,23 @@ class AlpagymRollout(RolloutBase):
                 raise ValueError(
                     "humanoid rollout_generation requires current_weight_version"
                 )
+            model_lease = None
+            if self._humanoid_session_model_leases:
+                if self._inference_engine is None:
+                    raise RuntimeError("humanoid inference engine is not initialized")
+                # Cosmos has made current_weight_version live before entering
+                # rollout_generation. Clone it once, then share that independent
+                # module across every session in this generation batch. Later
+                # R2R updates can mutate the live model without changing any
+                # already-open episode.
+                model_lease = self._inference_engine.create_model_lease(
+                    current_weight_version
+                )
             payload_states = [
                 self._worker.submit_payload(
                     payload,
                     behavior_policy_version=current_weight_version,
+                    model_lease=model_lease,
                 )
                 for payload in payloads
             ]

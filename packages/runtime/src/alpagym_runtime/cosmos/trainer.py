@@ -10,8 +10,12 @@ policy kind string. The cosmos entrypoint dispatches the data packer the same wa
 """
 
 import copy
+import hashlib
+import json
 import logging
 import os
+import re
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -40,6 +44,189 @@ from alpagym_runtime.replay import TrainingSignal
 from alpagym_runtime.tensor_utils import to_device_recursive
 
 logger = logging.getLogger(__name__)
+
+_ACTOR_INITIALIZATION_SCHEMA = "videomimic_v9_actor_initialization.v1"
+_ACTOR_UPDATE_LINEAGE_SCHEMA = "videomimic_planner_actor_update_lineage.v1"
+_ACTOR_STATE_HASH_SCHEMA = "videomimic_planner_actor_state.safetensors.v1"
+_ACTOR_LINEAGE_CHECKPOINT_KEY = "alpagym_actor_update_lineage"
+_ACTOR_STATUS_TRAINED = "trained_descendant"
+_ACTOR_STATUS_UNCHANGED = "actor_bit_identical_to_parent"
+_ACTOR_STATE_LINEAGE_FIELDS = (
+    "actor_state_hash_schema",
+    "current_actor_state_sha256",
+    "parent_actor_state_sha256",
+)
+_ACTOR_INITIAL_STATUSES = frozenset(
+    (
+        "v9_initialized_unmodified",
+        "v9_actor_mean_initialized_std_clamped",
+    )
+)
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _canonical_mapping_sha256(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(dict(value), sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _model_actor_provenance(
+    model: Any,
+) -> tuple[Mapping[str, Any], Mapping[str, Any]] | None:
+    """Return canonical planner provenance, rejecting half-populated configs."""
+
+    config = getattr(model, "config", None)
+    initialization = getattr(config, "actor_initialization_attestation", None)
+    lineage = getattr(config, "actor_update_lineage", None)
+    if initialization is None and lineage is None:
+        return None
+    if not isinstance(initialization, Mapping) or not isinstance(lineage, Mapping):
+        raise RuntimeError(
+            "provenance-aware policy config must contain both actor "
+            "initialization and update lineage mappings"
+        )
+    return initialization, lineage
+
+
+def _validated_actor_lineage(
+    initialization: Mapping[str, Any],
+    lineage: Mapping[str, Any],
+    *,
+    expected_step: int,
+    expected_actor_state_sha256: str | None = None,
+    expected_model_weights_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Validate one lineage snapshot before it crosses a resume boundary."""
+
+    if initialization.get("schema") != _ACTOR_INITIALIZATION_SCHEMA:
+        raise RuntimeError("actor initialization attestation schema is invalid")
+    if lineage.get("schema") != _ACTOR_UPDATE_LINEAGE_SCHEMA:
+        raise RuntimeError("actor update lineage schema is invalid")
+    if lineage.get("initialization_attestation_sha256") != (
+        _canonical_mapping_sha256(initialization)
+    ):
+        raise RuntimeError("actor update lineage identifies another initialization")
+    if lineage.get("training_export_step") != expected_step:
+        raise RuntimeError(
+            "actor update lineage step differs from the Cosmos checkpoint: "
+            f"lineage={lineage.get('training_export_step')!r}, "
+            f"checkpoint={expected_step}"
+        )
+    current_weights = lineage.get("current_model_weights_sha256")
+    if (
+        not isinstance(current_weights, str)
+        or _SHA256.fullmatch(current_weights) is None
+    ):
+        raise RuntimeError("actor update lineage has no valid current weight identity")
+    if (
+        expected_model_weights_sha256 is not None
+        and current_weights != expected_model_weights_sha256
+    ):
+        raise RuntimeError("actor update lineage does not match loaded model weights")
+    actor_extension_presence = tuple(
+        name in lineage for name in _ACTOR_STATE_LINEAGE_FIELDS
+    )
+    if any(actor_extension_presence) and not all(actor_extension_presence):
+        raise RuntimeError(
+            "actor update lineage has an incomplete actor-state identity"
+        )
+    has_actor_state_identity = all(actor_extension_presence)
+    current_actor_state: str | None = None
+    if has_actor_state_identity:
+        if lineage.get("actor_state_hash_schema") != _ACTOR_STATE_HASH_SCHEMA:
+            raise RuntimeError("actor update lineage has an invalid actor-state schema")
+        candidate = lineage.get("current_actor_state_sha256")
+        if not isinstance(candidate, str) or _SHA256.fullmatch(candidate) is None:
+            raise RuntimeError(
+                "actor update lineage has no valid current actor identity"
+            )
+        current_actor_state = candidate
+        if (
+            expected_actor_state_sha256 is not None
+            and current_actor_state != expected_actor_state_sha256
+        ):
+            raise RuntimeError("actor update lineage does not match loaded actor state")
+    if expected_step == 0:
+        if (
+            lineage.get("current_actor_status") not in _ACTOR_INITIAL_STATUSES
+            or lineage.get("parent_model_weights_sha256") is not None
+            or lineage.get("parent_update_lineage_sha256") is not None
+        ):
+            raise RuntimeError("initial actor update lineage is inconsistent")
+        if (
+            has_actor_state_identity
+            and lineage.get("parent_actor_state_sha256") is not None
+        ):
+            raise RuntimeError("initial actor update lineage identifies a parent actor")
+    else:
+        for name in (
+            "parent_model_weights_sha256",
+            "parent_update_lineage_sha256",
+        ):
+            value = lineage.get(name)
+            if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+                raise RuntimeError(f"actor update lineage has invalid {name}")
+        if has_actor_state_identity:
+            parent_actor_state = lineage.get("parent_actor_state_sha256")
+            if (
+                not isinstance(parent_actor_state, str)
+                or _SHA256.fullmatch(parent_actor_state) is None
+            ):
+                raise RuntimeError(
+                    "actor update lineage has no valid parent actor identity"
+                )
+            expected_status = (
+                _ACTOR_STATUS_UNCHANGED
+                if current_actor_state == parent_actor_state
+                else _ACTOR_STATUS_TRAINED
+            )
+            if lineage.get("current_actor_status") != expected_status:
+                raise RuntimeError(
+                    "actor update lineage status disagrees with actor-state hashes"
+                )
+        elif lineage.get("current_actor_status") != _ACTOR_STATUS_TRAINED:
+            raise RuntimeError("legacy resumed actor must be a trained descendant")
+    return dict(lineage)
+
+
+def _model_actor_state_identity(
+    model: Any,
+    lineage: Mapping[str, Any],
+) -> str | None:
+    """Recompute actor identity only for lineage snapshots that declare it."""
+
+    presence = tuple(name in lineage for name in _ACTOR_STATE_LINEAGE_FIELDS)
+    if not any(presence):
+        return None
+    if not all(presence):
+        raise RuntimeError(
+            "actor update lineage has an incomplete actor-state identity"
+        )
+    identity = getattr(model, "actor_state_sha256", None)
+    if not callable(identity):
+        raise RuntimeError(
+            "actor-state-aware lineage requires model.actor_state_sha256()"
+        )
+    digest = identity()
+    if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+        raise RuntimeError("model returned an invalid actor-state identity")
+    return digest
+
+
+def _model_weights_identity(model: Any) -> str:
+    """Recompute the full policy-native weight identity after load or before save."""
+
+    identity = getattr(model, "model_weights_sha256", None)
+    if not callable(identity):
+        raise RuntimeError(
+            "provenance-aware lineage requires model.model_weights_sha256()"
+        )
+    digest = identity()
+    if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+        raise RuntimeError("model returned an invalid full-model weight identity")
+    return digest
 
 
 def _fixed_reference_reset_interval(value: int | None) -> int:
@@ -70,6 +257,35 @@ def _load_run_config(config: _cosmos_config.Config) -> RunConfig:
             "AlpaGym run config. Production cosmos invocations set this via --config."
         )
     return load_run_config(resolved_config_path)
+
+
+def _requires_planner_every_update_checkpoint(run_config: RunConfig) -> bool:
+    """Return whether this is trainable current-policy H70 PPO."""
+
+    bundle_config = dict(run_config.policy.model.bundle_config)
+    return (
+        run_config.policy.model.kind == "g1_videomimic_planner"
+        and bundle_config.get("planner_mode", "shadow_rollout") == "shadow_rollout"
+        and run_config.cosmos.train.train_policy.grpo_optimization_iterations > 0
+    )
+
+
+def _validate_planner_every_update_checkpoint_config(config: Any) -> None:
+    """Fail closed if Cosmos did not load the canonical checkpoint schedule."""
+
+    checkpoint = getattr(getattr(config, "train", None), "ckpt", None)
+    if (
+        not bool(getattr(checkpoint, "enable_checkpoint", False))
+        or int(getattr(checkpoint, "save_freq", 0)) != 1
+        or int(getattr(checkpoint, "save_freq_in_epoch", -1)) != 0
+        or not bool(getattr(checkpoint, "export_safetensors", False))
+        or int(getattr(checkpoint, "max_keep", 0)) != -1
+    ):
+        raise ValueError(
+            "current-policy H70 PPO requires Cosmos to load "
+            "enable_checkpoint=true, save_freq=1, save_freq_in_epoch=0, "
+            "export_safetensors=true, max_keep=-1"
+        )
 
 
 @_trainer_base.TrainerRegistry.register(trainer_type="alpagym_grpo")
@@ -119,6 +335,11 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         # Production cosmos invocations always set `custom.resolved_config_path` via
         # `--config`.
         run_config = _load_run_config(config)
+        self._planner_every_update_checkpoint = (
+            _requires_planner_every_update_checkpoint(run_config)
+        )
+        if self._planner_every_update_checkpoint:
+            _validate_planner_every_update_checkpoint_config(config)
         initialize_perf(run_config)
         # Cosmos's super-init resolves a tokenizer from
         # ``config.policy.model_name_or_path`` and calls ``ModelRegistry.build_model``.
@@ -235,12 +456,29 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         post_update_metrics = self._post_update_diagnostics(samples)
         self.lr_schedulers.step()
         checkpoint_config = getattr(self.config.train, "ckpt", None)
-        final_checkpoint_fallback = (
-            bool(getattr(checkpoint_config, "enable_checkpoint", False))
-            and current_step == total_steps
+        checkpoint_enabled = bool(
+            getattr(checkpoint_config, "enable_checkpoint", False)
         )
-        if is_master_replica and (do_save_checkpoint or final_checkpoint_fallback):
-            if final_checkpoint_fallback and not do_save_checkpoint:
+        planner_every_update_checkpoint = bool(
+            getattr(self, "_planner_every_update_checkpoint", False)
+        )
+        final_checkpoint_fallback = checkpoint_enabled and current_step == total_steps
+        if is_master_replica and (
+            do_save_checkpoint
+            or planner_every_update_checkpoint
+            or final_checkpoint_fallback
+        ):
+            if planner_every_update_checkpoint and not do_save_checkpoint:
+                logger.info(
+                    "Cosmos did not request the current-policy H70 checkpoint on "
+                    "trainer step %d; applying AlpaGym every-update fallback",
+                    current_step,
+                )
+            if (
+                final_checkpoint_fallback
+                and not planner_every_update_checkpoint
+                and not do_save_checkpoint
+            ):
                 # Some Cosmos colocated controller paths send the final real
                 # DataFetchCommand with do_save=False and then stop the policy
                 # worker before its synthetic TrainingCompleteCommand can run.
@@ -663,6 +901,22 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
                     dtype=getattr(torch, str(self.config.train.param_dtype).lower()),
                 )
 
+        checkpoint_metadata: dict[str, Any] = {}
+        actor_provenance = _model_actor_provenance(self.model)
+        if actor_provenance is not None:
+            initialization, lineage = actor_provenance
+            checkpoint_metadata[_ACTOR_LINEAGE_CHECKPOINT_KEY] = (
+                _validated_actor_lineage(
+                    initialization,
+                    lineage,
+                    expected_step=current_step,
+                    expected_actor_state_sha256=_model_actor_state_identity(
+                        self.model,
+                        lineage,
+                    ),
+                    expected_model_weights_sha256=_model_weights_identity(self.model),
+                )
+            )
         logger.info("[Policy] Saving cosmos checkpoint at step %d", current_step)
         self.ckpt_manager.save_checkpoint(
             model=self.model,
@@ -672,6 +926,7 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
             total_steps=total_steps,
             remain_samples_num=remain_samples_num,
             is_final=is_last_step,
+            **checkpoint_metadata,
         )
         self.ckpt_manager.save_check(step=current_step)
 
@@ -679,18 +934,61 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
     # Reference model lifecycle
     # ------------------------------------------------------------------
 
+    def weight_resume(self) -> dict[str, Any]:
+        """Load weights and validate planner actor lineage on resume."""
+        resume_requested = bool(getattr(self.config.train, "resume", False))
+        checkpoint_info = super().weight_resume()
+        actor_provenance = _model_actor_provenance(self.model)
+        checkpoint_step = checkpoint_info.get("step")
+        if (
+            resume_requested
+            and checkpoint_step is None
+            and actor_provenance is not None
+        ):
+            raise RuntimeError(
+                "canonical planner resume was requested, but Cosmos "
+                "did not restore a checkpoint step; refusing its fallback to the "
+                "initial policy"
+            )
+        if actor_provenance is not None and checkpoint_step is not None:
+            if (
+                isinstance(checkpoint_step, bool)
+                or not isinstance(checkpoint_step, int)
+                or checkpoint_step < 1
+            ):
+                raise RuntimeError(
+                    f"resumed Cosmos checkpoint has invalid step {checkpoint_step!r}"
+                )
+            initialization, _ = actor_provenance
+            resumed_lineage = checkpoint_info.get(_ACTOR_LINEAGE_CHECKPOINT_KEY)
+            if not isinstance(resumed_lineage, Mapping):
+                raise RuntimeError(
+                    "provenance-aware policy resume checkpoint has no actor lineage"
+                )
+            restored_lineage = _validated_actor_lineage(
+                initialization,
+                resumed_lineage,
+                expected_step=checkpoint_step,
+                expected_actor_state_sha256=_model_actor_state_identity(
+                    self.model,
+                    resumed_lineage,
+                ),
+                expected_model_weights_sha256=_model_weights_identity(self.model),
+            )
+            self.model.config.actor_update_lineage = restored_lineage
+        self._reference_model = None
+        return checkpoint_info
+
     def _ensure_reference_model(self) -> None:
-        """Create the frozen initial-policy KL reference on first use.
+        """Create the frozen initial-policy reference on first use.
 
         Stores the reference on a private attribute (not registered as a
-        submodule, since `Trainer` is an ABC, not an `nn.Module`). The
-        inherited ``GRPOTrainer.weight_resume`` loads the configured policy
-        before loading a Cosmos resume checkpoint and records those initial
-        weights in ``self.reference_state_dict``. Building the teacher from
-        that state, rather than from the possibly-resumed live model, keeps
-        ``reference_reset_interval=0`` anchored to the same initial policy
-        across process restarts. We drive KL via ``teacher_model=`` on the
-        model forward rather than Cosmos's state-dict swapping path.
+        submodule, since `Trainer` is an ABC, not an `nn.Module`). AlpaGym's
+        ``weight_resume`` records the configured initial policy before a
+        Cosmos checkpoint can restore different live weights. Building the
+        teacher from that state keeps both KL and actor-mean anchoring fixed
+        across process restarts. We drive the reference via ``teacher_model=``
+        on the model forward rather than Cosmos's state-dict swapping path.
         """
         if self._kl_beta <= 0.0 or self._reference_model is not None:
             return

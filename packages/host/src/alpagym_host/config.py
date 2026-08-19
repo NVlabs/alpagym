@@ -421,6 +421,9 @@ class HumanoidAlpaSimConfig:
     scene_store_path: str
     scenario_ids_by_scene: dict[str, str]
     execution_profile: HumanoidExecutionProfile = HumanoidExecutionProfile.direct_action
+    # Host-derived from the planner mode before the resolved run config is
+    # written. It selects the exact AlpaSim motion-reference wire profile.
+    reference_frame_count: int = 70
     # Required by the fixed GRAIL/SONIC controller image in reference mode.
     grail_root_path: str | None = None
     # Host-frozen identity snapshot.  Authored configs leave this empty; run
@@ -466,8 +469,8 @@ class HumanoidAlpaSimConfig:
             ):
                 raise ValueError(
                     "motion_reference reward_profile_id must be one of "
-                    "reference_route_centered.v1, reference_route_centered.v2, or "
-                    "reference_route_centered.v3"
+                    "reference_route_centered.v1, reference_route_centered.v2, "
+                    "or reference_route_centered.v3"
                 )
         elif self.reward_profile_id != "direct_v9_shaped.v1":
             raise ValueError(

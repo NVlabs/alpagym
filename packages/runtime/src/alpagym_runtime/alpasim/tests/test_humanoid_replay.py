@@ -6,7 +6,9 @@
 import pytest
 import torch
 
-from alpagym_runtime.alpasim.humanoid_replay import attach_humanoid_transitions
+from alpagym_runtime.alpasim.humanoid_replay import (
+    attach_humanoid_transitions,
+)
 from alpagym_runtime.replay import ActionSelection, PolicyReplayData
 from alpagym_runtime.types import PolicyOutput
 
@@ -51,23 +53,28 @@ def _motion_output(
     terminated: bool = True,
     outer_truncated: bool = False,
     active_digest: str | None = None,
+    applied_digest: str | None = None,
     root_offset: float = 0.125,
+    frame_count: int = 70,
+    step: int = 0,
+    reward_total: float = 1.0,
 ) -> PolicyOutput:
     digest = "a" * 64
-    rewards = [1.0 / duration] * duration
+    rewards = [reward_total / duration] * duration
+    controller_step_start = step * 25
     ticks = [
         {
             "control_tick_offset": index + 1,
             "reference_action_index": index,
-            "timestamp_us": (index + 1) * 20_000,
+            "timestamp_us": (controller_step_start + index + 1) * 20_000,
             "active_reference_id": 7,
             "active_reference_sha256": active_digest or digest,
-            "applied_reference_sha256": digest,
+            "applied_reference_sha256": applied_digest or digest,
             "root_z_alignment_offset_m": root_offset,
             "reward": rewards[index],
             "terminated": terminated and index == duration - 1,
             "truncated": False,
-            "control_episode_step": index + 1,
+            "control_episode_step": controller_step_start + index + 1,
         }
         for index in range(duration)
     ]
@@ -80,28 +87,28 @@ def _motion_output(
         old_logprob=torch.tensor(0.0),
         payload={
             "reference_id": 7,
-            "source_decision_id": 0,
+            "source_decision_id": step,
             "reference_sha256": digest,
             "root_z_alignment_offset_m": 0.125,
             "feedback_trace": {
                 "env_id": 0,
-                "source_decision_id": 0,
+                "source_decision_id": step,
                 "ticks": ticks,
             },
             **({"outer_truncated": True} if outer_truncated else {}),
         },
     )
     return PolicyOutput(
-        chosen_xyz=torch.zeros((50, 3)),
-        chosen_quat=torch.tensor([[1.0, 0.0, 0.0, 0.0]] * 50),
-        chosen_dt_us=torch.arange(50, dtype=torch.int64) * 20_000,
+        chosen_xyz=torch.zeros((frame_count, 3)),
+        chosen_quat=torch.tensor([[1.0, 0.0, 0.0, 0.0]] * frame_count),
+        chosen_dt_us=torch.arange(frame_count, dtype=torch.int64) * 20_000,
         replay_data=replay,
         model_extra={
             "humanoid_env_id": 0,
             "humanoid_episode_id": 4,
-            "humanoid_step_index": 0,
-            "humanoid_decision_id": 0,
-            "humanoid_timestamp_us": 0,
+            "humanoid_step_index": step,
+            "humanoid_decision_id": step,
+            "humanoid_timestamp_us": controller_step_start * 20_000,
             "humanoid_value": 0.5,
         },
     )
@@ -273,7 +280,7 @@ def test_missing_reward_metric_fails_instead_of_zero_filling() -> None:
         )
 
 
-@pytest.mark.parametrize("duration", (1, 5))
+@pytest.mark.parametrize("duration", (1, 5, 25))
 def test_motion_reference_receipt_emits_exact_smdp_prefix(duration: int) -> None:
     patched = attach_humanoid_transitions(
         (_motion_output(duration=duration),),
@@ -285,38 +292,56 @@ def test_motion_reference_receipt_emits_exact_smdp_prefix(duration: int) -> None
         {"humanoid_episode_length_env0": 1.0},
         behavior_policy_version=9,
         final_bootstrap_values={},
-        control_timestep_us=100_000,
+        control_timestep_us=500_000,
         expected_num_envs=1,
-        max_transition_rows=150,
+        max_transition_rows=30,
     )
 
     transition = patched[0].replay_data.payload["transition"]
     assert transition["duration_ticks"] == duration
     assert transition["primitive_reward_mask"] == [
-        index < duration for index in range(5)
+        index < duration for index in range(25)
     ]
     assert sum(transition["primitive_rewards"]) == pytest.approx(1.0)
     assert transition["terminated"] is True
     assert transition["bootstrap_value"] == 0.0
 
 
+def test_motion_reference_replay_rejects_non_k25_contract() -> None:
+    with pytest.raises(ValueError, match="must select K=25"):
+        attach_humanoid_transitions(
+            (_motion_output(duration=1),),
+            _motion_metrics(
+                timestamp_us=20_000,
+                terminated=True,
+                truncated=False,
+            ),
+            {"humanoid_episode_length_env0": 1.0},
+            behavior_policy_version=9,
+            final_bootstrap_values={},
+            control_timestep_us=20_000,
+            expected_num_envs=1,
+            max_transition_rows=30,
+        )
+
+
 def test_motion_reference_outer_horizon_truncates_after_full_controller_prefix() -> (
     None
 ):
     dense = _motion_metrics(
-        timestamp_us=100_000,
+        timestamp_us=500_000,
         terminated=False,
         truncated=True,
     )
     dense["humanoid_final_bootstrap_value_env0"] = {
-        "timestamps_us": [100_000],
+        "timestamps_us": [500_000],
         "values": [2.0],
         "valid": [True],
     }
     patched = attach_humanoid_transitions(
         (
             _motion_output(
-                duration=5,
+                duration=25,
                 terminated=False,
                 outer_truncated=True,
             ),
@@ -328,15 +353,15 @@ def test_motion_reference_outer_horizon_truncates_after_full_controller_prefix()
         },
         behavior_policy_version=9,
         final_bootstrap_values={0: 2.0},
-        control_timestep_us=100_000,
+        control_timestep_us=500_000,
         expected_num_envs=1,
-        max_transition_rows=150,
+        max_transition_rows=30,
     )
 
     transition = patched[0].replay_data.payload["transition"]
     assert transition["terminated"] is False
     assert transition["truncated"] is True
-    assert transition["duration_ticks"] == 5
+    assert transition["duration_ticks"] == 25
     assert transition["bootstrap_value"] == pytest.approx(2.0)
 
 
@@ -368,7 +393,30 @@ def test_motion_reference_receipt_rejects_mixed_identity(
             {"humanoid_episode_length_env0": 1.0},
             behavior_policy_version=9,
             final_bootstrap_values={},
-            control_timestep_us=100_000,
+            control_timestep_us=500_000,
             expected_num_envs=1,
-            max_transition_rows=150,
+            max_transition_rows=30,
+        )
+
+
+def test_h70_replay_rejects_rewritten_applied_reference_hash() -> None:
+    with pytest.raises(ValueError, match="H70 feedback applied reference digest"):
+        attach_humanoid_transitions(
+            (
+                _motion_output(
+                    duration=1,
+                    applied_digest="b" * 64,
+                ),
+            ),
+            _motion_metrics(
+                timestamp_us=20_000,
+                terminated=True,
+                truncated=False,
+            ),
+            {"humanoid_episode_length_env0": 1.0},
+            behavior_policy_version=9,
+            final_bootstrap_values={},
+            control_timestep_us=500_000,
+            expected_num_envs=1,
+            max_transition_rows=30,
         )

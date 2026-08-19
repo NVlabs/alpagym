@@ -11,7 +11,8 @@ from typing import Any, Mapping, cast
 
 from alpagym_runtime.types import PolicyOutput
 
-_MOTION_CONTROLLER_TICKS = 5
+_MOTION_REFERENCE_TICK_US = 20_000
+_MOTION_CONTROLLER_TICKS = 25
 
 
 def attach_humanoid_transitions(
@@ -121,6 +122,17 @@ def attach_humanoid_transitions(
             motion_reference = "reference_sha256" in payload
             receipt_fields: dict[str, Any] = {}
             if motion_reference:
+                reference_frame_count = int(output.chosen_xyz.shape[0])
+                if reference_frame_count != 70:
+                    raise ValueError("motion-reference replay must carry H70")
+                controller_ticks, remainder_us = divmod(
+                    control_timestep_us, _MOTION_REFERENCE_TICK_US
+                )
+                if remainder_us or controller_ticks != _MOTION_CONTROLLER_TICKS:
+                    raise ValueError(
+                        "motion-reference replay control_timestep_us must select "
+                        "K=25 on the 20000us controller grid"
+                    )
                 (
                     reward,
                     terminated,
@@ -136,6 +148,7 @@ def attach_humanoid_transitions(
                     metric_reward=metric_reward,
                     metric_terminated=metric_terminated,
                     metric_truncated=metric_truncated,
+                    controller_ticks=controller_ticks,
                 )
             else:
                 expected_timestamp = (
@@ -224,6 +237,7 @@ def _motion_reference_receipt(
     metric_reward: float,
     metric_terminated: bool,
     metric_truncated: bool,
+    controller_ticks: int,
 ) -> tuple[float, bool, bool, int, int, dict[str, Any]]:
     """Validate one exact controller trace and derive its SMDP transition."""
     trace = payload.get("feedback_trace")
@@ -247,11 +261,11 @@ def _motion_reference_receipt(
     if reference_id <= 0 or not math.isfinite(root_z_offset):
         raise ValueError("motion-reference replay has invalid reference identity")
     ticks = trace.get("ticks")
-    if not isinstance(ticks, list) or not 1 <= len(ticks) <= _MOTION_CONTROLLER_TICKS:
+    if not isinstance(ticks, list) or not 1 <= len(ticks) <= controller_ticks:
         raise ValueError("motion-reference feedback ticks must be a non-empty K-prefix")
 
-    primitive_rewards = [0.0] * _MOTION_CONTROLLER_TICKS
-    primitive_mask = [False] * _MOTION_CONTROLLER_TICKS
+    primitive_rewards = [0.0] * controller_ticks
+    primitive_mask = [False] * controller_ticks
     previous_timestamp: int | None = None
     applied_hashes: list[str] = []
     for action_index, tick in enumerate(ticks):
@@ -275,12 +289,15 @@ def _motion_reference_receipt(
             != reference_sha256
         ):
             raise ValueError("feedback active reference digest does not match plan")
-        applied_hashes.append(
-            _require_sha256(
-                "feedback applied_reference_sha256",
-                tick.get("applied_reference_sha256"),
-            )
+        applied_sha256 = _require_sha256(
+            "feedback applied_reference_sha256",
+            tick.get("applied_reference_sha256"),
         )
+        if applied_sha256 != reference_sha256:
+            raise ValueError(
+                "H70 feedback applied reference digest does not match source plan"
+            )
+        applied_hashes.append(applied_sha256)
         if not math.isclose(
             float(tick.get("root_z_alignment_offset_m", math.nan)),
             root_z_offset,
@@ -318,7 +335,7 @@ def _motion_reference_receipt(
     )
     if terminated and truncated:
         raise ValueError("terminated motion lane cannot be outer-truncated")
-    if len(ticks) < _MOTION_CONTROLLER_TICKS and not (terminated or truncated):
+    if len(ticks) < controller_ticks and not (terminated or truncated):
         raise ValueError("short motion-reference trace must end the transition")
     reward = float(sum(primitive_rewards))
     if not math.isclose(reward, metric_reward, rel_tol=1.0e-6, abs_tol=1.0e-6):

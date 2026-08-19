@@ -113,7 +113,6 @@ cosmos:
     train_batch_per_replica: 1
     max_num_steps: 1
     num_epochs: 1
-    # AdamW learning rate (Cosmos-RL default: 1e-6).
     optm_lr: 1.0e-6
     # Linear warmup steps for the learning rate (Cosmos-RL default: 20).
     optm_warmup_steps: 20
@@ -157,6 +156,9 @@ cosmos:
       # Clamp learned Gaussian exploration after every optimizer step.
       ppo_min_action_std: 0.02
       ppo_max_action_std: 2.0
+      # Fixed flattened transition count, independent from rollout/shard
+      # mini_batch above.
+      step_mini_batch: null
   policy:
     parallelism:
       tp_size: 1

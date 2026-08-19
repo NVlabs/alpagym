@@ -35,11 +35,13 @@ class G1MjlabHumanoidPolicy:
         self,
         inference_engine: InferenceEngine,
         *,
+        session_uuid: str,
         device: torch.device,
         deterministic: bool = False,
         random_seed: int = 0,
     ) -> None:
         self._inference_engine = inference_engine
+        self._session_uuid = session_uuid
         self._device = device
         self._deterministic = bool(deterministic)
         self._generator = torch.Generator(device=device)
@@ -51,11 +53,15 @@ class G1MjlabHumanoidPolicy:
         *,
         sample_actions: bool = True,
     ) -> tuple[HumanoidPolicyStepOutput, ...]:
-        observations = [split_flat_observation(item.observation) for item in policy_inputs]
+        observations = [
+            split_flat_observation(item.observation) for item in policy_inputs
+        ]
         obs_batch = stack_observations(observations, self._device)
-        model = self._inference_engine.get_model()
+        model = self._inference_engine.get_model_for_session(self._session_uuid)
         if not isinstance(model, G1MjlabActorCriticModel):
-            raise TypeError(f"expected G1MjlabActorCriticModel, got {type(model).__name__}")
+            raise TypeError(
+                f"expected G1MjlabActorCriticModel, got {type(model).__name__}"
+            )
         model.eval()
         with torch.no_grad():
             actions, log_probs, values, _means = model.act(
@@ -95,13 +101,15 @@ def build_humanoid_policy_factory(
 ):
     """Build the per-session factory consumed by ``HumanoidPolicyServer``."""
     device = torch.device(run_config.policy.model.device)
-    deterministic = bool(run_config.policy.model.bundle_config.get("deterministic", False))
+    deterministic = bool(
+        run_config.policy.model.bundle_config.get("deterministic", False)
+    )
 
     def _factory(session_uuid: str, request: Any) -> G1MjlabHumanoidPolicy:
-        del session_uuid
         _validate_session_request(request)
         return G1MjlabHumanoidPolicy(
             inference_engine,
+            session_uuid=session_uuid,
             device=device,
             deterministic=deterministic,
             random_seed=int(request.random_seed),
@@ -119,7 +127,9 @@ def _validate_session_request(request: Any) -> None:
     }
     for field, (actual, expected) in scalar_fields.items():
         if actual != expected:
-            raise ValueError(f"Humanoid session {field} must be {expected!r}, got {actual!r}")
+            raise ValueError(
+                f"Humanoid session {field} must be {expected!r}, got {actual!r}"
+            )
     observation_terms = tuple(
         (str(term.name), int(term.size)) for term in request.observation_terms
     )

@@ -22,6 +22,8 @@ import logging
 import os
 import queue
 import sys
+import threading
+from copy import deepcopy
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Final
@@ -32,7 +34,13 @@ from alpagym_host.config import SamplingParamsConfig
 from alpagym_runtime.perf.instrument.scope import timed_scope
 from alpagym_runtime.replay import ActionSelection, PolicyReplayData
 
-from .types import BatchedModelInput, BatchedModelOutput, InferenceModel, ModelInput, ModelOutput
+from .types import (
+    BatchedModelInput,
+    BatchedModelOutput,
+    InferenceModel,
+    ModelInput,
+    ModelOutput,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +60,14 @@ class _Shutdown:
 _SHUTDOWN: Final[_Shutdown] = _Shutdown()
 
 
+@dataclass(frozen=True, slots=True)
+class InferenceModelLease:
+    """One immutable rollout-model snapshot bound to a behavior version."""
+
+    behavior_policy_version: int
+    model: torch.nn.Module
+
+
 class InferenceEngine:
     """Queue-based batched dispatcher into one `InferenceModel`."""
 
@@ -61,13 +77,20 @@ class InferenceEngine:
         sampling: SamplingParamsConfig,
         return_trace_for_rl: bool,
         max_batch_size: int,
+        *,
+        require_session_model_leases: bool = False,
     ) -> None:
         """Wire the dispatcher with its model and batching settings."""
         self._inference_model = inference_model
         self._sampling_config = sampling
         self._return_trace_for_rl = return_trace_for_rl
         self._max_batch_size = max_batch_size
-        self._queue: queue.SimpleQueue[_PendingRequest | _Shutdown] = queue.SimpleQueue()
+        self._require_session_model_leases = bool(require_session_model_leases)
+        self._model_lock = threading.RLock()
+        self._session_model_leases: dict[str, InferenceModelLease] = {}
+        self._queue: queue.SimpleQueue[_PendingRequest | _Shutdown] = (
+            queue.SimpleQueue()
+        )
 
     def infer(self, model_input: ModelInput) -> Future[ModelOutput]:
         """Enqueue one `ModelInput` and return its result handle."""
@@ -90,11 +113,85 @@ class InferenceEngine:
 
     def get_model(self) -> torch.nn.Module:
         """Return the rollout-serving model object."""
-        return self._inference_model.get_model()
+        with self._model_lock:
+            return self._inference_model.get_model()
+
+    @property
+    def requires_session_model_leases(self) -> bool:
+        """Whether every humanoid session must resolve an immutable model lease."""
+
+        return self._require_session_model_leases
+
+    def create_model_lease(self, behavior_policy_version: int) -> InferenceModelLease:
+        """Clone the live model into a read-only snapshot for one rollout version.
+
+        The disaggregated rollout backend calls this only after Cosmos has made
+        ``current_weight_version`` live.  Later R2R writes target the live model,
+        while policies holding this independent module keep scoring and sampling
+        from the exact weights that opened their episode.
+        """
+
+        if (
+            isinstance(behavior_policy_version, bool)
+            or not isinstance(behavior_policy_version, int)
+            or behavior_policy_version < 0
+        ):
+            raise ValueError("model lease requires a non-negative behavior version")
+        with self._model_lock:
+            snapshot = deepcopy(self._inference_model.get_model())
+        snapshot.eval()
+        snapshot.requires_grad_(False)
+        return InferenceModelLease(
+            behavior_policy_version=behavior_policy_version,
+            model=snapshot,
+        )
+
+    def register_session_model_lease(
+        self,
+        session_uuid: str,
+        lease: InferenceModelLease,
+    ) -> None:
+        """Bind one session UUID to its already-snapshotted behavior model."""
+
+        if not session_uuid:
+            raise ValueError("model lease registration requires a session UUID")
+        if not isinstance(lease, InferenceModelLease):
+            raise TypeError("session model lease has an unexpected type")
+        with self._model_lock:
+            if session_uuid in self._session_model_leases:
+                raise ValueError(f"session {session_uuid!r} already has a model lease")
+            self._session_model_leases[session_uuid] = lease
+
+    def release_session_model_lease(self, session_uuid: str) -> None:
+        """Release the immutable model snapshot after a session closes or fails."""
+
+        with self._model_lock:
+            try:
+                self._session_model_leases.pop(session_uuid)
+            except KeyError as exc:
+                raise ValueError(
+                    f"session {session_uuid!r} has no model lease to release"
+                ) from exc
+
+    def get_model_for_session(self, session_uuid: str) -> torch.nn.Module:
+        """Return a session snapshot, or the live model in colocated mode."""
+
+        if not session_uuid:
+            raise ValueError("session model lookup requires a session UUID")
+        with self._model_lock:
+            lease = self._session_model_leases.get(session_uuid)
+            if lease is not None:
+                return lease.model
+            if self._require_session_model_leases:
+                raise RuntimeError(
+                    f"session {session_uuid!r} has no immutable model lease"
+                )
+            return self._inference_model.get_model()
 
     def set_model(self, model: torch.nn.Module) -> None:
         """Forward Cosmos weight-sync replacement into the rollout-serving model."""
-        self._inference_model.set_model(model)
+        with self._model_lock:
+            self._inference_model.set_model(model)
 
     def run_loop(self) -> None:
         """Drain the queue and dispatch batches until shutdown drains it."""
@@ -122,7 +219,9 @@ class InferenceEngine:
                 model_inputs = [req.model_input for req in batch]
                 batched_model_input = BatchedModelInput.stack(model_inputs)
                 with timed_scope(
-                    "rollout/inference_forward", category="compute_gpu_wall", gpu_snapshot=True
+                    "rollout/inference_forward",
+                    category="compute_gpu_wall",
+                    gpu_snapshot=True,
                 ):
                     batched_model_output: BatchedModelOutput = (
                         self._inference_model.sample_trajectories_from_data(
@@ -146,7 +245,9 @@ class InferenceEngine:
                     try:
                         store.write_atomic()
                     except Exception:
-                        logger.exception("InferenceEngine failed to flush perf artifact")
+                        logger.exception(
+                            "InferenceEngine failed to flush perf artifact"
+                        )
                 sys.stderr.flush()
                 os._exit(1)
 

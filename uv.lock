@@ -140,6 +140,7 @@ version = "0.1.0"
 source = { editable = "packages/policies/g1_videomimic_planner" }
 dependencies = [
     { name = "alpagym-g1-mjlab" },
+    { name = "alpagym-host" },
     { name = "alpagym-runtime" },
     { name = "mujoco" },
     { name = "safetensors" },
@@ -149,6 +150,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "alpagym-g1-mjlab", editable = "packages/policies/g1_mjlab" },
+    { name = "alpagym-host", editable = "packages/host" },
     { name = "alpagym-runtime", editable = "packages/runtime" },
     { name = "mujoco", specifier = "==3.10.0" },
     { name = "safetensors" },

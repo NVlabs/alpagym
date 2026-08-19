@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -170,7 +171,9 @@ class G1MjlabActorCriticModel(BaseModel):
         if checkpoint_path is None:
             self._weights_loaded = True
             return
-        if checkpoint_path.suffix == ".safetensors":
+        if checkpoint_path.name == "model.safetensors.index.json":
+            state_dict = _load_safetensors_shards(checkpoint_path)
+        elif checkpoint_path.suffix == ".safetensors":
             from safetensors.torch import load_file
 
             state_dict = load_file(str(checkpoint_path), device="cpu")
@@ -236,6 +239,53 @@ class G1MjlabActorCriticModel(BaseModel):
                 teacher_dist = torch.distributions.Normal(teacher_mean, teacher_std)
             kl_div = torch.distributions.kl_divergence(dist, teacher_dist).sum(dim=-1)
         return {"log_probs": log_probs, "values": value.squeeze(-1), "kl_div": kl_div}
+
+    def forward_values(self, obs: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """Evaluate only the critic head for value-only PPO optimization."""
+
+        return self._head(obs, actor=False).squeeze(-1)
+
+    def ppo_parameter_groups(
+        self,
+    ) -> dict[str, tuple[nn.Parameter, ...]]:
+        """Return the complete actor/critic ownership partition.
+
+        Planner checkpoint provenance hashes the actor group, including the
+        standalone action standard deviation and optional actor context, while
+        excluding every critic parameter.
+        """
+        actor_parameters = [
+            *self.actor.parameters(),
+            *self.actor_terrain.parameters(),
+            self.actor_attention,
+            self.std,
+        ]
+        critic_parameters = [
+            *self.critic.parameters(),
+            *self.critic_terrain.parameters(),
+            self.critic_attention,
+        ]
+        if self.actor_context is not None:
+            actor_parameters.extend(self.actor_context.parameters())
+        if self.critic_context is not None:
+            critic_parameters.extend(self.critic_context.parameters())
+        groups = {
+            "actor": tuple(actor_parameters),
+            "critic": tuple(critic_parameters),
+        }
+        trainable_ids = {
+            id(parameter) for parameter in self.parameters() if parameter.requires_grad
+        }
+        actor_ids = {id(parameter) for parameter in groups["actor"]}
+        critic_ids = {id(parameter) for parameter in groups["critic"]}
+        if actor_ids & critic_ids:
+            raise RuntimeError("actor and critic parameter groups overlap")
+        if actor_ids | critic_ids != trainable_ids:
+            raise RuntimeError(
+                "actor/critic parameter groups do not cover every trainable "
+                "model parameter"
+            )
+        return groups
 
     def act(
         self,
@@ -473,10 +523,50 @@ def _resolve_checkpoint_path(
         return None
     path = Path(configured_path)
     if not path.is_absolute():
-        path = Path(model_name_or_path) / path
+        model_dir = Path(model_name_or_path)
+        path = model_dir / path
+        safetensors_index = model_dir / "model.safetensors.index.json"
+        if path.name == "pytorch_model.bin" and safetensors_index.is_file():
+            return safetensors_index
+        safetensors_file = model_dir / "model.safetensors"
+        if path.name == "pytorch_model.bin" and safetensors_file.is_file():
+            return safetensors_file
     if not path.is_file():
         raise FileNotFoundError(f"G1 checkpoint not found: {path}")
     return path
+
+
+def _load_safetensors_shards(index_path: Path) -> dict[str, torch.Tensor]:
+    """Load the tensors named by a HuggingFace safetensors shard index."""
+    from safetensors.torch import load_file
+
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    weight_map = index["weight_map"]
+    if not isinstance(weight_map, dict) or not all(
+        isinstance(key, str) and isinstance(filename, str)
+        for key, filename in weight_map.items()
+    ):
+        raise TypeError(f"invalid safetensors weight_map in {index_path}")
+
+    state_dict: dict[str, torch.Tensor] = {}
+    for filename in dict.fromkeys(weight_map.values()):
+        shard_path = index_path.parent / filename
+        if not shard_path.is_file():
+            raise FileNotFoundError(
+                f"safetensors shard listed by {index_path} not found: {shard_path}"
+            )
+        shard = load_file(str(shard_path), device="cpu")
+        expected_keys = {
+            key
+            for key, mapped_filename in weight_map.items()
+            if mapped_filename == filename
+        }
+        missing_keys = expected_keys.difference(shard)
+        if missing_keys:
+            missing = ", ".join(sorted(missing_keys))
+            raise KeyError(f"safetensors shard {shard_path} is missing: {missing}")
+        state_dict.update({key: shard[key] for key in expected_keys})
+    return state_dict
 
 
 def _strip_known_prefixes(state_dict: Mapping[str, Any]) -> dict[str, Any]:

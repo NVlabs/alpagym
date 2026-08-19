@@ -15,7 +15,9 @@ from alpagym_host.endpoint_registry import FileTopologyRegistry, TopologyEndpoin
 from PIL import Image
 
 
-def _deep_merge_policy_overrides(base: dict[str, Any], overrides: dict[str, Any]) -> None:
+def _deep_merge_policy_overrides(
+    base: dict[str, Any], overrides: dict[str, Any]
+) -> None:
     """In-place deep merge `overrides` into `base`."""
     for key, value in overrides.items():
         existing = base.get(key)
@@ -170,7 +172,9 @@ def _write_resolved_config(
         "artifact_paths": {
             "run_dir": str(tmp_path),
             "artifacts_dir": str(tmp_path / "artifacts"),
-            "policy_model_bundle_dir": str(tmp_path / "artifacts" / "policy_model_bundle"),
+            "policy_model_bundle_dir": str(
+                tmp_path / "artifacts" / "policy_model_bundle"
+            ),
             "resolved_config_path": str(tmp_path / "resolved_config.yaml"),
             "cosmos_config_path": str(tmp_path / "cosmos_config.toml"),
             "submit_script_path": str(tmp_path / "submit.sbatch"),
@@ -242,7 +246,9 @@ def test_entrypoint_configures_logging_from_resolved_config_yaml(
         entrypoint_module,
         "get_policy_bundle",
         lambda model_kind: SimpleNamespace(
-            build_data_packer=lambda config, cosmos_role: SimpleNamespace(close=lambda: None)
+            build_data_packer=lambda config, cosmos_role: SimpleNamespace(
+                close=lambda: None
+            )
         ),
     )
     monkeypatch.setattr(
@@ -291,7 +297,9 @@ def test_entrypoint_installs_policy_bundle_tokenizer_hook(
         lambda model_kind: SimpleNamespace(
             install_runtime_bridge=lambda: calls.append("bridge"),
             setup_tokenizer=lambda config: bundle_tokenizer,
-            build_data_packer=lambda config, cosmos_role: SimpleNamespace(close=lambda: None),
+            build_data_packer=lambda config, cosmos_role: SimpleNamespace(
+                close=lambda: None
+            ),
         ),
     )
     monkeypatch.setattr(entrypoint_module, "launch_worker", lambda **kwargs: None)
@@ -493,6 +501,11 @@ def test_rollout_init_acquires_runtime_for_driver(
             """Return a model object for rollout weight sync."""
             return self.model
 
+        @property
+        def requires_session_model_leases(self) -> bool:
+            """The AV-only test never enables humanoid session snapshots."""
+            return False
+
         def run_loop(self) -> None:
             """Return immediately for the test thread."""
 
@@ -521,14 +534,18 @@ def test_rollout_init_acquires_runtime_for_driver(
         "build_inference_engine",
         lambda config: FakeInferenceEngine(),
     )
-    monkeypatch.setattr(rollout_module, "build_policy_factory", lambda config, engine: object())
+    monkeypatch.setattr(
+        rollout_module, "build_policy_factory", lambda config, engine: object()
+    )
     monkeypatch.setattr(rollout_module.socket, "gethostname", lambda: "worker-host")
     monkeypatch.setattr(rollout_module, "EgodriverServer", FakeDriverServer)
     monkeypatch.setattr(rollout_module, "FileTopologyRegistry", FakeRegistry)
     monkeypatch.setattr(rollout_module, "StreamingRolloutWorker", FakeStreamingWorker)
     monkeypatch.setattr(rollout_module, "RuntimeServiceStub", lambda channel: channel)
     monkeypatch.setattr(rollout_module.grpc, "insecure_channel", FakeChannel)
-    monkeypatch.setattr(rollout_module.grpc, "channel_ready_future", fake_channel_ready_future)
+    monkeypatch.setattr(
+        rollout_module.grpc, "channel_ready_future", fake_channel_ready_future
+    )
 
     config = SimpleNamespace(custom={"resolved_config_path": str(resolved_config_path)})
     rollout = RolloutRegistry.get_rollout_cls("alpagym_rollout")(config=config)
@@ -540,9 +557,12 @@ def test_rollout_init_acquires_runtime_for_driver(
         assert FakeDriverServer.instances[0].publish_host == "worker-host"
         assert FakeDriverServer.instances[0].max_concurrent_rollouts == 3
         assert FakeStreamingWorker.instances[0].max_concurrent_rollouts == 3
-        assert FakeRegistry.published_drivers == [FakeDriverServer.instances[0].topology_endpoint]
+        assert FakeRegistry.published_drivers == [
+            FakeDriverServer.instances[0].topology_endpoint
+        ]
         assert (
-            FakeStreamingWorker.instances[0].alpasim_runtime_stub.target == "runtime-1.local:6102"
+            FakeStreamingWorker.instances[0].alpasim_runtime_stub.target
+            == "runtime-1.local:6102"
         )
     finally:
         rollout.shutdown()
@@ -585,7 +605,8 @@ def _alpamayo_test_policy_input() -> Any:
     nan = float("nan")
     live_waypoints = (RouteWaypoint(x=5.0, y=0.0), RouteWaypoint(x=10.0, y=1.0))
     route_waypoints = live_waypoints + tuple(
-        RouteWaypoint(x=nan, y=nan, z=nan) for _ in range(NUM_ROUTE_WAYPOINTS - len(live_waypoints))
+        RouteWaypoint(x=nan, y=nan, z=nan)
+        for _ in range(NUM_ROUTE_WAYPOINTS - len(live_waypoints))
     )
 
     return PolicyInput(

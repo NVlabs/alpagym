@@ -3,7 +3,9 @@
 
 """Trainer-side replay signal tests."""
 
+import hashlib
 import importlib
+import json
 import logging
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -523,8 +525,8 @@ def test_short_planner_episode_pads_and_trains_token_ppo(
         "truncated": False,
         "behavior_policy_version": 0,
         "duration_ticks": 1,
-        "primitive_rewards": torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0]),
-        "primitive_reward_mask": torch.tensor([True, False, False, False, False]),
+        "primitive_rewards": torch.tensor([1.0] + [0.0] * 24),
+        "primitive_reward_mask": torch.tensor([True] + [False] * 24),
     }
     replay = PolicyReplayData(
         replay_schema_version=1,
@@ -1380,7 +1382,7 @@ def test_filter_rollouts_keeps_stale_rollouts_with_warning(
                 _rollout(prompt="scene-old", completion="stale-0", weight_version=4),
                 _rollout(prompt="scene-older", completion="stale-1", weight_version=4),
             ],
-            current_step=8,
+            current_step=9,
             train_batch_per_replica=2,
             allowed_outdated_steps=3,
         )
@@ -2098,3 +2100,461 @@ def _parameters_changed(module: torch.nn.Module, before: list[torch.Tensor]) -> 
         not torch.equal(parameter.detach(), old)
         for parameter, old in zip(module.parameters(), before, strict=True)
     )
+
+
+def _actor_provenance_for_test(
+    *, step: int, parent: dict[str, object] | None = None
+) -> tuple[dict[str, object], dict[str, object]]:
+    initialization: dict[str, object] = {
+        "schema": "videomimic_v9_actor_initialization.v1",
+        "source_v9_checkpoint_sha256": "c" * 64,
+        "source_v9_actor_parity_samples": 16,
+        "source_v9_actor_parity_max_abs": 0.0,
+        "planner_critic_seed": 0,
+    }
+    initialization_sha = hashlib.sha256(
+        json.dumps(initialization, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    lineage: dict[str, object] = {
+        "schema": "videomimic_planner_actor_update_lineage.v1",
+        "current_actor_status": (
+            "v9_initialized_unmodified" if step == 0 else "trained_descendant"
+        ),
+        "initialization_attestation_sha256": initialization_sha,
+        "current_model_weights_sha256": chr(ord("a") + step) * 64,
+        "parent_model_weights_sha256": (
+            None if parent is None else parent["current_model_weights_sha256"]
+        ),
+        "parent_update_lineage_sha256": (
+            None
+            if parent is None
+            else hashlib.sha256(
+                json.dumps(parent, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        ),
+        "training_export_step": step,
+    }
+    return initialization, lineage
+
+
+def test_actor_lineage_accepts_std_clamped_step_zero_status(
+    cosmos_stubs: None,
+) -> None:
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    initialization, lineage = _actor_provenance_for_test(step=0)
+    lineage["current_actor_status"] = "v9_actor_mean_initialized_std_clamped"
+
+    validated = trainer_module._validated_actor_lineage(
+        initialization,
+        lineage,
+        expected_step=0,
+    )
+
+    assert validated["current_actor_status"] == (
+        "v9_actor_mean_initialized_std_clamped"
+    )
+
+
+def test_actor_lineage_extension_distinguishes_critic_only_and_actor_updates(
+    cosmos_stubs: None,
+) -> None:
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    initialization, initial = _actor_provenance_for_test(step=0)
+    initial.update(
+        {
+            "actor_state_hash_schema": (
+                "videomimic_planner_actor_state.safetensors.v1"
+            ),
+            "current_actor_state_sha256": "d" * 64,
+            "parent_actor_state_sha256": None,
+        }
+    )
+    trainer_module._validated_actor_lineage(
+        initialization,
+        initial,
+        expected_step=0,
+        expected_actor_state_sha256="d" * 64,
+    )
+
+    _, critic_only = _actor_provenance_for_test(step=1, parent=initial)
+    critic_only.update(
+        {
+            "current_actor_status": "actor_bit_identical_to_parent",
+            "actor_state_hash_schema": (
+                "videomimic_planner_actor_state.safetensors.v1"
+            ),
+            "current_actor_state_sha256": "d" * 64,
+            "parent_actor_state_sha256": "d" * 64,
+        }
+    )
+    trainer_module._validated_actor_lineage(
+        initialization,
+        critic_only,
+        expected_step=1,
+        expected_actor_state_sha256="d" * 64,
+    )
+
+    _, actor_update = _actor_provenance_for_test(step=2, parent=critic_only)
+    actor_update.update(
+        {
+            "actor_state_hash_schema": (
+                "videomimic_planner_actor_state.safetensors.v1"
+            ),
+            "current_actor_state_sha256": "e" * 64,
+            "parent_actor_state_sha256": "d" * 64,
+        }
+    )
+    trainer_module._validated_actor_lineage(
+        initialization,
+        actor_update,
+        expected_step=2,
+        expected_actor_state_sha256="e" * 64,
+    )
+
+    actor_update["current_actor_status"] = "actor_bit_identical_to_parent"
+    with pytest.raises(RuntimeError, match="status disagrees"):
+        trainer_module._validated_actor_lineage(
+            initialization,
+            actor_update,
+            expected_step=2,
+        )
+    actor_update.pop("parent_actor_state_sha256")
+    with pytest.raises(RuntimeError, match="incomplete actor-state identity"):
+        trainer_module._validated_actor_lineage(
+            initialization,
+            actor_update,
+            expected_step=2,
+        )
+
+
+def test_actor_lineage_extension_rejects_loaded_actor_hash_mismatch(
+    cosmos_stubs: None,
+) -> None:
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    initialization, lineage = _actor_provenance_for_test(step=0)
+    lineage.update(
+        {
+            "actor_state_hash_schema": (
+                "videomimic_planner_actor_state.safetensors.v1"
+            ),
+            "current_actor_state_sha256": "d" * 64,
+            "parent_actor_state_sha256": None,
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="does not match loaded actor state"):
+        trainer_module._validated_actor_lineage(
+            initialization,
+            lineage,
+            expected_step=0,
+            expected_actor_state_sha256="e" * 64,
+        )
+
+
+def test_cosmos_checkpoint_carries_policy_native_actor_lineage(
+    cosmos_stubs: None,
+    tmp_path: Path,
+) -> None:
+    """Resume state owns the config lineage paired with its tensor state."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    initialization, initial_lineage = _actor_provenance_for_test(step=0)
+    _, step_1_lineage = _actor_provenance_for_test(step=1, parent=initial_lineage)
+    trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
+    trainer.config = SimpleNamespace(
+        train=SimpleNamespace(
+            output_dir=str(tmp_path),
+            param_dtype="float32",
+            ckpt=SimpleNamespace(export_safetensors=False),
+        )
+    )
+    trainer.model = SimpleNamespace(
+        config=SimpleNamespace(
+            actor_initialization_attestation=initialization,
+            actor_update_lineage=initial_lineage,
+        ),
+        model_weights_sha256=lambda: str(
+            trainer.model.config.actor_update_lineage["current_model_weights_sha256"]
+        ),
+    )
+    trainer.optimizers = object()
+    trainer.lr_schedulers = object()
+
+    def _export(model: object, path: Path) -> None:
+        del path
+        model.config.actor_update_lineage = step_1_lineage
+
+    trainer._policy_bundle = SimpleNamespace(export_model_checkpoint=_export)
+    saved: list[dict[str, object]] = []
+    trainer.ckpt_manager = SimpleNamespace(
+        save_checkpoint=lambda **kwargs: saved.append(kwargs),
+        save_check=lambda **kwargs: None,
+    )
+
+    trainer._save_checkpoint(current_step=1, total_steps=1, remain_samples_num=0)
+
+    assert saved[0]["alpagym_actor_update_lineage"] == step_1_lineage
+
+
+@pytest.mark.parametrize("include_lineage", (True, False))
+def test_policy_resume_restores_lineage_or_fails_closed(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+    include_lineage: bool,
+) -> None:
+    """A resumed tensor checkpoint cannot silently retain its step-0 config."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    initialization, initial_lineage = _actor_provenance_for_test(step=0)
+    _, step_1_lineage = _actor_provenance_for_test(step=1, parent=initial_lineage)
+    _, step_2_lineage = _actor_provenance_for_test(step=2, parent=step_1_lineage)
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer.model = SimpleNamespace(
+        config=SimpleNamespace(
+            actor_initialization_attestation=initialization,
+            actor_update_lineage=initial_lineage,
+        ),
+        model_weights_sha256=lambda: str(
+            step_2_lineage["current_model_weights_sha256"]
+        ),
+    )
+    trainer._reference_model = None
+    trainer._kl_beta = 0.0
+    trainer.config = SimpleNamespace(train=SimpleNamespace(resume="checkpoint"))
+    checkpoint_info: dict[str, object] = {"step": 2}
+    if include_lineage:
+        checkpoint_info["alpagym_actor_update_lineage"] = step_2_lineage
+
+    monkeypatch.setattr(
+        trainer_module._grpo_trainer.GRPOTrainer,
+        "weight_resume",
+        lambda self: checkpoint_info,
+        raising=False,
+    )
+
+    if include_lineage:
+        assert trainer.weight_resume() == checkpoint_info
+        assert trainer.model.config.actor_update_lineage == step_2_lineage
+    else:
+        with pytest.raises(RuntimeError, match="has no actor lineage"):
+            trainer.weight_resume()
+
+
+def test_policy_resume_rejects_full_model_hash_mismatch(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A matching actor cannot hide corrupt or mismatched critic weights."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    initialization, initial_lineage = _actor_provenance_for_test(step=0)
+    _, resumed_lineage = _actor_provenance_for_test(step=1, parent=initial_lineage)
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer.model = SimpleNamespace(
+        config=SimpleNamespace(
+            actor_initialization_attestation=initialization,
+            actor_update_lineage=initial_lineage,
+        ),
+        model_weights_sha256=lambda: "f" * 64,
+    )
+    trainer._reference_model = None
+    trainer._kl_beta = 0.0
+    trainer.config = SimpleNamespace(train=SimpleNamespace(resume="checkpoint"))
+    monkeypatch.setattr(
+        trainer_module._grpo_trainer.GRPOTrainer,
+        "weight_resume",
+        lambda self: {
+            "step": 1,
+            "alpagym_actor_update_lineage": resumed_lineage,
+        },
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="does not match loaded model weights"):
+        trainer.weight_resume()
+
+
+def test_filter_rollouts_treats_previous_version_as_fresh_for_next_update(
+    cosmos_stubs: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Optimizer update N consumes freshly generated behavior version N-1."""
+    del cosmos_stubs
+    with caplog.at_level(logging.WARNING):
+        kept = filter_trainable_rollouts(
+            [
+                _rollout(prompt="scene-a", completion="fresh-0", weight_version=2),
+                _rollout(prompt="scene-b", completion="fresh-1", weight_version=2),
+            ],
+            current_step=3,
+            train_batch_per_replica=2,
+            allowed_outdated_steps=0,
+        )
+
+    assert len(kept) == 2
+    assert "stale rollouts" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("field_name", "bad_value"),
+    (
+        ("enable_checkpoint", False),
+        ("save_freq", 20),
+        ("save_freq_in_epoch", 1),
+        ("export_safetensors", False),
+        ("max_keep", 5),
+    ),
+)
+def test_planner_every_update_checkpoint_contract_validates_loaded_cosmos_config(
+    cosmos_stubs: None,
+    field_name: str,
+    bad_value: object,
+) -> None:
+    """A stale Cosmos schedule fails before current-policy H70 training."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    checkpoint = {
+        "enable_checkpoint": True,
+        "save_freq": 1,
+        "save_freq_in_epoch": 0,
+        "export_safetensors": True,
+        "max_keep": -1,
+    }
+    valid_config = SimpleNamespace(
+        train=SimpleNamespace(ckpt=SimpleNamespace(**checkpoint))
+    )
+    trainer_module._validate_planner_every_update_checkpoint_config(valid_config)
+
+    checkpoint[field_name] = bad_value
+    config = SimpleNamespace(train=SimpleNamespace(ckpt=SimpleNamespace(**checkpoint)))
+
+    with pytest.raises(ValueError, match="current-policy H70 PPO"):
+        trainer_module._validate_planner_every_update_checkpoint_config(config)
+
+
+@pytest.mark.parametrize(
+    (
+        "checkpoint_enabled",
+        "current_step",
+        "total_steps",
+        "requested",
+        "planner_every_update",
+        "master",
+        "saved",
+    ),
+    (
+        # Regression: Cosmos colocated can omit do_save on its only/final
+        # DataFetchCommand. AlpaGym must still persist the applied update.
+        (True, 1, 1, False, False, True, True),
+        (False, 1, 1, False, False, True, False),
+        (True, 1, 2, False, False, True, False),
+        # Regression: even if the Cosmos command omits do_save, the loaded
+        # save_freq=1 contract persists every successfully applied update.
+        (True, 1, 2, False, True, True, True),
+        (True, 1, 2, True, False, True, True),
+        (True, 1, 1, False, True, False, False),
+    ),
+)
+def test_step_training_honors_planner_every_update_and_final_checkpoint_fallbacks(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint_enabled: bool,
+    current_step: int,
+    total_steps: int,
+    requested: bool,
+    planner_every_update: bool,
+    master: bool,
+    saved: bool,
+) -> None:
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
+    trainer.lr_schedulers = _ListLRScheduler(0.05)
+    trainer.parallel_dims = SimpleNamespace(
+        dp_replicate_enabled=False,
+        dp_shard_enabled=False,
+        cp_enabled=False,
+    )
+    trainer._group_size = 1
+    trainer._mini_batch = 1
+    trainer._grpo_optimization_iterations = 1
+    trainer._allowed_outdated_steps = 100
+    trainer._planner_every_update_checkpoint = planner_every_update
+    trainer.config = SimpleNamespace(
+        train=SimpleNamespace(
+            train_batch_per_replica=1,
+            ckpt=SimpleNamespace(enable_checkpoint=checkpoint_enabled),
+        )
+    )
+    monkeypatch.setattr(
+        trainer_module, "filter_trainable_rollouts", lambda rollouts, **kwargs: rollouts
+    )
+    trainer._prepare_training_data = lambda rollouts: (
+        [object()],
+        torch.tensor([0.5], dtype=torch.float32),
+    )
+    trainer._run_training_loop = lambda samples, advantages, nccl: (
+        1.0,
+        0.0,
+        1,
+        1.0,
+        1.0,
+        0.0,
+        0.0,
+    )
+    saves: list[tuple[int, int, int]] = []
+
+    def _record_save(step: int, steps: int, remaining: int) -> None:
+        saves.append((step, steps, remaining))
+
+    trainer._save_checkpoint = _record_save
+
+    trainer.step_training(
+        rollouts=[object()],
+        current_step=current_step,
+        total_steps=total_steps,
+        remain_samples_num=17,
+        inter_policy_nccl=object(),
+        is_master_replica=master,
+        do_save_checkpoint=requested,
+    )
+
+    assert saves == ([(current_step, total_steps, 17)] if saved else [])
+
+
+def test_ppo_smdp_k25_keeps_literal_50hz_gamma_and_lambda(
+    cosmos_stubs: None,
+) -> None:
+    """A 2 Hz macro raises the direct 50 Hz factors to its realized duration."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer._gamma = 0.99
+    trainer._gae_lambda = 0.95
+    samples = [
+        _smdp_sample(
+            rewards=(0.0,) * 25,
+            old_value=0.2,
+            bootstrap_value=0.3,
+            terminated=False,
+            width=25,
+        ),
+        _smdp_sample(
+            rewards=(1.0,),
+            old_value=0.3,
+            bootstrap_value=0.0,
+            terminated=True,
+            width=25,
+        ),
+    ]
+
+    advantages, returns = trainer._compute_gae(samples)
+
+    final_advantage = 1.0 - 0.3
+    first_delta = 0.99**25 * 0.3 - 0.2
+    first_advantage = first_delta + (0.99 * 0.95) ** 25 * final_advantage
+    assert advantages == pytest.approx([first_advantage, final_advantage])
+    assert returns == pytest.approx([first_advantage + 0.2, 1.0])

@@ -11,8 +11,9 @@ model:
   num_context_frames: 1
   num_historical_waypoints: 1
   num_future_waypoints: 1
-  # Outer planner decisions are 10 Hz.  The emitted reference remains 50 Hz.
-  step_dt_us: 100_000
+  # Outer planner decisions are 2 Hz. H70 spans 1.38 s at 50 Hz so GRAIL keeps
+  # its future window while each plan executes 25 x 20 ms controller ticks.
+  step_dt_us: 500_000
   bundle_config:
     humanoid_policy_factory: alpagym_g1_videomimic_planner.humanoid_policy:build_humanoid_policy_factory
     # Run preparation injects humanoid_repo_path, scene_store_path, and the

@@ -19,13 +19,23 @@ from alpagym_g1_videomimic_planner.inference_model import (
     G1VideoMimicPlannerInferenceModel,
 )
 from alpagym_g1_videomimic_planner.model import (
+    GRAIL_FUTURE_REFERENCE_OFFSET,
+    PLANNER_MODE_SHADOW_ROLLOUT,
     REPLAY_SCHEMA,
-    SHADOW_ACTION_STEPS,
     G1VideoMimicPlannerActorCriticModel,
     G1VideoMimicPlannerConfig,
     OBS_DIMS,
     OBS_KEYS,
+    planner_mode_contract,
     register_planner_model,
+)
+from alpagym_g1_videomimic_planner.provenance import (
+    ACTOR_STATE_HASH_SCHEMA,
+    ACTOR_STATE_LINEAGE_FIELDS,
+    canonical_actor_state_sha256,
+    file_sha256,
+    trained_actor_lineage,
+    training_export_step,
 )
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -66,6 +76,13 @@ def load_inference_model(
     register_planner_model()
     bundle_dir = Path(run_config.policy.model.path)
     config = G1VideoMimicPlannerConfig.from_pretrained(bundle_dir)
+    planner_mode = _planner_mode(run_config)
+    contract = planner_mode_contract(planner_mode)
+    if int(config.shadow_action_steps) != contract.actor_steps:
+        raise ValueError(
+            "planner checkpoint shadow_action_steps does not match planner_mode: "
+            f"expected {contract.actor_steps}, got {config.shadow_action_steps}"
+        )
     # The inherited factory is typed to its base class even though it constructs
     # ``cls``; preserve the concrete planner type at this boundary.
     model = cast(
@@ -74,6 +91,7 @@ def load_inference_model(
     )
     model.to(device=device, dtype=torch.float32)
     model.load_hf_weights(str(bundle_dir), parallel_dims=None, device=device)
+    _validate_loaded_actor_state(model)
     model.eval()
     return G1VideoMimicPlannerInferenceModel(model)
 
@@ -82,7 +100,11 @@ def build_model_inputs(
     run_config: Any,
 ) -> Callable[[PolicyReplayData], tuple[dict[str, Any], torch.Tensor]]:
     """Return a fail-closed parser for one macro-decision replay row."""
-    del run_config
+    planner_mode = _planner_mode(run_config)
+    contract = planner_mode_contract(
+        planner_mode,
+        macro_period_us=_policy_step_dt_us(run_config),
+    )
 
     def _build(replay_data: PolicyReplayData) -> tuple[dict[str, Any], torch.Tensor]:
         if replay_data.payload_schema != REPLAY_SCHEMA:
@@ -110,6 +132,17 @@ def build_model_inputs(
                 "transition",
             ),
         )
+        if any(
+            key in replay_data.payload
+            for key in (
+                "completion_policy_sha256",
+                "actor_bundle_sha256",
+                "actor_source_v9_checkpoint_sha256",
+            )
+        ):
+            raise ValueError(
+                "current-policy planner replay must not identify a frozen completion"
+            )
         observations = replay_data.payload["shadow_observations"]
         if not isinstance(observations, Mapping):
             raise TypeError("planner shadow_observations must be a mapping")
@@ -118,19 +151,19 @@ def build_model_inputs(
             key: _finite_tensor(
                 f"shadow_observations.{key}",
                 observations[key],
-                expected_shape=(SHADOW_ACTION_STEPS, OBS_DIMS[key]),
+                expected_shape=(contract.actor_steps, OBS_DIMS[key]),
             )
             for key in OBS_KEYS
         }
         raw_actions = _finite_tensor(
             "raw_actions",
             replay_data.payload["raw_actions"],
-            expected_shape=(SHADOW_ACTION_STEPS, 23),
+            expected_shape=(contract.actor_steps, 23),
         )
         executed_actions = _finite_tensor(
             "executed_actions",
             replay_data.payload["executed_actions"],
-            expected_shape=(SHADOW_ACTION_STEPS, 23),
+            expected_shape=(contract.actor_steps, 23),
         )
         if not torch.equal(executed_actions, raw_actions.clamp(min=-8.0, max=8.0)):
             raise ValueError(
@@ -139,7 +172,7 @@ def build_model_inputs(
         old_token_logprobs = _finite_tensor(
             "old_token_logprobs",
             replay_data.payload["old_token_logprobs"],
-            expected_shape=(SHADOW_ACTION_STEPS,),
+            expected_shape=(contract.actor_steps,),
         )
         if replay_data.old_logprob is None:
             raise ValueError("planner replay is missing scalar old_logprob")
@@ -168,15 +201,19 @@ def build_model_inputs(
             replay_data.payload,
             transition=transition,
             expected_reference_sha256=reference_sha256,
+            controller_ticks=contract.controller_ticks,
+            require_unmodified_applied_reference=True,
         )
 
         model_inputs["actions"] = raw_actions
         model_inputs["old_token_logprobs"] = old_token_logprobs
-        # Shadow reference frames consume actions at offsets [0, 5, ..., 45].
-        # For a realized d-tick prefix only token indices < 44+d can have
-        # affected that macro transition's reward.
+        # At controller tick j, GRAIL's farthest future reference is j+45.
+        # Therefore a realized d-tick prefix can depend on the first 44+d
+        # current-policy actions. A full K25 transition credits all 69 H70
+        # actions; an early terminal excludes only the causally unseen tail.
         model_inputs["token_causality_mask"] = (
-            torch.arange(SHADOW_ACTION_STEPS, dtype=torch.int64) < 44 + duration
+            torch.arange(contract.actor_steps, dtype=torch.int64)
+            < GRAIL_FUTURE_REFERENCE_OFFSET - 1 + duration
         )
         return model_inputs, old_logprob
 
@@ -184,7 +221,7 @@ def build_model_inputs(
 
 
 def export_model_checkpoint(model: torch.nn.Module, output_dir: Path) -> None:
-    """Write a directly loadable non-generative planner safetensors bundle."""
+    """Write a loadable checkpoint with explicit current-actor provenance."""
     if not isinstance(model, G1VideoMimicPlannerActorCriticModel):
         raise TypeError(
             "planner export expected G1VideoMimicPlannerActorCriticModel, got "
@@ -193,16 +230,90 @@ def export_model_checkpoint(model: torch.nn.Module, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     config = model.config.to_dict()
     config["checkpoint_path"] = "model.safetensors"
+    state_dict = {
+        name: tensor.detach().to(device="cpu").contiguous()
+        for name, tensor in model.state_dict().items()
+    }
+    current_actor_state_sha256 = canonical_actor_state_sha256(
+        model,
+        state_dict=state_dict,
+    )
+    weights_path = output_dir / "model.safetensors"
+    temporary_weights_path = output_dir / "model.safetensors.tmp"
+    temporary_weights_path.unlink(missing_ok=True)
+    save_file(state_dict, str(temporary_weights_path))
+
+    initialization = config.get("actor_initialization_attestation")
+    previous_lineage = config.get("actor_update_lineage")
+    if (initialization is None) != (previous_lineage is None):
+        raise ValueError(
+            "planner actor provenance must contain both initialization and lineage"
+        )
+    if initialization is not None:
+        if not isinstance(initialization, Mapping) or not isinstance(
+            previous_lineage, Mapping
+        ):
+            raise TypeError("planner actor provenance fields must be mappings")
+        export_step = training_export_step(output_dir)
+        previous_step = previous_lineage.get("training_export_step")
+        current_weights_sha256 = file_sha256(temporary_weights_path)
+        if previous_step == export_step:
+            if (
+                previous_lineage.get("current_model_weights_sha256")
+                != current_weights_sha256
+            ):
+                temporary_weights_path.unlink(missing_ok=True)
+                raise ValueError(
+                    "re-exporting one training step with different policy weights "
+                    "would corrupt actor lineage"
+                )
+            actor_extension_presence = tuple(
+                name in previous_lineage for name in ACTOR_STATE_LINEAGE_FIELDS
+            )
+            if any(actor_extension_presence) and not all(actor_extension_presence):
+                temporary_weights_path.unlink(missing_ok=True)
+                raise ValueError("actor state lineage extension is incomplete")
+            if all(actor_extension_presence) and (
+                previous_lineage["current_actor_state_sha256"]
+                != current_actor_state_sha256
+            ):
+                temporary_weights_path.unlink(missing_ok=True)
+                raise ValueError(
+                    "re-exporting one training step with different actor state "
+                    "would corrupt actor lineage"
+                )
+            # A repeated final-save hook is idempotent: keep the existing parent
+            # instead of manufacturing a self-parent edge.
+            lineage = dict(previous_lineage)
+        else:
+            if (
+                not isinstance(previous_step, int)
+                or isinstance(previous_step, bool)
+                or previous_step != export_step - 1
+            ):
+                temporary_weights_path.unlink(missing_ok=True)
+                raise ValueError(
+                    "policy-native checkpoints must be exported in contiguous "
+                    f"steps: parent={previous_step!r}, export={export_step}"
+                )
+            lineage = trained_actor_lineage(
+                initialization,
+                previous_lineage,
+                current_model_weights_sha256=current_weights_sha256,
+                training_export_step=export_step,
+                current_actor_state_sha256=current_actor_state_sha256,
+            )
+        config["actor_update_lineage"] = lineage
+        # Preserve the chain if this process later writes another checkpoint.
+        model.config.actor_update_lineage = lineage
+
+    temporary_weights_path.replace(weights_path)
+
     config_path = output_dir / "config.json"
     config_path.write_text(
         json.dumps(config, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    state_dict = {
-        name: tensor.detach().to(device="cpu").contiguous()
-        for name, tensor in model.state_dict().items()
-    }
-    save_file(state_dict, str(output_dir / "model.safetensors"))
 
 
 def get_bundle() -> PolicyBundle:
@@ -237,11 +348,37 @@ def _require_sha256(name: str, value: Any) -> str:
     return digest
 
 
+def _validate_loaded_actor_state(
+    model: G1VideoMimicPlannerActorCriticModel,
+) -> None:
+    """Verify the optional actor-only provenance against loaded parameters."""
+
+    lineage = getattr(model.config, "actor_update_lineage", None)
+    if not isinstance(lineage, Mapping):
+        return
+    presence = tuple(name in lineage for name in ACTOR_STATE_LINEAGE_FIELDS)
+    if not any(presence):
+        return
+    if not all(presence):
+        raise ValueError("planner actor state lineage extension is incomplete")
+    if lineage["actor_state_hash_schema"] != ACTOR_STATE_HASH_SCHEMA:
+        raise ValueError("planner actor state hash schema is invalid")
+    expected = _require_sha256(
+        "current_actor_state_sha256",
+        lineage["current_actor_state_sha256"],
+    )
+    actual = canonical_actor_state_sha256(model)
+    if actual != expected:
+        raise ValueError("planner actor state differs from actor-only provenance")
+
+
 def _validate_feedback_receipt(
     payload: Mapping[str, Any],
     *,
     transition: Mapping[str, Any],
     expected_reference_sha256: str,
+    controller_ticks: int,
+    require_unmodified_applied_reference: bool,
 ) -> int:
     """Require every realized controller tick to credit the emitted reference."""
     raw_trace = payload["feedback_trace"]
@@ -269,7 +406,7 @@ def _validate_feedback_receipt(
     if not isinstance(ticks, (list, tuple)) or not ticks:
         raise ValueError("planner feedback_trace.ticks must be a non-empty sequence")
     duration = int(transition.get("duration_ticks", -1))
-    if duration != len(ticks) or not 1 <= duration <= 5:
+    if duration != len(ticks) or not 1 <= duration <= controller_ticks:
         raise ValueError(
             "planner duration_ticks must equal the feedback K-prefix length"
         )
@@ -279,9 +416,15 @@ def _validate_feedback_receipt(
     primitive_mask = torch.as_tensor(
         transition.get("primitive_reward_mask"), dtype=torch.bool
     )
-    if primitive_rewards.shape != (5,) or primitive_mask.shape != (5,):
-        raise ValueError("planner primitive reward receipt must have shape (5,)")
-    expected_mask = torch.arange(5) < duration
+    expected_shape = (controller_ticks,)
+    if (
+        primitive_rewards.shape != expected_shape
+        or primitive_mask.shape != expected_shape
+    ):
+        raise ValueError(
+            f"planner primitive reward receipt must have shape {expected_shape}"
+        )
+    expected_mask = torch.arange(controller_ticks) < duration
     if not torch.equal(primitive_mask, expected_mask):
         raise ValueError("planner primitive reward mask must be a contiguous K-prefix")
     previous_control_step: int | None = None
@@ -292,13 +435,17 @@ def _validate_feedback_receipt(
             f"feedback_trace.ticks[{index}].active_reference_sha256",
             tick.get("active_reference_sha256"),
         )
-        _require_sha256(
+        applied = _require_sha256(
             f"feedback_trace.ticks[{index}].applied_reference_sha256",
             tick.get("applied_reference_sha256"),
         )
         if active != expected_reference_sha256:
             raise ValueError(
                 "AlpaSim active reference SHA256 does not match the planner reference"
+            )
+        if require_unmodified_applied_reference and applied != active:
+            raise ValueError(
+                "current-policy H70 reference was modified before controller application"
             )
         if int(tick.get("control_tick_offset", -1)) != index + 1:
             raise ValueError("planner feedback control_tick_offset is not 1..K")
@@ -328,6 +475,27 @@ def _validate_feedback_receipt(
             raise ValueError("planner feedback control_episode_step is not contiguous")
         previous_control_step = control_step
     return duration
+
+
+def _planner_mode(run_config: Any) -> str:
+    """Read the fixed H69/K25 current-policy rollout mode."""
+
+    try:
+        bundle_config = run_config.policy.model.bundle_config
+    except AttributeError:
+        return PLANNER_MODE_SHADOW_ROLLOUT
+    if bundle_config is None:
+        return PLANNER_MODE_SHADOW_ROLLOUT
+    return str(dict(bundle_config).get("planner_mode", PLANNER_MODE_SHADOW_ROLLOUT))
+
+
+def _policy_step_dt_us(run_config: Any) -> int:
+    """Read the outer execution period, retaining K25 for unit fixtures."""
+
+    try:
+        return int(run_config.policy.model.step_dt_us)
+    except AttributeError:
+        return 500_000
 
 
 def _no_op_tokenizer() -> Any:

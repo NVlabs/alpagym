@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Mapping
 
 import torch
@@ -22,13 +23,69 @@ from transformers import AutoConfig
 MODEL_TYPE = "g1_videomimic_planner_actor_critic"
 REPLAY_SCHEMA = "alpagym_humanoid.videomimic_planner.v1"
 OBSERVATION_SCHEMA = "videomimic_motion_planner_state.v1"
-ACTION_SCHEMA = "g1_motion_reference_29d_50hz_h50.v1"
-REFERENCE_FRAME_COUNT = 50
+ACTION_SCHEMA_H70 = "g1_motion_reference_29d_50hz_h70.v1"
+REFERENCE_FRAME_COUNT = 70
 SHADOW_ACTION_STEPS = REFERENCE_FRAME_COUNT - 1
 REFERENCE_PERIOD_US = 20_000
-MACRO_PERIOD_US = 100_000
+MACRO_PERIOD_US = 500_000
 CONTROLLER_TICKS_PER_MACRO = MACRO_PERIOD_US // REFERENCE_PERIOD_US
+PLANNER_MODE_SHADOW_ROLLOUT = "shadow_rollout"
+PLANNER_MODES = frozenset((PLANNER_MODE_SHADOW_ROLLOUT,))
+# GRAIL samples ten future frames at offsets [0, 5, ..., 45]. H70 supplies the
+# complete future window while the controller executes the first 25 ticks.
+GRAIL_FUTURE_REFERENCE_OFFSET = 45
 REFERENCE_JOINT_DIM = 29
+
+
+@dataclass(frozen=True)
+class PlannerModeContract:
+    """Actor, reference, and execution timing owned by one planner mode."""
+
+    actor_steps: int
+    controller_ticks: int
+    macro_period_us: int
+    reference_frames: int
+    action_schema: str
+
+
+def planner_mode_contract(
+    mode: str,
+    *,
+    macro_period_us: int = MACRO_PERIOD_US,
+) -> PlannerModeContract:
+    """Return the complete wire and replay contract for one planner mode.
+
+    The current VideoMimic actor autoregressively generates all 69 actions in
+    the H70 reference. The outer policy remains a fixed 2 Hz/K25 contract so
+    GRAIL receives its 25 realized frames and 45-frame future window.
+    """
+
+    if (
+        isinstance(macro_period_us, bool)
+        or int(macro_period_us) != macro_period_us
+        or int(macro_period_us) <= 0
+    ):
+        raise ValueError("planner macro_period_us must be a positive integer")
+    macro_period_us = int(macro_period_us)
+    controller_ticks, remainder_us = divmod(macro_period_us, REFERENCE_PERIOD_US)
+    if remainder_us:
+        raise ValueError(
+            "planner macro_period_us must lie on the 20000us controller grid"
+        )
+
+    if mode == PLANNER_MODE_SHADOW_ROLLOUT:
+        if controller_ticks != CONTROLLER_TICKS_PER_MACRO:
+            raise ValueError("shadow_rollout requires the 500000us/K25 contract")
+        return PlannerModeContract(
+            actor_steps=SHADOW_ACTION_STEPS,
+            controller_ticks=controller_ticks,
+            macro_period_us=macro_period_us,
+            reference_frames=REFERENCE_FRAME_COUNT,
+            action_schema=ACTION_SCHEMA_H70,
+        )
+    raise ValueError(
+        f"planner_mode must be one of {sorted(PLANNER_MODES)}, got {mode!r}"
+    )
 
 
 class G1VideoMimicPlannerConfig(G1MjlabConfig):
@@ -54,12 +111,13 @@ class G1VideoMimicPlannerConfig(G1MjlabConfig):
 
 
 class G1VideoMimicPlannerActorCriticModel(G1MjlabActorCriticModel):
-    """Scores all stochastic actions in one shadow rollout.
+    """Score the trainable VideoMimic decisions in one planner step.
 
-    Inputs are ``[B, H, ...]`` with ``H=49``.  The actor log-probability is
-    retained as one scalar per shadow step so PPO can clip importance ratios
-    independently.  ``log_probs`` is their exact sum for replay/audit only. The
-    critic estimates the macro-boundary state and therefore consumes only H=0.
+    Inputs are ``[B, H, ...]`` where ``H=69`` is fixed by the checkpoint. Every
+    action is sampled from the current actor while the private MuJoCo state rolls
+    forward. ``log_probs`` is the exact sum of those trainable-token
+    log-probabilities. The critic estimates the macro-boundary state and consumes
+    only H=0.
     """
 
     config: G1VideoMimicPlannerConfig
@@ -138,6 +196,16 @@ class G1VideoMimicPlannerActorCriticModel(G1MjlabActorCriticModel):
             generator=generator,
         )
 
+    def forward_values(self, obs: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """Evaluate macro-boundary values without generating an H70 reference."""
+
+        self._validate_shadow_observations(obs)
+        # The replay packer also carries model-control kwargs such as
+        # ``return_log_prob``.  Only the explicit VideoMimic observation ABI is
+        # temporal and belongs in the critic input.
+        first_obs = {key: obs[key][:, 0] for key in OBS_KEYS}
+        return self._head(first_obs, actor=False).squeeze(-1)
+
     def reset_planner_critic_(self) -> None:
         """Reinitialize the macro critic and make its initial value exactly zero."""
         self.critic_terrain.reset_parameters()
@@ -149,6 +217,22 @@ class G1VideoMimicPlannerActorCriticModel(G1MjlabActorCriticModel):
             layer.reset_parameters()
         nn.init.zeros_(linear_layers[-1].weight)
         nn.init.zeros_(linear_layers[-1].bias)
+
+    def actor_state_sha256(self) -> str:
+        """Return the canonical identity of the exact PPO actor parameter group."""
+
+        from alpagym_g1_videomimic_planner.provenance import (
+            canonical_actor_state_sha256,
+        )
+
+        return canonical_actor_state_sha256(self)
+
+    def model_weights_sha256(self) -> str:
+        """Return the policy-native safetensors identity of the full model."""
+
+        from alpagym_g1_videomimic_planner.provenance import model_weights_sha256
+
+        return model_weights_sha256(self)
 
     def _validate_shadow_observations(self, obs: Mapping[str, torch.Tensor]) -> None:
         horizon = int(self.config.shadow_action_steps)

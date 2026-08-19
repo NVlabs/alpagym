@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Callable
 
@@ -119,14 +120,88 @@ def _no_op_tokenizer() -> Any:
     try:
         from cosmos_rl.utils.no_op_tokenizer import NoOpTokenizer
 
-        return NoOpTokenizer()
+        tokenizer: Any = NoOpTokenizer()
     except Exception:
+
         class _NoOpTokenizer:
             pad_token_id = 0
             eos_token_id = 0
+            model_max_length = 512
+            vocab_size = 4
+
+            def encode(self, item: Any, **kwargs: Any) -> list[int]:
+                del kwargs
+                if isinstance(item, dict):
+                    return [0] * max(1, int(item.get("episode_length", 1)))
+                return [0]
+
+            def decode(self, *args: Any, **kwargs: Any) -> str:
+                del args, kwargs
+                return ""
+
+            def batch_decode(self, batches: Any, **kwargs: Any) -> list[str]:
+                del kwargs
+                try:
+                    return [""] * len(batches)
+                except TypeError:
+                    return [""]
 
             def __call__(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
                 del args, kwargs
                 return {}
 
-        return _NoOpTokenizer()
+        tokenizer = _NoOpTokenizer()
+    return _CheckpointableNoOpTokenizer(tokenizer)
+
+
+class _CheckpointableNoOpTokenizer:
+    """Add deterministic checkpoint persistence to Cosmos's non-text tokenizer.
+
+    Cosmos calls ``data_packer.save_state()`` from its safetensors export
+    thread, which in turn unconditionally calls ``tokenizer.save_pretrained``.
+    The upstream ``NoOpTokenizer`` intentionally implements only inference
+    methods, so the G1 bundle supplies the missing persistence boundary here.
+    Reload does not consume this marker: ``setup_tokenizer`` always recreates
+    the same non-text tokenizer after registering the G1 model family.
+    """
+
+    _MARKER_NAME = "g1_mjlab_no_op_tokenizer.json"
+
+    def __init__(self, tokenizer: Any) -> None:
+        object.__setattr__(self, "_tokenizer", tokenizer)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._tokenizer, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._tokenizer, name, value)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._tokenizer(*args, **kwargs)
+
+    def save_pretrained(
+        self,
+        save_directory: str | Path,
+        **kwargs: Any,
+    ) -> tuple[str]:
+        """Persist a small, deterministic marker using the HF method shape."""
+        del kwargs
+        destination = Path(save_directory)
+        destination.mkdir(parents=True, exist_ok=True)
+        marker_path = destination / self._MARKER_NAME
+        payload = {
+            "format_version": 1,
+            "tokenizer_type": "alpagym_g1_mjlab_no_op",
+            "pad_token_id": int(self.pad_token_id),
+            "eos_token_id": int(self.eos_token_id),
+            "model_max_length": int(getattr(self, "model_max_length", 1)),
+            "vocab_size": int(getattr(self, "vocab_size", 1)),
+        }
+        marker_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return (str(marker_path),)
+
+    def __repr__(self) -> str:
+        return f"Checkpointable({self._tokenizer!r})"

@@ -46,7 +46,11 @@ class _FakeInferenceModel:
         """Record the dispatch and emit a deterministic batched output."""
         self.calls.append(model_input)
         tags = model_input.ego_history_xyz[:, 0, 0, 0]
-        batch_size = self.output_batch_size if self.output_batch_size is not None else tags.shape[0]
+        batch_size = (
+            self.output_batch_size
+            if self.output_batch_size is not None
+            else tags.shape[0]
+        )
         pred_xyz = torch.zeros(
             (batch_size, sampling.num_traj_sets, sampling.num_traj_samples, 1, 3),
             dtype=tags.dtype,
@@ -54,7 +58,9 @@ class _FakeInferenceModel:
         pred_xyz[..., 0, 0] = tags[:batch_size, None, None]
         pred_rot = (
             torch.eye(3, dtype=tags.dtype)
-            .expand(batch_size, sampling.num_traj_sets, sampling.num_traj_samples, 1, 3, 3)
+            .expand(
+                batch_size, sampling.num_traj_sets, sampling.num_traj_samples, 1, 3, 3
+            )
             .clone()
         )
         return BatchedModelOutput(pred_xyz=pred_xyz, pred_rot=pred_rot)
@@ -115,7 +121,9 @@ def test_engine_resolves_outputs_in_queue_order() -> None:
     thread = threading.Thread(target=inference_engine.run_loop, daemon=True)
     thread.start()
     try:
-        results = [int(f.result(timeout=2.0).pred_xyz[0, 0, 0, 0].item()) for f in futures]
+        results = [
+            int(f.result(timeout=2.0).pred_xyz[0, 0, 0, 0].item()) for f in futures
+        ]
     finally:
         inference_engine.shutdown()
         thread.join(timeout=2.0)
@@ -170,6 +178,56 @@ def test_engine_forwards_model_hooks() -> None:
 
     assert inference_engine.get_model() is synced_model
     assert inference_model.model is synced_model
+    assert inference_engine.get_model_for_session("colocated-session") is synced_model
+
+
+def test_session_model_lease_survives_inplace_and_replacement_weight_sync() -> None:
+    """A disaggregated episode never observes a mid-session live-model update."""
+
+    inference_model = _FakeInferenceModel()
+    inference_engine = InferenceEngine(
+        inference_model=inference_model,
+        sampling=_sampling(),
+        return_trace_for_rl=False,
+        max_batch_size=8,
+        require_session_model_leases=True,
+    )
+    with torch.no_grad():
+        inference_model.model.weight.fill_(1.0)
+        inference_model.model.bias.fill_(1.0)
+
+    lease = inference_engine.create_model_lease(behavior_policy_version=7)
+    inference_engine.register_session_model_lease("session-7", lease)
+    leased_model = inference_engine.get_model_for_session("session-7")
+
+    assert leased_model is lease.model
+    assert not leased_model.training
+    assert all(not parameter.requires_grad for parameter in leased_model.parameters())
+
+    # Distributed R2R updates the live parameter tensors in place.
+    with torch.no_grad():
+        inference_engine.get_model().weight.fill_(2.0)
+        inference_engine.get_model().bias.fill_(2.0)
+    torch.testing.assert_close(
+        leased_model.weight, torch.ones_like(leased_model.weight)
+    )
+
+    # Colocated P2R may replace the live model object instead.
+    replacement = torch.nn.Linear(1, 1)
+    with torch.no_grad():
+        replacement.weight.fill_(3.0)
+        replacement.bias.fill_(3.0)
+    inference_engine.set_model(replacement)
+
+    assert inference_engine.get_model() is replacement
+    assert inference_engine.get_model_for_session("session-7") is leased_model
+    torch.testing.assert_close(
+        leased_model.weight, torch.ones_like(leased_model.weight)
+    )
+
+    inference_engine.release_session_model_lease("session-7")
+    with pytest.raises(RuntimeError, match="no immutable model lease"):
+        inference_engine.get_model_for_session("session-7")
 
 
 def test_engine_batches_fixed_route_inputs() -> None:
@@ -189,7 +247,9 @@ def test_engine_batches_fixed_route_inputs() -> None:
     thread = threading.Thread(target=inference_engine.run_loop, daemon=True)
     thread.start()
     try:
-        results = [int(f.result(timeout=2.0).pred_xyz[0, 0, 0, 0].item()) for f in futures]
+        results = [
+            int(f.result(timeout=2.0).pred_xyz[0, 0, 0, 0].item()) for f in futures
+        ]
     finally:
         inference_engine.shutdown()
         thread.join(timeout=2.0)
@@ -201,4 +261,8 @@ def test_engine_batches_fixed_route_inputs() -> None:
     torch.testing.assert_close(route_xy[0], _route_xy(1.0))
     torch.testing.assert_close(route_xy[1], _route_xy(2.0))
     torch.testing.assert_close(route_xy[2], _route_xy(3.0))
-    assert inference_model.calls[0].ego_history_xyz[:, 0, 0, 0].tolist() == [0.0, 1.0, 2.0]
+    assert inference_model.calls[0].ego_history_xyz[:, 0, 0, 0].tolist() == [
+        0.0,
+        1.0,
+        2.0,
+    ]

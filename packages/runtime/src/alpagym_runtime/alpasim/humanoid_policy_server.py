@@ -49,12 +49,16 @@ from alpasim_grpc.v0.humanoid_pb2_grpc import (
     add_HumanoidPolicyServiceServicer_to_server,
 )
 
+from alpagym_runtime.inference.inference_engine import (
+    InferenceModelLease,
+)
 from alpagym_runtime.replay import PolicyReplayData
 from alpagym_runtime.types import PolicyOutput
 
 logger = logging.getLogger(__name__)
 
 _LOWERCASE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_MOTION_REFERENCE_SCHEMA_H70 = "g1_motion_reference_29d_50hz_h70.v1"
 MOTION_REFERENCE_JOINT_NAMES = (
     "left_hip_pitch_joint",
     "right_hip_pitch_joint",
@@ -150,7 +154,7 @@ class HumanoidMotionReferenceFrame:
 
 @dataclass(frozen=True)
 class HumanoidMotionReference:
-    """Typed 50-frame reference returned instead of a direct joint action."""
+    """Typed fixed-horizon reference returned instead of a direct joint action."""
 
     reference_id: int
     source_decision_id: int
@@ -186,6 +190,20 @@ class HumanoidPolicy(Protocol):
 
     def close(self) -> None:
         """Release per-session resources."""
+
+
+class SessionModelLeaseRegistry(Protocol):
+    """Lifecycle surface used to bind immutable models to gRPC sessions."""
+
+    def register_session_model_lease(
+        self,
+        session_uuid: str,
+        lease: InferenceModelLease,
+    ) -> None:
+        """Register a behavior-model snapshot before session construction."""
+
+    def release_session_model_lease(self, session_uuid: str) -> None:
+        """Release a snapshot after close, failure, or retry."""
 
 
 @dataclass(frozen=True)
@@ -273,6 +291,14 @@ class _Session:
                     if tick.active_reference_sha256 != reference_sha256:
                         raise ValueError(
                             "feedback active_reference_sha256 does not match source plan"
+                        )
+                    if (
+                        self.reference_frame_count == 70
+                        and tick.applied_reference_sha256 != reference_sha256
+                    ):
+                        raise ValueError(
+                            "H70 feedback applied_reference_sha256 does not match "
+                            "the unmodified source plan"
                         )
                     if not math.isclose(
                         tick.root_z_alignment_offset_m,
@@ -436,14 +462,21 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
     def __init__(
         self,
         policy_factory: Callable[[str, HumanoidPolicySessionRequest], HumanoidPolicy],
+        model_lease_registry: SessionModelLeaseRegistry | None = None,
     ) -> None:
         self._policy_factory = policy_factory
+        self._model_lease_registry = model_lease_registry
         self._sessions: dict[str, _Session] = {}
         self._sessions_lock = threading.Lock()
         self._session_records: dict[str, HumanoidSessionRecord] = {}
         self._reserved_versions: dict[str, int] = {}
 
-    def reserve_session(self, session_uuid: str, behavior_policy_version: int) -> None:
+    def reserve_session(
+        self,
+        session_uuid: str,
+        behavior_policy_version: int,
+        model_lease: InferenceModelLease | None = None,
+    ) -> None:
         """Bind queued simulator work to the exact rollout-weight version."""
         if not session_uuid or behavior_policy_version < 0:
             raise ValueError(
@@ -458,6 +491,25 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
                 raise ValueError(
                     f"humanoid session {session_uuid!r} is already reserved"
                 )
+            if self._model_lease_registry is None:
+                if model_lease is not None:
+                    raise ValueError(
+                        "colocated humanoid sessions must not carry model leases"
+                    )
+            else:
+                if model_lease is None:
+                    raise ValueError(
+                        "disaggregated humanoid sessions require a model lease"
+                    )
+                if model_lease.behavior_policy_version != behavior_policy_version:
+                    raise ValueError(
+                        "humanoid model lease version does not match the reserved "
+                        "behavior version"
+                    )
+                self._model_lease_registry.register_session_model_lease(
+                    session_uuid,
+                    model_lease,
+                )
             self._reserved_versions[session_uuid] = behavior_policy_version
 
     def start_session(
@@ -471,37 +523,49 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
             if session_uuid not in self._reserved_versions:
                 raise ValueError(f"humanoid session {session_uuid!r} was not reserved")
             behavior_policy_version = self._reserved_versions.pop(session_uuid)
-            # Proto zero/missing preserves the legacy direct-action contract.
-            execution_mode = int(getattr(request, "execution_mode", 0))
-            reference_joint_names: tuple[str, ...] = ()
-            reference_frame_count = 0
-            reference_sample_period_us = 0
-            control_ticks_per_policy_step = 1
-            if execution_mode == HUMANOID_EXECUTION_MODE_MOTION_REFERENCE:
-                (
-                    reference_joint_names,
-                    reference_frame_count,
-                    reference_sample_period_us,
-                    control_ticks_per_policy_step,
-                ) = _validate_motion_reference_session(request)
-            policy = self._policy_factory(session_uuid, request)
-            save_camera_dir = _session_save_camera_dir(session_uuid, request)
-            session = _Session(
-                policy=policy,
-                action_size=int(request.action_size),
-                observation_schema=str(request.observation_schema),
-                observation_terms=tuple(
-                    (str(term.name), int(term.size))
-                    for term in request.observation_terms
-                ),
-                execution_mode=execution_mode,
-                reference_joint_names=reference_joint_names,
-                reference_frame_count=reference_frame_count,
-                reference_sample_period_us=reference_sample_period_us,
-                control_ticks_per_policy_step=control_ticks_per_policy_step,
-                behavior_policy_version=behavior_policy_version,
-                save_camera_dir=save_camera_dir,
-            )
+            policy: HumanoidPolicy | None = None
+            try:
+                # Proto zero/missing preserves the legacy direct-action contract.
+                execution_mode = int(getattr(request, "execution_mode", 0))
+                reference_joint_names: tuple[str, ...] = ()
+                reference_frame_count = 0
+                reference_sample_period_us = 0
+                control_ticks_per_policy_step = 1
+                if execution_mode == HUMANOID_EXECUTION_MODE_MOTION_REFERENCE:
+                    (
+                        reference_joint_names,
+                        reference_frame_count,
+                        reference_sample_period_us,
+                        control_ticks_per_policy_step,
+                    ) = _validate_motion_reference_session(request)
+                policy = self._policy_factory(session_uuid, request)
+                save_camera_dir = _session_save_camera_dir(session_uuid, request)
+                session = _Session(
+                    policy=policy,
+                    action_size=int(request.action_size),
+                    observation_schema=str(request.observation_schema),
+                    observation_terms=tuple(
+                        (str(term.name), int(term.size))
+                        for term in request.observation_terms
+                    ),
+                    execution_mode=execution_mode,
+                    reference_joint_names=reference_joint_names,
+                    reference_frame_count=reference_frame_count,
+                    reference_sample_period_us=reference_sample_period_us,
+                    control_ticks_per_policy_step=control_ticks_per_policy_step,
+                    behavior_policy_version=behavior_policy_version,
+                    save_camera_dir=save_camera_dir,
+                )
+            except BaseException:
+                try:
+                    if policy is not None:
+                        policy.close()
+                finally:
+                    if self._model_lease_registry is not None:
+                        self._model_lease_registry.release_session_model_lease(
+                            session_uuid
+                        )
+                raise
             self._sessions[session_uuid] = session
         logger.info(
             "Started AlpaGym humanoid policy session=%s action_size=%d",
@@ -674,7 +738,11 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
         with self._sessions_lock:
             session = self._sessions.pop(session_uuid)
             self._session_records[session_uuid] = session.get_record()
-        session.policy.close()
+        try:
+            session.policy.close()
+        finally:
+            if self._model_lease_registry is not None:
+                self._model_lease_registry.release_session_model_lease(session_uuid)
         logger.info(
             "Closed AlpaGym humanoid policy session=%s recorded_outputs=%d",
             session_uuid,
@@ -689,12 +757,19 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
 
     def discard_session(self, session_uuid: str) -> None:
         """Drop a failed reservation/session/record before scheduling its retry."""
+        missing = object()
         with self._sessions_lock:
-            self._reserved_versions.pop(session_uuid, None)
+            reserved_version = self._reserved_versions.pop(session_uuid, missing)
             session = self._sessions.pop(session_uuid, None)
             self._session_records.pop(session_uuid, None)
-        if session is not None:
-            session.policy.close()
+        try:
+            if session is not None:
+                session.policy.close()
+        finally:
+            if self._model_lease_registry is not None and (
+                reserved_version is not missing or session is not None
+            ):
+                self._model_lease_registry.release_session_model_lease(session_uuid)
 
     def get_version(self, request: Empty, context: grpc.ServicerContext) -> VersionId:
         del request, context
@@ -716,12 +791,16 @@ class HumanoidPolicyServer:
         max_concurrent_rollouts: int,
         policy_factory: Callable[[str, HumanoidPolicySessionRequest], HumanoidPolicy],
         publish_host: str = "localhost",
+        model_lease_registry: SessionModelLeaseRegistry | None = None,
     ) -> None:
         self.name = name
         self.max_concurrent_rollouts = max_concurrent_rollouts
         self.host = publish_host
         bind_host = "localhost" if publish_host == "localhost" else "[::]"
-        self._servicer = HumanoidPolicyGrpcServicer(policy_factory=policy_factory)
+        self._servicer = HumanoidPolicyGrpcServicer(
+            policy_factory=policy_factory,
+            model_lease_registry=model_lease_registry,
+        )
         self._grpc_server = grpc.server(
             futures.ThreadPoolExecutor(max_workers=2 * max_concurrent_rollouts + 2)
         )
@@ -803,14 +882,14 @@ def _save_camera_images(
 def _validate_motion_reference_session(
     request: HumanoidPolicySessionRequest,
 ) -> tuple[tuple[str, ...], int, int, int]:
-    """Validate the fixed 50 Hz/H=50 motion-reference wire ABI."""
+    """Validate one supported 50 Hz motion-reference wire ABI."""
     spec = request.reference_spec
     joint_names = tuple(str(name) for name in spec.joint_names)
-    if str(spec.schema) != "g1_motion_reference_29d_50hz_h50.v1":
-        raise ValueError(
-            "motion-reference session requires schema "
-            "'g1_motion_reference_29d_50hz_h50.v1'"
-        )
+    schema = str(spec.schema)
+    if schema != _MOTION_REFERENCE_SCHEMA_H70:
+        raise ValueError("motion-reference session requires the H70 G1 schema")
+    if str(request.action_schema) != schema:
+        raise ValueError("motion-reference action_schema must match reference schema")
     if not joint_names or joint_names != tuple(
         str(name) for name in request.joint_names
     ):
@@ -825,10 +904,11 @@ def _validate_motion_reference_session(
     frame_count = int(spec.frame_count)
     sample_period_us = int(spec.sample_period_us)
     control_ticks = int(spec.control_ticks_per_policy_step)
-    if (frame_count, sample_period_us, control_ticks) != (50, 20_000, 5):
+    if frame_count != 70 or sample_period_us != 20_000 or control_ticks != 25:
         raise ValueError(
-            "motion-reference spec must be H=50, period=20000us, macro K=5; got "
-            f"H={frame_count}, period={sample_period_us}, K={control_ticks}"
+            "motion-reference spec does not match its schema; got "
+            f"H={frame_count}, period={sample_period_us}, K={control_ticks}; "
+            "expected H=70, period=20000us, K=25"
         )
     return joint_names, frame_count, sample_period_us, control_ticks
 

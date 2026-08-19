@@ -94,19 +94,8 @@ def test_wizard_command_can_select_test_suite(tmp_path: Path) -> None:
     assert not any(override.startswith("scenes.scene_ids=") for override in command)
 
 
-@pytest.mark.parametrize(
-    ("n_sim_steps", "expected_max_control_ticks", "reward_profile_id"),
-    [
-        (150, 750, "reference_route_centered.v1"),
-        (200, 1000, "reference_route_centered.v2"),
-        (150, 750, "reference_route_centered.v3"),
-    ],
-)
 def test_wizard_command_selects_strict_motion_reference_profile(
     tmp_path: Path,
-    n_sim_steps: int,
-    expected_max_control_ticks: int,
-    reward_profile_id: str,
 ) -> None:
     """Reference execution sends one frozen identity map and no direct-action knobs."""
     config = _alpasim_config(
@@ -115,8 +104,8 @@ def test_wizard_command_selects_strict_motion_reference_profile(
             topology="1gpu",
             driver_source="external_dynamic",
             force_gt_duration_us=0,
-            control_timestep_us=100_000,
-            n_sim_steps=n_sim_steps,
+            control_timestep_us=500_000,
+            n_sim_steps=60,
             extra_overrides="cameras=motion_reference_debug",
         )
     )
@@ -127,7 +116,7 @@ def test_wizard_command_selects_strict_motion_reference_profile(
         scenario_ids_by_scene={"hq_stairs": "ascend"},
         execution_profile=HumanoidExecutionProfile.motion_reference,
         grail_root_path="/workspace/GRAIL",
-        reward_profile_id=reward_profile_id,
+        reward_profile_id="reference_route_centered.v3",
         expected_scene_fingerprints={"hq_stairs": "a" * 64},
     )
 
@@ -139,7 +128,7 @@ def test_wizard_command_selects_strict_motion_reference_profile(
         checkout_root=tmp_path,
     )
 
-    assert "runtime_domain=humanoid_reference" in command
+    assert "runtime_domain=humanoid_reference_h70" in command
     assert "defines.humanoid_grail_root=/workspace/GRAIL" in command
     assert (
         'defines.humanoid_scene_fingerprints_json="{\\"hq_stairs\\":\\"'
@@ -147,8 +136,10 @@ def test_wizard_command_selects_strict_motion_reference_profile(
         + '\\"}"'
     ) in command
     assert not any("registration_options" in item for item in command)
+    assert "runtime.humanoid.reference.control_ticks_per_policy_step=25" in command
     assert (
-        f'+runtime.humanoid.controller.options.reward_profile_id="{reward_profile_id}"'
+        "+runtime.humanoid.controller.options.reward_profile_id="
+        '"reference_route_centered.v3"'
     ) in command
     assert '+runtime.humanoid.controller.options.route_center_soft_m="0.1"' in command
     assert (
@@ -159,8 +150,7 @@ def test_wizard_command_selects_strict_motion_reference_profile(
         in command
     )
     derived_horizon_override = (
-        "runtime.humanoid.controller.options.max_control_ticks="
-        f'"{expected_max_control_ticks}"'
+        'runtime.humanoid.controller.options.max_control_ticks="1500"'
     )
     assert derived_horizon_override in command
     assert "cameras=motion_reference_debug" in command
@@ -206,7 +196,7 @@ def test_wizard_command_rejects_motion_reference_controller_overrides(
 
     with pytest.raises(
         ValueError,
-        match="motion_reference extra_overrides cannot modify reserved controller",
+        match="motion_reference extra_overrides cannot modify host-owned",
     ):
         _build_wizard_command(
             config=config,
@@ -380,3 +370,44 @@ def test_wait_for_runtime_ready_publishes_caller_host(
         published_host="runtime-node-0",
     ) == ("runtime-node-0", 30051)
     assert connection_attempts == [("runtime-node-0", 30051)]
+
+
+def test_wizard_command_selects_h70_for_current_policy_planner(tmp_path: Path) -> None:
+    """The host selects H70/K25 and derives the full 30-second tick budget."""
+    config = _alpasim_config(
+        AlpaSimWizardArgs(
+            deploy="local",
+            topology="1gpu",
+            driver_source="external_dynamic",
+            force_gt_duration_us=0,
+            control_timestep_us=500_000,
+            n_sim_steps=60,
+        )
+    )
+    config.simulation_domain = "humanoid"
+    config.humanoid = HumanoidAlpaSimConfig(
+        repo_path="/workspace/humanoid",
+        scene_store_path="/workspace/scenes",
+        scenario_ids_by_scene={"hq_stairs": "ascend"},
+        execution_profile=HumanoidExecutionProfile.motion_reference,
+        reference_frame_count=70,
+        grail_root_path="/workspace/GRAIL",
+        reward_profile_id="reference_route_centered.v3",
+    )
+
+    command = _build_wizard_command(
+        config=config,
+        execution_backend=ExecutionBackend.local_process,
+        dataset=DatasetConfig(scene_ids=["hq_stairs"], test_suite_id=None),
+        alpasim_run_dir=tmp_path / "alpasim",
+        checkout_root=tmp_path,
+    )
+
+    assert "runtime_domain=humanoid_reference_h70" in command
+    assert "runtime.humanoid.reference.control_ticks_per_policy_step=25" in command
+    assert 'runtime.humanoid.controller.options.max_control_ticks="1500"' in command
+    assert (
+        "+runtime.humanoid.controller.options.reward_profile_id="
+        '"reference_route_centered.v3"'
+    ) in command
+    assert "runtime_domain=humanoid_reference" not in command

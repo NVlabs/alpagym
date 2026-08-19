@@ -6,7 +6,12 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
-from alpagym_g1_mjlab.bundle import build_model_inputs, get_bundle, load_inference_model
+from alpagym_g1_mjlab.bundle import (
+    build_model_inputs,
+    get_bundle,
+    load_inference_model,
+    setup_tokenizer,
+)
 from alpagym_g1_mjlab.humanoid_policy import build_humanoid_policy_factory
 from alpagym_g1_mjlab.model import (
     ACTION_SCHEMA,
@@ -19,6 +24,7 @@ from alpagym_g1_mjlab.model import (
     OBS_KEYS,
     register_g1_mjlab_model,
 )
+from alpagym_runtime.inference.inference_engine import InferenceEngine
 from alpagym_runtime.replay import (
     ActionSelection,
     PolicyReplayData,
@@ -68,60 +74,6 @@ def test_build_model_inputs_scores_continuous_action_payload() -> None:
     assert set(model_inputs) == {*OBS_KEYS, "actions"}
     assert model_inputs["actions"].shape == (23,)
     torch.testing.assert_close(old_logprob, torch.tensor(-1.25))
-
-
-def test_load_inference_model_and_humanoid_policy_factory(tmp_path: Path) -> None:
-    _write_bundle(tmp_path)
-    run_config = SimpleNamespace(
-        policy=SimpleNamespace(
-            model=SimpleNamespace(
-                path=str(tmp_path),
-                device="cpu",
-                bundle_config={"deterministic": True},
-            )
-        )
-    )
-    inference = load_inference_model(run_config, torch.device("cpu"), torch.float32)
-    factory = build_humanoid_policy_factory(run_config, SimpleNamespace(get_model=inference.get_model))
-    policy = factory("session", _session_request())
-    flat_obs = torch.zeros(sum(OBS_DIMS[key] for key in OBS_KEYS))
-    output = policy.step((SimpleNamespace(env_id=3, observation=flat_obs),))[0]
-    assert output.env_id == 3
-    assert output.action.shape == (23,)
-    assert output.logprob is not None
-    assert output.value is not None
-    assert output.replay_data is not None
-
-
-def test_humanoid_policy_reads_replaced_inference_model_at_every_step(tmp_path: Path) -> None:
-    """Cosmos model replacement must affect sessions created before the swap."""
-    _write_bundle(tmp_path)
-    run_config = SimpleNamespace(
-        policy=SimpleNamespace(
-            model=SimpleNamespace(
-                path=str(tmp_path),
-                device="cpu",
-                bundle_config={"deterministic": True},
-            )
-        )
-    )
-    first = load_inference_model(run_config, torch.device("cpu"), torch.float32).get_model()
-    second = G1MjlabActorCriticModel(G1MjlabConfig(hidden_dims=[8], init_std=0.2))
-    engine = SimpleNamespace(model=first)
-    engine.get_model = lambda: engine.model
-    policy = build_humanoid_policy_factory(run_config, engine)("session", _session_request())
-    flat_obs = torch.zeros(sum(OBS_DIMS.values()))
-    policy_input = SimpleNamespace(env_id=0, observation=flat_obs)
-    first_action = policy.step((policy_input,))[0].action
-
-    with torch.no_grad():
-        second.actor[-1].weight.zero_()
-        second.actor[-1].bias.fill_(0.75)
-    engine.model = second
-    second_action = policy.step((policy_input,))[0].action
-
-    assert not torch.equal(first_action, second_action)
-    torch.testing.assert_close(second_action, torch.full((23,), 0.75))
 
 
 def _session_request() -> SimpleNamespace:
@@ -179,10 +131,12 @@ def test_g1_model_trains_with_alpagym_ppo_minibatch() -> None:
     critic_before = [param.detach().clone() for param in model.critic.parameters()]
     std_before = model.std.detach().clone()
 
-    loss, kl, ratio_max, ratio_min, clip_fraction, _grad_norm = trainer._train_minibatch(
-        samples,
-        advantages,
-        inter_policy_nccl=object(),
+    loss, kl, ratio_max, ratio_min, clip_fraction, _grad_norm = (
+        trainer._train_minibatch(
+            samples,
+            advantages,
+            inter_policy_nccl=object(),
+        )
     )
 
     assert torch.isfinite(torch.tensor(loss))
@@ -190,7 +144,9 @@ def test_g1_model_trains_with_alpagym_ppo_minibatch() -> None:
     assert ratio_min == pytest.approx(1.0)
     assert ratio_max == pytest.approx(1.0)
     assert clip_fraction == 0.0
-    assert _parameters_changed(model.actor.parameters(), actor_before) or not torch.equal(
+    assert _parameters_changed(
+        model.actor.parameters(), actor_before
+    ) or not torch.equal(
         model.std.detach(),
         std_before,
     )
@@ -198,7 +154,9 @@ def test_g1_model_trains_with_alpagym_ppo_minibatch() -> None:
 
 
 class _G1SmokePacker:
-    def policy_collate_fn(self, samples: list[TrainerReplayData]) -> TrainerReplayDataBatch:
+    def policy_collate_fn(
+        self, samples: list[TrainerReplayData]
+    ) -> TrainerReplayDataBatch:
         return TrainerReplayDataBatch.stack(samples)
 
 
@@ -217,7 +175,9 @@ def _ppo_samples_for_model(model: G1MjlabActorCriticModel) -> list[TrainerReplay
         action = torch.zeros(23, dtype=torch.float32)
         with torch.no_grad():
             batched_obs = {key: value.unsqueeze(0) for key, value in obs.items()}
-            old_logprob = model(actions=action.unsqueeze(0), **batched_obs)["log_probs"].reshape(1)
+            old_logprob = model(actions=action.unsqueeze(0), **batched_obs)[
+                "log_probs"
+            ].reshape(1)
         samples.append(
             TrainerReplayData(
                 model_inputs={**obs, "actions": action},
@@ -242,4 +202,140 @@ def _parameters_changed(
     parameters: object,
     before: list[torch.Tensor],
 ) -> bool:
-    return any(not torch.equal(param.detach(), previous) for param, previous in zip(parameters, before))
+    return any(
+        not torch.equal(param.detach(), previous)
+        for param, previous in zip(parameters, before)
+    )
+
+
+def _write_safetensors_bundle(path: Path, *, indexed: bool) -> dict[str, torch.Tensor]:
+    from safetensors.torch import save_file
+
+    path.mkdir(exist_ok=True)
+    register_g1_mjlab_model()
+    config = G1MjlabConfig(hidden_dims=[8], init_std=0.2)
+    (path / "config.json").write_text(json.dumps(config.to_dict()), encoding="utf-8")
+    model = G1MjlabActorCriticModel(config)
+    state_dict = {
+        key: torch.full_like(value, 0.125).to(dtype=torch.bfloat16)
+        for key, value in model.state_dict().items()
+    }
+    shard_name = "00000.safetensors" if indexed else "model.safetensors"
+    save_file(state_dict, path / shard_name)
+    if indexed:
+        (path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {
+                        "total_size": sum(
+                            value.numel() * value.element_size()
+                            for value in state_dict.values()
+                        )
+                    },
+                    "weight_map": {key: shard_name for key in state_dict},
+                }
+            ),
+            encoding="utf-8",
+        )
+    return state_dict
+
+
+def test_disaggregated_humanoid_policy_keeps_its_session_model_lease(
+    tmp_path: Path,
+) -> None:
+    """A live-model sync cannot change actions inside an already-open episode."""
+
+    _write_bundle(tmp_path)
+    run_config = SimpleNamespace(
+        policy=SimpleNamespace(
+            model=SimpleNamespace(
+                path=str(tmp_path),
+                device="cpu",
+                bundle_config={"deterministic": True},
+            )
+        )
+    )
+    inference_model = load_inference_model(
+        run_config,
+        torch.device("cpu"),
+        torch.float32,
+    )
+    engine = InferenceEngine(
+        inference_model=inference_model,
+        sampling=SimpleNamespace(),
+        return_trace_for_rl=False,
+        max_batch_size=1,
+        require_session_model_leases=True,
+    )
+    lease = engine.create_model_lease(behavior_policy_version=4)
+    engine.register_session_model_lease("session", lease)
+    policy = build_humanoid_policy_factory(run_config, engine)(
+        "session", _session_request()
+    )
+    flat_obs = torch.zeros(sum(OBS_DIMS.values()))
+    policy_input = SimpleNamespace(env_id=0, observation=flat_obs)
+    leased_action_before_sync = policy.step((policy_input,))[0].action
+
+    replacement = G1MjlabActorCriticModel(G1MjlabConfig(hidden_dims=[8], init_std=0.2))
+    with torch.no_grad():
+        replacement.actor[-1].weight.zero_()
+        replacement.actor[-1].bias.fill_(0.75)
+    engine.set_model(replacement)
+    leased_action_after_sync = policy.step((policy_input,))[0].action
+
+    torch.testing.assert_close(
+        leased_action_after_sync,
+        leased_action_before_sync,
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert not torch.equal(
+        leased_action_after_sync,
+        torch.full((23,), 0.75),
+    )
+
+
+@pytest.mark.parametrize("indexed", [True, False], ids=["shard-index", "single-file"])
+def test_load_inference_model_from_safetensors_export(
+    tmp_path: Path, indexed: bool
+) -> None:
+    expected = _write_safetensors_bundle(tmp_path, indexed=indexed)
+    run_config = SimpleNamespace(
+        policy=SimpleNamespace(
+            model=SimpleNamespace(
+                path=str(tmp_path),
+                device="cpu",
+                bundle_config={"deterministic": True},
+            )
+        )
+    )
+
+    model = load_inference_model(
+        run_config, torch.device("cpu"), torch.float32
+    ).get_model()
+
+    assert not (tmp_path / "pytorch_model.bin").exists()
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(value, expected[key].to(dtype=torch.float32))
+
+
+def test_no_op_tokenizer_can_be_saved_by_cosmos_checkpoint_export(
+    tmp_path: Path,
+) -> None:
+    """Cosmos data-packer checkpointing requires ``save_pretrained``."""
+    tokenizer = setup_tokenizer(SimpleNamespace())
+    export_dir = tmp_path / "safetensors" / "step_1"
+
+    saved_paths = tokenizer.save_pretrained(export_dir)
+
+    marker_path = export_dir / "g1_mjlab_no_op_tokenizer.json"
+    assert saved_paths == (str(marker_path),)
+    assert json.loads(marker_path.read_text(encoding="utf-8")) == {
+        "format_version": 1,
+        "tokenizer_type": "alpagym_g1_mjlab_no_op",
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+        "model_max_length": tokenizer.model_max_length,
+        "vocab_size": tokenizer.vocab_size,
+    }
+    assert tokenizer.encode({"episode_length": 3}) == [0, 0, 0]
