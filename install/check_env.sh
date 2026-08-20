@@ -107,11 +107,11 @@ fi
 # --- Optional checks (warn only) ---------------------------------------------
 printf '\n%sOptional (policy/integration dependent):%s\n' "$bold" "$reset"
 
-if GIT_TERMINAL_PROMPT=0 git ls-remote --quiet https://github.com/NVlabs/alpasim.git >/dev/null 2>&1; then
-  ok "AlpaSim repo (github.com/NVlabs/alpasim) reachable"
+if GIT_TERMINAL_PROMPT=0 git ls-remote --quiet https://github.com/chenyx09/alpasim.git >/dev/null 2>&1; then
+  ok "Pinned humanoid AlpaSim fork reachable"
 else
-  warn "could not reach github.com/NVlabs/alpasim.git" \
-    "Check your network/proxy (uv sync clones this repo)"
+  warn "could not authenticate to github.com/chenyx09/alpasim.git" \
+    "Configure GitHub HTTPS credentials; uv sync and managed humanoid runs use this private fork"
 fi
 
 if ! command -v hf >/dev/null 2>&1 && command -v huggingface-cli >/dev/null 2>&1; then

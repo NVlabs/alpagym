@@ -69,7 +69,7 @@ alpasim:
   checkout_cache_dir: null
   # AlpaSim fork containing the exact humanoid gRPC/runtime ABI pinned by this
   # workspace. Set repo_path to start Wizard from a local checkout instead.
-  repo_url: ssh://git@github.com/chenyx09/alpasim.git
+  repo_url: https://github.com/chenyx09/alpasim.git
   repo_ref: ${alpasim_grpc_repo_ref:}
   startup_timeout_s: 1200.0
   simulation_timeout_s: 600.0

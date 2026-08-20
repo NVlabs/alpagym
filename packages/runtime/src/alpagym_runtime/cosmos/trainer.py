@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""GRPO trainer for AlpaGym closed-loop training.
+"""GRPO, actor-critic PPO, and Flow-PPO adapters for closed-loop training.
 
 The trainer is policy-agnostic: per-policy tokenizer resolution and data
 packer construction are looked up via the
 ``alpagym_runtime.policies.registry`` bundle for the configured
-policy kind string. The cosmos entrypoint dispatches the data packer the same way.
+policy kind string.  Cosmos currently exposes their shared scheduling fields
+through ``GrpoConfig``; the selected ``trainer_type`` determines the objective.
 """
 
 import copy
@@ -872,7 +873,7 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         parallel_dims: _parallelism.ParallelDims,
         **kwargs: Any,
     ) -> None:
-        """Initialize PPO-specific hyperparameters after the shared GRPO setup."""
+        """Initialize PPO-specific hyperparameters after shared Cosmos setup."""
         super().__init__(config=config, parallel_dims=parallel_dims, **kwargs)
         ppo_config = _custom_config_section(config, "ppo")
         self._value_loss_coef = float(ppo_config.get("value_loss_coef", 0.5))
@@ -1453,7 +1454,7 @@ class AlpagymFlowPPOTrainer(AlpagymPPOTrainer):
             raise ValueError("alpagym_flow_ppo does not use reference-model KL")
 
     def _compute_gae(self, step_samples: list[Any]) -> tuple[list[float], list[float]]:
-        """Compute variable-duration GAE on Wenhao's nominal 0.5 s clock.
+        """Compute variable-duration GAE on the VLA's nominal 0.5 s clock.
 
         RLinf's configured ``gamma`` and ``lambda`` are per policy decision,
         not per 50 Hz controller tick.  A nominal transition is 25 controller

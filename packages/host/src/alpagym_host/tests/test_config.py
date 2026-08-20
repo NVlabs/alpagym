@@ -30,7 +30,7 @@ from alpagym_host.config import (
 )
 from alpagym_host.config_validation import (
     _validate_humanoid_config,
-    _validate_wenhao_slurm_worker_mounts,
+    _validate_vla_slurm_worker_mounts,
     validate_run_config,
 )
 from alpagym_host.humanoid_scene_identity import freeze_humanoid_scene_fingerprints
@@ -180,7 +180,7 @@ def test_host_writes_alpagym_ppo_trainer_config(
     }
 
 
-def test_host_writes_wenhao_flow_ppo_config(tmp_path: Path) -> None:
+def test_host_writes_vla_flow_ppo_config(tmp_path: Path) -> None:
     """Host serializes the exact Flow-PPO optimizer and loss configuration."""
     register_config_schema()
     with initialize_config_module(version_base=None, config_module="alpagym_host.conf"):
@@ -737,7 +737,7 @@ def test_humanoid_policy_camera_requires_typed_writable_cache() -> None:
             scenario_ids_by_scene={"stairs": "ascend"},
             execution_profile=HumanoidExecutionProfile.motion_reference,
             grail_root_path="/tmp/GRAIL",
-            policy_camera_profile=HumanoidPolicyCameraProfile.wenhao_d455,
+            policy_camera_profile=HumanoidPolicyCameraProfile.vla_d455,
             service_image="alpasim-humanoid-nurec:local",
             reward_profile_id="reference_route_centered.v3",
         )
@@ -755,7 +755,7 @@ def test_humanoid_policy_camera_profile_round_trips_resolved_config(
         scenario_ids_by_scene={"stairs": "ascend"},
         execution_profile=HumanoidExecutionProfile.motion_reference,
         grail_root_path="/tmp/GRAIL",
-        policy_camera_profile=HumanoidPolicyCameraProfile.wenhao_d455,
+        policy_camera_profile=HumanoidPolicyCameraProfile.vla_d455,
         service_image="alpasim-humanoid-nurec:local",
         reward_profile_id="reference_route_centered.v3",
     )
@@ -774,16 +774,15 @@ def test_humanoid_policy_camera_profile_round_trips_resolved_config(
         run_config.artifact_paths.resolved_config_path.read_text(encoding="utf-8")
     )
     loaded_config = load_run_config(run_config.artifact_paths.resolved_config_path)
-    assert raw_config["alpasim"]["humanoid"]["policy_camera_profile"] == "wenhao_d455"
-    assert HumanoidPolicyCameraProfile.wenhao_d455.value == "wenhao_d455"
+    assert raw_config["alpasim"]["humanoid"]["policy_camera_profile"] == "vla_d455"
+    assert HumanoidPolicyCameraProfile.vla_d455.value == "vla_d455"
     assert (
-        HumanoidPolicyCameraProfile.wenhao_d455.wizard_config_group
-        == "humanoid_wenhao_d455"
+        HumanoidPolicyCameraProfile.vla_d455.wizard_config_group == "humanoid_vla_d455"
     )
     assert loaded_config.alpasim.humanoid is not None
     assert (
         loaded_config.alpasim.humanoid.policy_camera_profile
-        is HumanoidPolicyCameraProfile.wenhao_d455
+        is HumanoidPolicyCameraProfile.vla_d455
     )
 
 
@@ -801,27 +800,27 @@ def test_humanoid_motion_reference_without_camera_remains_supported() -> None:
     assert config.scene_cache_path is None
 
 
-def test_wenhao_policy_rejects_av_runtime_route() -> None:
+def test_vla_policy_rejects_av_runtime_route() -> None:
     """The VLA must fail before an AV runtime can dispatch the wrong factory."""
-    config = _make_valid_wenhao_validation_config()
+    config = _make_valid_vla_validation_config()
     config.alpasim.simulation_domain = "av"
 
     with pytest.raises(ValueError, match="simulation_domain=humanoid"):
         _validate_humanoid_config(config)
 
 
-def test_wenhao_policy_rejects_av_policy_dispatch() -> None:
+def test_vla_policy_rejects_av_policy_dispatch() -> None:
     """The VLA model cannot enter the AV policy factory through an override."""
-    config = _make_valid_wenhao_validation_config()
+    config = _make_valid_vla_validation_config()
     config.policy.kind = "alpamayo"
 
     with pytest.raises(ValueError, match="policy.kind=humanoid"):
         _validate_humanoid_config(config)
 
 
-def test_wenhao_policy_rejects_direct_action_runtime_route() -> None:
+def test_vla_policy_rejects_direct_action_runtime_route() -> None:
     """The one-second VLA output cannot enter the direct-action execution ABI."""
-    config = _make_valid_wenhao_validation_config()
+    config = _make_valid_vla_validation_config()
     assert config.alpasim.humanoid is not None
     config.alpasim.humanoid.execution_profile = HumanoidExecutionProfile.direct_action
 
@@ -830,11 +829,11 @@ def test_wenhao_policy_rejects_direct_action_runtime_route() -> None:
 
 
 @pytest.mark.parametrize("factory_spec", [None, "zero"])
-def test_wenhao_policy_requires_native_runtime_factory(
+def test_vla_policy_requires_native_runtime_factory(
     factory_spec: str | None,
 ) -> None:
     """Missing or smoke-test factories cannot silently replace the VLA."""
-    config = _make_valid_wenhao_validation_config()
+    config = _make_valid_vla_validation_config()
     if factory_spec is None:
         config.policy.model.bundle_config.pop("humanoid_policy_factory")
     else:
@@ -845,11 +844,11 @@ def test_wenhao_policy_requires_native_runtime_factory(
 
 
 @pytest.mark.parametrize("camera_requirement", [None, False])
-def test_wenhao_policy_requires_strict_camera_runtime(
+def test_vla_policy_requires_strict_camera_runtime(
     camera_requirement: bool | None,
 ) -> None:
     """A visual VLA cannot run after its strict D455 camera ABI is disabled."""
-    config = _make_valid_wenhao_validation_config()
+    config = _make_valid_vla_validation_config()
     if camera_requirement is None:
         config.policy.model.bundle_config.pop("require_policy_camera")
     else:
@@ -868,7 +867,7 @@ def test_humanoid_policy_camera_rejects_dynamics_only_image() -> None:
             scenario_ids_by_scene={"stairs": "ascend"},
             execution_profile=HumanoidExecutionProfile.motion_reference,
             grail_root_path="/tmp/GRAIL",
-            policy_camera_profile=HumanoidPolicyCameraProfile.wenhao_d455,
+            policy_camera_profile=HumanoidPolicyCameraProfile.vla_d455,
             reward_profile_id="reference_route_centered.v3",
         )
 
@@ -1130,7 +1129,7 @@ def test_cosmos_config_accepts_grpo_batch_geometry(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "missing_label",
     [
-        "Wenhao policy_eval_root",
+        "VLA policy_eval_root",
         "alpasim.humanoid.repo_path",
         "alpasim.humanoid.scene_store_path",
         "alpasim.humanoid.grail_root_path",
@@ -1138,15 +1137,15 @@ def test_cosmos_config_accepts_grpo_batch_geometry(tmp_path: Path) -> None:
         "alpasim.repo_path",
     ],
 )
-def test_wenhao_slurm_requires_every_worker_path_identity_mounted(
+def test_vla_slurm_requires_every_worker_path_identity_mounted(
     tmp_path: Path,
     missing_label: str,
 ) -> None:
-    """A model-leaf mount cannot hide missing Wenhao source/service mounts."""
+    """A model-leaf mount cannot hide missing VLA source/service mounts."""
     policy_eval_root = tmp_path / "policy_eval"
-    model_root = policy_eval_root / "models" / "wenhao-model"
+    model_root = policy_eval_root / "models" / "vla-model"
     required_paths = {
-        "Wenhao policy_eval_root": policy_eval_root,
+        "VLA policy_eval_root": policy_eval_root,
         "alpasim.humanoid.repo_path": tmp_path / "humanoid_repo",
         "alpasim.humanoid.scene_store_path": tmp_path / "scene_store",
         "alpasim.humanoid.grail_root_path": tmp_path / "grail",
@@ -1165,7 +1164,7 @@ def test_wenhao_slurm_requires_every_worker_path_identity_mounted(
             slurm=SimpleNamespace(container_mounts=mounts),
         ),
         policy=SimpleNamespace(
-            model=SimpleNamespace(kind="g1_wenhao_vla", path=str(model_root))
+            model=SimpleNamespace(kind="g1_vla", path=str(model_root))
         ),
         alpasim=SimpleNamespace(
             repo_path=str(required_paths["alpasim.repo_path"]),
@@ -1185,15 +1184,15 @@ def test_wenhao_slurm_requires_every_worker_path_identity_mounted(
     )
 
     with pytest.raises(ValueError, match=re.escape(missing_label)):
-        _validate_wenhao_slurm_worker_mounts(cast(RunConfig, config))
+        _validate_vla_slurm_worker_mounts(cast(RunConfig, config))
 
 
-def test_wenhao_slurm_accepts_all_worker_mounts_and_local_needs_none(
+def test_vla_slurm_accepts_all_worker_mounts_and_local_needs_none(
     tmp_path: Path,
 ) -> None:
     """Complete Slurm visibility passes while local execution remains unchanged."""
     policy_eval_root = tmp_path / "policy_eval"
-    model_root = policy_eval_root / "models" / "wenhao-model"
+    model_root = policy_eval_root / "models" / "vla-model"
     worker_paths = [
         policy_eval_root,
         tmp_path / "humanoid_repo",
@@ -1210,7 +1209,7 @@ def test_wenhao_slurm_accepts_all_worker_mounts_and_local_needs_none(
             ),
         ),
         policy=SimpleNamespace(
-            model=SimpleNamespace(kind="g1_wenhao_vla", path=str(model_root))
+            model=SimpleNamespace(kind="g1_vla", path=str(model_root))
         ),
         alpasim=SimpleNamespace(
             repo_path=None,
@@ -1225,25 +1224,25 @@ def test_wenhao_slurm_accepts_all_worker_mounts_and_local_needs_none(
         ),
     )
 
-    _validate_wenhao_slurm_worker_mounts(cast(RunConfig, config))
-    config.policy.model.path = "models/wenhao-model"
+    _validate_vla_slurm_worker_mounts(cast(RunConfig, config))
+    config.policy.model.path = "models/vla-model"
     with pytest.raises(ValueError, match="policy.model.path must be an absolute path"):
-        _validate_wenhao_slurm_worker_mounts(cast(RunConfig, config))
+        _validate_vla_slurm_worker_mounts(cast(RunConfig, config))
     config.policy.model.path = str(model_root)
     config.alpasim.checkout_cache_dir = None
     with pytest.raises(ValueError, match="alpasim.repo_path or"):
-        _validate_wenhao_slurm_worker_mounts(cast(RunConfig, config))
+        _validate_vla_slurm_worker_mounts(cast(RunConfig, config))
     config.execution.backend = ExecutionBackend.local_process
     config.execution.slurm.container_mounts = []
-    _validate_wenhao_slurm_worker_mounts(cast(RunConfig, config))
+    _validate_vla_slurm_worker_mounts(cast(RunConfig, config))
 
 
-def test_wenhao_mount_preflight_precedes_unqualified_slurm_mode_rejection(
+def test_vla_mount_preflight_precedes_unqualified_slurm_mode_rejection(
     tmp_path: Path,
 ) -> None:
     """A candidate Slurm run reports its latent model-root mount first."""
     policy_eval_root = tmp_path / "policy_eval"
-    model_root = policy_eval_root / "models" / "wenhao-model"
+    model_root = policy_eval_root / "models" / "vla-model"
     run_config = _make_run_config(
         tmp_path,
         f"policy.model.path={model_root}",
@@ -1263,12 +1262,12 @@ def test_wenhao_mount_preflight_precedes_unqualified_slurm_mode_rejection(
         scenario_ids_by_scene={"stairs": "ascend"},
         execution_profile=HumanoidExecutionProfile.motion_reference,
         grail_root_path=str(humanoid_paths["grail"]),
-        policy_camera_profile=HumanoidPolicyCameraProfile.wenhao_d455,
+        policy_camera_profile=HumanoidPolicyCameraProfile.vla_d455,
         scene_cache_path=str(humanoid_paths["scene_cache"]),
         service_image="combined-humanoid:latest",
         reward_profile_id="reference_route_centered.v3",
     )
-    run_config.policy.model.kind = "g1_wenhao_vla"
+    run_config.policy.model.kind = "g1_vla"
     run_config.policy.model.path = str(model_root)
     run_config.execution.slurm.container_mounts = [
         f"{model_root}:{model_root}",
@@ -1279,7 +1278,7 @@ def test_wenhao_mount_preflight_precedes_unqualified_slurm_mode_rejection(
         ),
     ]
 
-    with pytest.raises(ValueError, match="Wenhao policy_eval_root"):
+    with pytest.raises(ValueError, match="VLA policy_eval_root"):
         validate_run_config(run_config, "run")
 
 
@@ -1513,7 +1512,7 @@ def _make_run_config(tmp_path: Path, *overrides: str) -> RunConfig:
     return build_run_config(cfg, artifact_paths)
 
 
-def _make_valid_wenhao_validation_config() -> RunConfig:
+def _make_valid_vla_validation_config() -> RunConfig:
     """Build the complete config slice consumed by humanoid preflight."""
     fingerprints = {"stairs": "a" * 64}
     humanoid_repo_path = "/tmp/humanoid-support"
@@ -1524,12 +1523,12 @@ def _make_valid_wenhao_validation_config() -> RunConfig:
             policy=SimpleNamespace(
                 kind="humanoid",
                 model=SimpleNamespace(
-                    kind="g1_wenhao_vla",
+                    kind="g1_vla",
                     step_dt_us=500_000,
-                    use_cameras=["wenhao_d455_policy_rgb"],
+                    use_cameras=["vla_d455_policy_rgb"],
                     bundle_config={
                         "humanoid_policy_factory": (
-                            "alpagym_g1_wenhao_vla.humanoid_policy:"
+                            "alpagym_g1_vla.humanoid_policy:"
                             "build_humanoid_policy_factory"
                         ),
                         "require_policy_camera": True,
@@ -1552,7 +1551,7 @@ def _make_valid_wenhao_validation_config() -> RunConfig:
                     expected_scene_fingerprints=fingerprints,
                     execution_profile=HumanoidExecutionProfile.motion_reference,
                     reference_frame_count=50,
-                    policy_camera_profile=HumanoidPolicyCameraProfile.wenhao_d455,
+                    policy_camera_profile=HumanoidPolicyCameraProfile.vla_d455,
                 ),
                 wizard_args=SimpleNamespace(
                     control_timestep_us=500_000,

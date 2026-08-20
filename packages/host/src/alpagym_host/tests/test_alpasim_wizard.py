@@ -116,7 +116,7 @@ def test_wizard_command_selects_strict_motion_reference_profile(
         scenario_ids_by_scene={"hq_stairs": "ascend"},
         execution_profile=HumanoidExecutionProfile.motion_reference,
         grail_root_path="/workspace/GRAIL",
-        policy_camera_profile=HumanoidPolicyCameraProfile.wenhao_d455,
+        policy_camera_profile=HumanoidPolicyCameraProfile.vla_d455,
         scene_cache_path="/workspace/cache/hq_stairs",
         service_image="alpasim-humanoid-nurec:local",
         reward_profile_id="reference_route_centered.v3",
@@ -157,7 +157,7 @@ def test_wizard_command_selects_strict_motion_reference_profile(
         'runtime.humanoid.controller.options.max_control_ticks="1500"'
     )
     assert derived_horizon_override in command
-    assert command.count("cameras=humanoid_wenhao_d455") == 1
+    assert command.count("cameras=humanoid_vla_d455") == 1
     assert command.count("defines.humanoid_scene_cache=/workspace/cache/hq_stairs") == 1
 
 
@@ -277,7 +277,7 @@ def test_start_wizard_creates_typed_policy_camera_cache(
         scenario_ids_by_scene={"hq_stairs": "ascend"},
         execution_profile=HumanoidExecutionProfile.motion_reference,
         grail_root_path="/workspace/GRAIL",
-        policy_camera_profile=HumanoidPolicyCameraProfile.wenhao_d455,
+        policy_camera_profile=HumanoidPolicyCameraProfile.vla_d455,
         service_image="alpasim-humanoid-nurec:local",
         reward_profile_id="reference_route_centered.v3",
     )

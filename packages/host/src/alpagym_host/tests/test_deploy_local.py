@@ -24,7 +24,7 @@ def test_deploy_local_public_preset(tmp_path: Path) -> None:
     assert cfg.execution.backend == "local_process"
     # repo_url comes from the shared default and carries the matching humanoid ABI;
     # deploy=local selects the public Wizard deploy preset.
-    assert cfg.alpasim.repo_url == "ssh://git@github.com/chenyx09/alpasim.git"
+    assert cfg.alpasim.repo_url == "https://github.com/chenyx09/alpasim.git"
     assert cfg.alpasim.wizard_args.deploy == "local"
     # renderer is unset so the public AlpaSim mirror's own default NRE renderer applies.
     assert cfg.alpasim.wizard_args.renderer is None

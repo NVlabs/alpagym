@@ -17,7 +17,7 @@ members = [
     "alpagym-alpamayo-r1",
     "alpagym-alpasim-configs",
     "alpagym-g1-mjlab",
-    "alpagym-g1-wenhao-vla",
+    "alpagym-g1-vla",
     "alpagym-host",
     "alpagym-plugins",
     "alpagym-runtime",
@@ -135,9 +135,9 @@ requires-dist = [
 ]
 
 [[package]]
-name = "alpagym-g1-wenhao-vla"
+name = "alpagym-g1-vla"
 version = "0.1.0"
-source = { editable = "packages/policies/g1_wenhao_vla" }
+source = { editable = "packages/policies/g1_vla" }
 dependencies = [
     { name = "alpagym-runtime" },
     { name = "diffusers" },
@@ -173,7 +173,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "alpagym-plugins", editable = "packages/plugins" },
-    { name = "alpasim-grpc", git = "ssh://git@github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=9cb8fc8e10fa78c2f9854da016b52a1795b9f18a" },
+    { name = "alpasim-grpc", git = "https://github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=73a42de84ef956c2b46437431d67a41240f97e24" },
     { name = "grpcio" },
     { name = "hydra-core", specifier = ">=1.3.2" },
     { name = "pyyaml", specifier = ">=6.0.2" },
@@ -214,7 +214,7 @@ requires-dist = [
     { name = "alpagym-host", editable = "packages/host" },
     { name = "alpagym-plugins", editable = "packages/plugins" },
     { name = "alpamayo-recipes", git = "https://github.com/NVlabs/alpamayo-recipes.git?subdirectory=src&rev=4bc76779739461a028ee8bb9008bc4082a3328dd" },
-    { name = "alpasim-grpc", git = "ssh://git@github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=9cb8fc8e10fa78c2f9854da016b52a1795b9f18a" },
+    { name = "alpasim-grpc", git = "https://github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=73a42de84ef956c2b46437431d67a41240f97e24" },
     { name = "cosmos-rl", extras = ["rl", "wfm"], git = "https://github.com/nvidia-cosmos/cosmos-rl.git?rev=a367b4cc814ff153e846f386fde59919ab7247e3" },
     { name = "einops" },
     { name = "flash-attn", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" },
@@ -296,7 +296,7 @@ dependencies = [
 [[package]]
 name = "alpasim-grpc"
 version = "0.55.0"
-source = { git = "ssh://git@github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=9cb8fc8e10fa78c2f9854da016b52a1795b9f18a#9cb8fc8e10fa78c2f9854da016b52a1795b9f18a" }
+source = { git = "https://github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=73a42de84ef956c2b46437431d67a41240f97e24#73a42de84ef956c2b46437431d67a41240f97e24" }
 dependencies = [
     { name = "dataclasses-json" },
     { name = "grpcio" },

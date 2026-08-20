@@ -149,14 +149,11 @@ _RUNTIME_REQUIRED_FIELDS: Mapping[str, frozenset[str]] = {
 
 
 def ensure_alpasim_grpc_source(root: str | Path | None = None) -> None:
-    """Prepend a local AlpaSim gRPC source tree when it has humanoid protos.
+    """Optionally prepend an explicit local AlpaSim gRPC development tree.
 
-    The released ``alpasim-grpc`` package currently used by AlpaGym can lag the
-    local AlpaSim checkout during humanoid prototyping. When
-    ``ALPASIM_GRPC_ROOT`` points at generated sources
-    containing ``humanoid_pb2.py``, expose that source tree before importing
-    ``alpasim_grpc.v0.*`` modules. AV-only environments without the local source
-    tree continue to use the installed package.
+    Normal runs use the exact ``alpasim-grpc`` revision in ``uv.lock``.
+    ``ALPASIM_GRPC_ROOT`` is an opt-in override for testing uncommitted generated
+    protobuf sources; the host lifecycle never sets it automatically.
     """
     configured_root = root if root is not None else os.environ.get("ALPASIM_GRPC_ROOT")
     if configured_root is None:

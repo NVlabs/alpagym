@@ -70,7 +70,7 @@ def write_run_artifacts(config: RunConfig) -> None:
     # OmegaConf's structured Enum loader accepts member names, not arbitrary
     # wire values.  Keep the host-owned resolved artifact round-trippable even
     # when an Enum value names an external Hydra group (for example
-    # ``wenhao_d455 -> humanoid_wenhao_d455``).
+    # ``vla_d455 -> humanoid_vla_d455``).
     config_dict = cast(dict[str, Any], _to_resolved_config_data(asdict(config)))
     artifact_paths.resolved_config_path.write_text(
         yaml.safe_dump(config_dict, sort_keys=False),

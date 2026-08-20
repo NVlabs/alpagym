@@ -154,14 +154,14 @@ class HumanoidExecutionProfile(StrEnum):
 class HumanoidPolicyCameraProfile(StrEnum):
     """Atomic AlpaSim camera profiles supported by humanoid policies."""
 
-    wenhao_d455 = "wenhao_d455"
+    vla_d455 = "vla_d455"
 
     @property
     def wizard_config_group(self) -> str:
         """Return the external AlpaSim Hydra cameras config-group name."""
         match self:
-            case HumanoidPolicyCameraProfile.wenhao_d455:
-                return "humanoid_wenhao_d455"
+            case HumanoidPolicyCameraProfile.vla_d455:
+                return "humanoid_vla_d455"
 
 
 @dataclass
@@ -218,11 +218,12 @@ class CosmosRLLaunchConfig:
 
 @dataclass
 class CosmosRLTrainPolicyConfig:
-    """Cosmos-RL trainer policy scheduling and GRPO hyperparameters.
+    """Cosmos-RL trainer selection, scheduling, and objective hyperparameters.
 
     AlpaGym-facing field names describe trainer behavior directly. Generated
     Cosmos-RL configs translate these fields to the names expected by
-    Cosmos-RL's `GrpoConfig`.
+    Cosmos-RL's shared `GrpoConfig` schema.  That schema name does not imply
+    that `alpagym_ppo` or `alpagym_flow_ppo` uses a GRPO objective.
     """
 
     allowed_outdated_steps: int
@@ -505,7 +506,7 @@ class HumanoidAlpaSimConfig:
                 )
             if self.service_image == "alpasim-humanoid:local":
                 raise ValueError(
-                    "Wenhao D455 policy_camera requires a combined image with "
+                    "VLA D455 policy_camera requires a combined image with "
                     "Open3D, Embree, gsplat, and MuJoCo-Warp; "
                     "alpasim-humanoid:local is dynamics-only"
                 )

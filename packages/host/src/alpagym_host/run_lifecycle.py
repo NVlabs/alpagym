@@ -213,7 +213,6 @@ def execute_run(config: RunConfig) -> None:
             execution_backend=execution_backend,
             topology=topology,
             container_image=container_image,
-            alpasim_checkout_root=alpasim_checkout_root,
         )
         logging.info(
             "Starting Cosmos launcher: backend=%s cosmos_hosts=%s log_dir=%s",
@@ -237,20 +236,6 @@ def execute_run(config: RunConfig) -> None:
         # model auto-discovery) is interleaved in order instead of being flushed in a
         # block when the process exits.
         os.environ["PYTHONUNBUFFERED"] = "1"
-        if (
-            config.alpasim.simulation_domain == "humanoid"
-            and not execution_backend.is_slurm_run
-        ):
-            # The workspace pin can lag a local AlpaSim humanoid proto while
-            # the two worktrees are developed together.  Every local Cosmos
-            # worker must import the exact generated source used by Wizard.
-            grpc_root = (alpasim_checkout_root / "src" / "grpc").resolve()
-            if not (grpc_root / "alpasim_grpc" / "v0" / "humanoid_pb2.py").is_file():
-                raise ValueError(
-                    "humanoid AlpaSim checkout has no generated gRPC source at "
-                    f"{grpc_root}"
-                )
-            os.environ["ALPASIM_GRPC_ROOT"] = str(grpc_root)
         # Only local runs inherit this terminal; Slurm replicas write their own logs.
         tee_logs = (
             tee_role_logs(config.artifact_paths.log_dir)
@@ -339,7 +324,6 @@ def _build_cosmos_command(
     execution_backend: ExecutionBackend,
     topology: RunTopologyPlan,
     container_image: str | None,
-    alpasim_checkout_root: Path,
 ) -> list[str]:
     """Build the Cosmos launcher command for the selected execution backend."""
     if not execution_backend.is_slurm_run:
@@ -383,19 +367,6 @@ def _build_cosmos_command(
             str(config.execution.slurm.container_workdir),
         ]
     ]
-    if config.alpasim.simulation_domain == "humanoid":
-        workspace_setup_commands.append(
-            [
-                "uv",
-                "pip",
-                "install",
-                "--python",
-                "/opt/venv/bin/python",
-                "--reinstall",
-                "--no-deps",
-                str(alpasim_checkout_root / "src" / "grpc"),
-            ]
-        )
     return build_cosmos_srun_command(
         cosmos_hosts=cosmos_hosts,
         slurm=config.execution.slurm,

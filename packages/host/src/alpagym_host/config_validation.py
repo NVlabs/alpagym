@@ -45,10 +45,10 @@ def validate_run_config(
         config=config.alpasim,
         dataset=config.dataset,
     )
-    # Run the Wenhao Slurm visibility audit before the currently intentional
+    # Run the VLA Slurm visibility audit before the currently intentional
     # humanoid colocated-only rejection, so an eventual qualification cannot
     # inherit latent host/container path drift.
-    _validate_wenhao_slurm_worker_mounts(config)
+    _validate_vla_slurm_worker_mounts(config)
     _validate_humanoid_config(config)
     _validate_training_policy_config(config)
     _validate_cosmos_grpo_batch_geometry(config.cosmos)
@@ -136,29 +136,23 @@ def _validate_wizard_startup_config(
 
 def _validate_humanoid_config(config: RunConfig) -> None:
     """Fail closed on humanoid routing and version-unsafe prefetch."""
-    if config.policy.model.kind == "g1_wenhao_vla":
+    if config.policy.model.kind == "g1_vla":
         if config.policy.kind != "humanoid":
-            raise ValueError("g1_wenhao_vla requires policy.kind=humanoid")
+            raise ValueError("g1_vla requires policy.kind=humanoid")
         if config.alpasim.simulation_domain != "humanoid":
-            raise ValueError(
-                "g1_wenhao_vla requires alpasim.simulation_domain=humanoid"
-            )
+            raise ValueError("g1_vla requires alpasim.simulation_domain=humanoid")
         humanoid = config.alpasim.humanoid
         if humanoid is None:
-            raise ValueError("g1_wenhao_vla requires alpasim.humanoid")
+            raise ValueError("g1_vla requires alpasim.humanoid")
         if humanoid.execution_profile is not HumanoidExecutionProfile.motion_reference:
-            raise ValueError(
-                "g1_wenhao_vla requires execution_profile=motion_reference"
-            )
+            raise ValueError("g1_vla requires execution_profile=motion_reference")
         bundle_config = config.policy.model.bundle_config
         if bundle_config.get("humanoid_policy_factory") != (
-            "alpagym_g1_wenhao_vla.humanoid_policy:build_humanoid_policy_factory"
+            "alpagym_g1_vla.humanoid_policy:build_humanoid_policy_factory"
         ):
-            raise ValueError(
-                "g1_wenhao_vla requires its native humanoid_policy_factory"
-            )
+            raise ValueError("g1_vla requires its native humanoid_policy_factory")
         if bundle_config.get("require_policy_camera") is not True:
-            raise ValueError("g1_wenhao_vla requires require_policy_camera=true")
+            raise ValueError("g1_vla requires require_policy_camera=true")
     if config.alpasim.simulation_domain != "humanoid":
         return
     humanoid = config.alpasim.humanoid
@@ -236,16 +230,14 @@ def _validate_humanoid_config(config: RunConfig) -> None:
             raise ValueError(
                 "motion_reference n_sim_steps must equal expected_valid_steps"
             )
-        if config.policy.model.kind == "g1_wenhao_vla":
+        if config.policy.model.kind == "g1_vla":
             if (
                 humanoid.policy_camera_profile
-                is not HumanoidPolicyCameraProfile.wenhao_d455
+                is not HumanoidPolicyCameraProfile.vla_d455
             ):
-                raise ValueError(
-                    "g1_wenhao_vla requires policy_camera_profile=wenhao_d455"
-                )
-            if config.policy.model.use_cameras != ["wenhao_d455_policy_rgb"]:
-                raise ValueError("g1_wenhao_vla requires only wenhao_d455_policy_rgb")
+                raise ValueError("g1_vla requires policy_camera_profile=vla_d455")
+            if config.policy.model.use_cameras != ["vla_d455_policy_rgb"]:
+                raise ValueError("g1_vla requires only vla_d455_policy_rgb")
             train_policy = config.cosmos.train.train_policy
             required_flow_values = {
                 "grpo_ratio_clip_low": 0.2,
@@ -270,14 +262,12 @@ def _validate_humanoid_config(config: RunConfig) -> None:
                 "kl_beta": train_policy.kl_beta,
             }
             if train_policy.trainer_type != "alpagym_flow_ppo":
-                raise ValueError(
-                    "g1_wenhao_vla motion_reference requires alpagym_flow_ppo"
-                )
+                raise ValueError("g1_vla motion_reference requires alpagym_flow_ppo")
             for name, expected in required_flow_values.items():
                 if actual_flow_values[name] != expected:
-                    raise ValueError(f"g1_wenhao_vla requires {name}={expected}")
+                    raise ValueError(f"g1_vla requires {name}={expected}")
             if train_policy.ppo_normalize_advantages is not True:
-                raise ValueError("g1_wenhao_vla requires ppo_normalize_advantages=true")
+                raise ValueError("g1_vla requires ppo_normalize_advantages=true")
             required_optimizer_values = {
                 "optm_part_lrs": [5.0e-6, 1.0e-4],
                 "epsilon": 1.0e-8,
@@ -296,7 +286,7 @@ def _validate_humanoid_config(config: RunConfig) -> None:
             }
             for name, expected in required_optimizer_values.items():
                 if actual_optimizer_values[name] != expected:
-                    raise ValueError(f"g1_wenhao_vla requires {name}={expected}")
+                    raise ValueError(f"g1_vla requires {name}={expected}")
     if config.cosmos.rollout.prefetch_rollout:
         raise ValueError(
             "humanoid rollouts require prefetch_rollout=false until Cosmos passes "
@@ -364,11 +354,9 @@ def _validate_policy_model_path(config: RunConfig) -> None:
             "artifact_paths.policy_model_bundle_dir. Regenerate run artifacts from the "
             "Hydra config."
         )
-    if config.policy.model.kind == "g1_wenhao_vla":
+    if config.policy.model.kind == "g1_vla":
         if not (model_path / "run_config.json").is_file():
-            raise ValueError(
-                "g1_wenhao_vla policy.model.path must contain run_config.json"
-            )
+            raise ValueError("g1_vla policy.model.path must contain run_config.json")
         return
     if not (model_path / "config.json").is_file():
         raise ValueError(
@@ -753,12 +741,12 @@ def _require_host_path_identity_mounted(
         )
 
 
-def _validate_wenhao_slurm_worker_mounts(config: RunConfig) -> None:
-    """Require every host-authored Wenhao worker path to survive Slurm unchanged."""
+def _validate_vla_slurm_worker_mounts(config: RunConfig) -> None:
+    """Require every host-authored VLA worker path to survive Slurm unchanged."""
     humanoid = config.alpasim.humanoid
     if (
         ExecutionBackend(config.execution.backend) is not ExecutionBackend.slurm
-        or config.policy.model.kind != "g1_wenhao_vla"
+        or config.policy.model.kind != "g1_vla"
         or humanoid is None
         or humanoid.execution_profile is not HumanoidExecutionProfile.motion_reference
     ):
@@ -767,22 +755,22 @@ def _validate_wenhao_slurm_worker_mounts(config: RunConfig) -> None:
     model_path = Path(config.policy.model.path)
     if not model_path.expanduser().is_absolute():
         raise ValueError(
-            "policy.model.path must be an absolute path for Wenhao Slurm runs, "
+            "policy.model.path must be an absolute path for VLA Slurm runs, "
             f"got {model_path!s}"
         )
     model_root = _resolve_path(model_path)
     required_paths: list[tuple[str, Path]] = [
-        ("Wenhao policy_eval_root", model_root.parent.parent),
+        ("VLA policy_eval_root", model_root.parent.parent),
         ("alpasim.humanoid.repo_path", Path(humanoid.repo_path)),
         ("alpasim.humanoid.scene_store_path", Path(humanoid.scene_store_path)),
     ]
     if humanoid.grail_root_path is None:
-        raise ValueError("Wenhao motion_reference requires grail_root_path")
+        raise ValueError("VLA motion_reference requires grail_root_path")
     required_paths.append(
         ("alpasim.humanoid.grail_root_path", Path(humanoid.grail_root_path))
     )
     if humanoid.scene_cache_path is None:
-        raise ValueError("Wenhao policy camera requires scene_cache_path")
+        raise ValueError("VLA policy camera requires scene_cache_path")
     required_paths.append(
         ("alpasim.humanoid.scene_cache_path", Path(humanoid.scene_cache_path))
     )
@@ -797,7 +785,7 @@ def _validate_wenhao_slurm_worker_mounts(config: RunConfig) -> None:
         )
     else:
         raise ValueError(
-            "Wenhao Slurm runs require either alpasim.repo_path or "
+            "VLA Slurm runs require either alpasim.repo_path or "
             "alpasim.checkout_cache_dir"
         )
 

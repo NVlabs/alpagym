@@ -70,6 +70,10 @@ def test_execute_run_runs_local_process_lifecycle(
     artifact_paths.log_dir.mkdir(parents=True)
     artifact_paths.alpasim_log_dir.mkdir(parents=True)
     config: RunConfig = build_run_config(cfg, artifact_paths)
+    # The host must not replace the locked alpasim-grpc ABI with Wizard checkout
+    # sources, even when the selected runtime domain is humanoid.
+    config.alpasim.simulation_domain = "humanoid"
+    monkeypatch.delenv("ALPASIM_GRPC_ROOT", raising=False)
     commands: list[list[str]] = []
     captured_paths: dict[str, Path] = {}
 
@@ -141,6 +145,8 @@ def test_execute_run_runs_local_process_lifecycle(
 
     caplog.set_level(logging.INFO)
     execute_run(config)
+
+    assert "ALPASIM_GRPC_ROOT" not in run_lifecycle.os.environ
 
     assert (
         captured_paths["alpasim_run_dir"] == artifact_paths.alpasim_log_dir / "wizard_0"
@@ -317,7 +323,8 @@ def test_execute_run_runs_distributed_slurm_topology(
     cosmos_command = commands[1]
     assert "--nodelist=cosmos-0,cosmos-1" in cosmos_command
     assert "alpasim-0" not in " ".join(cosmos_command)
-    assert str(tmp_path / "alpasim" / "src" / "grpc") in cosmos_command[-1]
+    assert str(tmp_path / "alpasim" / "src" / "grpc") not in cosmos_command[-1]
+    assert "uv pip install" not in cosmos_command[-1]
     assert all("CUDA_VISIBLE_DEVICES" not in " ".join(command) for command in commands)
 
 
