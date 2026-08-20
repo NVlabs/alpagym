@@ -15,6 +15,7 @@ dependencies = [
   "grpcio",
   "grouped-gemm @ git+https://github.com/fanshiqing/grouped_gemm@v1.1.4",
   "nvidia-ml-py",
+  "pillow",
   "psutil",
   "torch==2.8.0",
   "torchao>=0.10.0,<0.16.0",

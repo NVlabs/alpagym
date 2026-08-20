@@ -24,7 +24,12 @@ from torch.distributed import DistStoreError, TCPStore
 from alpagym_runtime.cosmos.packer import AlpagymDataPacker
 from alpagym_runtime.replay import DataPackerConfig
 from alpagym_runtime.tensor_utils import to_device_recursive
-from alpagym_runtime.transport.nccl.payload import TENSOR_KEY_MARKER, WirePayload, pack, unpack
+from alpagym_runtime.transport.nccl.payload import (
+    TENSOR_KEY_MARKER,
+    WirePayload,
+    pack,
+    unpack,
+)
 from alpagym_runtime.transport.nccl.protocol import (
     NCCL_COMPLETION_PREFIX,
     build_metadata_key,
@@ -125,7 +130,9 @@ class NcclEpisodeWriter:
         on each message the writer frees the matching sender buffer.
         """
         if redis_client is None:
-            raise RuntimeError("NcclEpisodeWriter.start_cleanup requires an injected Redis client")
+            raise RuntimeError(
+                "NcclEpisodeWriter.start_cleanup requires an injected Redis client"
+            )
         if self._closed:
             raise RuntimeError("NcclEpisodeWriter.start_cleanup called after close")
         if self._cleanup_running():
@@ -141,8 +148,12 @@ class NcclEpisodeWriter:
             build_rollout_prefix,
         )
 
-        prefix = build_nccl_prefix(experiment_name=self._experiment_name, job_id=self._job_id)
-        channel = build_cleanup_channel(build_rollout_prefix(prefix, self._sender.rollout_idx))
+        prefix = build_nccl_prefix(
+            experiment_name=self._experiment_name, job_id=self._job_id
+        )
+        channel = build_cleanup_channel(
+            build_rollout_prefix(prefix, self._sender.rollout_idx)
+        )
         self._cleanup_stop_event.clear()
         self._cleanup_thread = threading.Thread(
             target=self._run_cleanup_listener,
@@ -172,7 +183,9 @@ class NcclEpisodeWriter:
         if thread is not None:
             thread.join(timeout=2.0)
             if thread.is_alive():
-                logger.warning("NCCL cleanup subscriber did not stop within close() timeout")
+                logger.warning(
+                    "NCCL cleanup subscriber did not stop within close() timeout"
+                )
                 return
         self._cleanup_thread = None
 
@@ -185,11 +198,14 @@ class NcclEpisodeWriter:
             logger.info("Listening for NCCL cleanup messages on %s", channel)
             while not self._cleanup_stop_event.is_set():
                 try:
-                    message = pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5)
+                    message = pubsub.get_message(
+                        ignore_subscribe_messages=True, timeout=0.5
+                    )
                 except Exception as error:
                     if not self._cleanup_stop_event.is_set():
                         logger.warning(
-                            "NCCL cleanup subscriber stopped after Redis error: %s", error
+                            "NCCL cleanup subscriber stopped after Redis error: %s",
+                            error,
                         )
                     break
                 if message is None:
@@ -200,7 +216,8 @@ class NcclEpisodeWriter:
                 pubsub.close()
             except Exception as error:
                 logger.debug(
-                    "Ignoring Redis pubsub close error during NCCL cleanup shutdown: %s", error
+                    "Ignoring Redis pubsub close error during NCCL cleanup shutdown: %s",
+                    error,
                 )
             if self._cleanup_pubsub is pubsub:
                 self._cleanup_pubsub = None
@@ -248,9 +265,13 @@ class NcclDataPackerMixin:
         **kwargs: Any,
     ) -> Any:
         """Resolve ``nccl:`` handles inline before replay collation."""
-        if isinstance(rollout_output, str) and rollout_output.startswith(NCCL_COMPLETION_PREFIX):
+        if isinstance(rollout_output, str) and rollout_output.startswith(
+            NCCL_COMPLETION_PREFIX
+        ):
             rollout_output = self._resolve_nccl_handle(rollout_output)
-        return super().get_policy_input(sample, rollout_output, n_ignore_prefix_tokens, **kwargs)
+        return super().get_policy_input(
+            sample, rollout_output, n_ignore_prefix_tokens, **kwargs
+        )
 
     def _resolve_nccl_handle(self, handle: str) -> EpisodeOutput:
         """Resolve the manifest, rendezvous + receive the tensors, and unpack the episode.
@@ -267,7 +288,9 @@ class NcclDataPackerMixin:
             raise RuntimeError(f"No metadata for transfer {handle}")
         metadata_raw = self._store.get(metadata_key)
         metadata_str = (
-            metadata_raw.decode("utf-8") if isinstance(metadata_raw, bytes) else metadata_raw
+            metadata_raw.decode("utf-8")
+            if isinstance(metadata_raw, bytes)
+            else metadata_raw
         )
         try:
             manifest = json.loads(metadata_str)["manifest"]
@@ -284,13 +307,16 @@ class NcclDataPackerMixin:
         # Triggers the rendezvous handshake and the matching nccl_send; blocks
         # until every tensor arrives or the receiver's watchdog fires.
         try:
-            tensors = self._receiver.recv(transfer_id=transfer_id, tensor_specs=tensor_specs)
+            tensors = self._receiver.recv(
+                transfer_id=transfer_id, tensor_specs=tensor_specs
+            )
         except Exception:
             self._store.delete_key(metadata_key)
             raise
         self._store.delete_key(metadata_key)
         tensors_on_device = {
-            key: to_device_recursive(tensor, self._target_device) for key, tensor in tensors.items()
+            key: to_device_recursive(tensor, self._target_device)
+            for key, tensor in tensors.items()
         }
         return unpack(WirePayload(tensors=tensors_on_device, manifest=manifest))
 
@@ -305,9 +331,14 @@ class NcclAlpagymDataPacker(NcclDataPackerMixin, AlpagymDataPacker):
         store: TCPStore,
         receiver: NcclReceiver,
         target_device: torch.device,
+        collate_samples: Any = None,
     ) -> None:
         """Wire the trainer packer to its NCCL receiver and TCPStore connection."""
-        super().__init__(config, build_model_inputs)
+        super().__init__(
+            config,
+            build_model_inputs,
+            collate_samples=collate_samples,
+        )
         self._store = store
         self._receiver = receiver
         self._target_device = target_device
@@ -354,7 +385,9 @@ def _parse_tensor_shape(shape: Any) -> tuple[int, ...]:
 def _parse_tensor_dtype(dtype: Any) -> str:
     """Validate a manifest tensor dtype before it reaches the recv daemon."""
     if not isinstance(dtype, str) or not dtype.startswith("torch."):
-        raise ValueError(f"NCCL tensor metadata dtype must be a torch dtype, got {dtype!r}")
+        raise ValueError(
+            f"NCCL tensor metadata dtype must be a torch dtype, got {dtype!r}"
+        )
     dtype_name = dtype.removeprefix("torch.")
     torch_dtype = getattr(torch, dtype_name, None)
     if not isinstance(torch_dtype, torch.dtype):

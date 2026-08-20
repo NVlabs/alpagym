@@ -16,6 +16,7 @@ from alpagym_host.config import (
     DatasetConfig,
     ExecutionBackend,
     HumanoidExecutionProfile,
+    HumanoidPolicyCameraProfile,
     RunConfig,
     SeparateNodesSlurmTopologyConfig,
     SlurmConfig,
@@ -23,7 +24,6 @@ from alpagym_host.config import (
     TransportKind,
 )
 from alpagym_host.run_artifacts import is_supported_hf_bundle_dir
-from alpagym_host.humanoid_scene_identity import validate_frozen_policy_model_bundle
 from alpagym_host.run_topology import build_slurm_topology
 from alpagym_host.slurm import validate_slurm_config
 
@@ -45,8 +45,11 @@ def validate_run_config(
         config=config.alpasim,
         dataset=config.dataset,
     )
+    # Run the Wenhao Slurm visibility audit before the currently intentional
+    # humanoid colocated-only rejection, so an eventual qualification cannot
+    # inherit latent host/container path drift.
+    _validate_wenhao_slurm_worker_mounts(config)
     _validate_humanoid_config(config)
-    validate_frozen_policy_model_bundle(config)
     _validate_training_policy_config(config)
     _validate_cosmos_grpo_batch_geometry(config.cosmos)
     _validate_transport_config(config)
@@ -133,6 +136,29 @@ def _validate_wizard_startup_config(
 
 def _validate_humanoid_config(config: RunConfig) -> None:
     """Fail closed on humanoid routing and version-unsafe prefetch."""
+    if config.policy.model.kind == "g1_wenhao_vla":
+        if config.policy.kind != "humanoid":
+            raise ValueError("g1_wenhao_vla requires policy.kind=humanoid")
+        if config.alpasim.simulation_domain != "humanoid":
+            raise ValueError(
+                "g1_wenhao_vla requires alpasim.simulation_domain=humanoid"
+            )
+        humanoid = config.alpasim.humanoid
+        if humanoid is None:
+            raise ValueError("g1_wenhao_vla requires alpasim.humanoid")
+        if humanoid.execution_profile is not HumanoidExecutionProfile.motion_reference:
+            raise ValueError(
+                "g1_wenhao_vla requires execution_profile=motion_reference"
+            )
+        bundle_config = config.policy.model.bundle_config
+        if bundle_config.get("humanoid_policy_factory") != (
+            "alpagym_g1_wenhao_vla.humanoid_policy:build_humanoid_policy_factory"
+        ):
+            raise ValueError(
+                "g1_wenhao_vla requires its native humanoid_policy_factory"
+            )
+        if bundle_config.get("require_policy_camera") is not True:
+            raise ValueError("g1_wenhao_vla requires require_policy_camera=true")
     if config.alpasim.simulation_domain != "humanoid":
         return
     humanoid = config.alpasim.humanoid
@@ -190,30 +216,14 @@ def _validate_humanoid_config(config: RunConfig) -> None:
                     f"motion_reference policy bundle {key} must come from "
                     "alpasim.humanoid"
                 )
-        planner_mode = str(
-            config.policy.model.bundle_config.get("planner_mode", "shadow_rollout")
-        )
-        if planner_mode != "shadow_rollout":
+        if humanoid.reference_frame_count != 50:
             raise ValueError(
-                "VideoMimic fake plans require planner_mode='shadow_rollout' so "
-                "all H70 actions come from the current policy"
-            )
-        if any(
-            key in config.policy.model.bundle_config
-            for key in ("completion_policy_path", "completion_policy_sha256")
-        ):
-            raise ValueError(
-                "VideoMimic fake plans must not configure a frozen completion policy"
-            )
-        if humanoid.reference_frame_count != 70:
-            raise ValueError(
-                f"planner_mode={planner_mode!r} requires motion-reference H=70"
+                "motion_reference requires the one-second H50 wire contract"
             )
         outer_period_us = int(config.alpasim.wizard_args.control_timestep_us)
         if outer_period_us != 500_000:
             raise ValueError(
-                "motion_reference outer policy period is unsupported for "
-                f"planner_mode={planner_mode!r}; expected 500000us"
+                "motion_reference requires the native 500000us replan trigger"
             )
         if config.policy.model.step_dt_us != outer_period_us:
             raise ValueError(
@@ -226,6 +236,67 @@ def _validate_humanoid_config(config: RunConfig) -> None:
             raise ValueError(
                 "motion_reference n_sim_steps must equal expected_valid_steps"
             )
+        if config.policy.model.kind == "g1_wenhao_vla":
+            if (
+                humanoid.policy_camera_profile
+                is not HumanoidPolicyCameraProfile.wenhao_d455
+            ):
+                raise ValueError(
+                    "g1_wenhao_vla requires policy_camera_profile=wenhao_d455"
+                )
+            if config.policy.model.use_cameras != ["wenhao_d455_policy_rgb"]:
+                raise ValueError("g1_wenhao_vla requires only wenhao_d455_policy_rgb")
+            train_policy = config.cosmos.train.train_policy
+            required_flow_values = {
+                "grpo_ratio_clip_low": 0.2,
+                "grpo_ratio_clip_high": 0.28,
+                "ppo_value_loss_coef": 1.0,
+                "ppo_value_clip_range": 0.2,
+                "ppo_gamma": 0.99,
+                "ppo_gae_lambda": 0.95,
+                "ppo_dual_clip_ratio": 3.0,
+                "ppo_value_huber_delta": 10.0,
+                "kl_beta": 0.0,
+            }
+            actual_flow_values = {
+                "grpo_ratio_clip_low": train_policy.grpo_ratio_clip_low,
+                "grpo_ratio_clip_high": train_policy.grpo_ratio_clip_high,
+                "ppo_value_loss_coef": train_policy.ppo_value_loss_coef,
+                "ppo_value_clip_range": train_policy.ppo_value_clip_range,
+                "ppo_gamma": train_policy.ppo_gamma,
+                "ppo_gae_lambda": train_policy.ppo_gae_lambda,
+                "ppo_dual_clip_ratio": train_policy.ppo_dual_clip_ratio,
+                "ppo_value_huber_delta": train_policy.ppo_value_huber_delta,
+                "kl_beta": train_policy.kl_beta,
+            }
+            if train_policy.trainer_type != "alpagym_flow_ppo":
+                raise ValueError(
+                    "g1_wenhao_vla motion_reference requires alpagym_flow_ppo"
+                )
+            for name, expected in required_flow_values.items():
+                if actual_flow_values[name] != expected:
+                    raise ValueError(f"g1_wenhao_vla requires {name}={expected}")
+            if train_policy.ppo_normalize_advantages is not True:
+                raise ValueError("g1_wenhao_vla requires ppo_normalize_advantages=true")
+            required_optimizer_values = {
+                "optm_part_lrs": [5.0e-6, 1.0e-4],
+                "epsilon": 1.0e-8,
+                "optm_weight_decay": 0.01,
+                "optm_betas": [0.9, 0.999],
+                "optm_grad_norm_clip": 1.0,
+                "optm_warmup_steps": 0,
+            }
+            actual_optimizer_values = {
+                "optm_part_lrs": config.cosmos.train.optm_part_lrs,
+                "epsilon": config.cosmos.train.epsilon,
+                "optm_weight_decay": config.cosmos.train.optm_weight_decay,
+                "optm_betas": config.cosmos.train.optm_betas,
+                "optm_grad_norm_clip": config.cosmos.train.optm_grad_norm_clip,
+                "optm_warmup_steps": config.cosmos.train.optm_warmup_steps,
+            }
+            for name, expected in required_optimizer_values.items():
+                if actual_optimizer_values[name] != expected:
+                    raise ValueError(f"g1_wenhao_vla requires {name}={expected}")
     if config.cosmos.rollout.prefetch_rollout:
         raise ValueError(
             "humanoid rollouts require prefetch_rollout=false until Cosmos passes "
@@ -293,6 +364,12 @@ def _validate_policy_model_path(config: RunConfig) -> None:
             "artifact_paths.policy_model_bundle_dir. Regenerate run artifacts from the "
             "Hydra config."
         )
+    if config.policy.model.kind == "g1_wenhao_vla":
+        if not (model_path / "run_config.json").is_file():
+            raise ValueError(
+                "g1_wenhao_vla policy.model.path must contain run_config.json"
+            )
+        return
     if not (model_path / "config.json").is_file():
         raise ValueError(
             f"policy.model.path is a directory without config.json: {model_path}. "
@@ -414,7 +491,48 @@ def _validate_training_policy_config(config: RunConfig) -> None:
             "Cosmos replay training. It can be false only for a rollout-only "
             "entrypoint."
         )
+    if (
+        isinstance(config.cosmos.train.optm_lr, bool)
+        or not math.isfinite(config.cosmos.train.optm_lr)
+        or config.cosmos.train.optm_lr <= 0.0
+    ):
+        raise ValueError("cosmos.train.optm_lr must be finite and positive")
+    if any(
+        isinstance(value, bool) or not math.isfinite(value) or value <= 0.0
+        for value in config.cosmos.train.optm_part_lrs
+    ):
+        raise ValueError(
+            "cosmos.train.optm_part_lrs must contain positive finite values"
+        )
+    if (
+        not math.isfinite(config.cosmos.train.epsilon)
+        or config.cosmos.train.epsilon <= 0.0
+    ):
+        raise ValueError("cosmos.train.epsilon must be finite and positive")
+    if (
+        not math.isfinite(config.cosmos.train.optm_weight_decay)
+        or config.cosmos.train.optm_weight_decay < 0.0
+    ):
+        raise ValueError(
+            "cosmos.train.optm_weight_decay must be finite and non-negative"
+        )
+    betas = config.cosmos.train.optm_betas
+    if len(betas) != 2 or any(
+        not math.isfinite(value) or not 0.0 <= value < 1.0 for value in betas
+    ):
+        raise ValueError("cosmos.train.optm_betas must contain two values in [0, 1)")
+    if not math.isfinite(config.cosmos.train.optm_grad_norm_clip):
+        raise ValueError("cosmos.train.optm_grad_norm_clip must be finite")
     train_policy = config.cosmos.train.train_policy
+    if train_policy.trainer_type not in {
+        "alpagym_grpo",
+        "alpagym_ppo",
+        "alpagym_flow_ppo",
+    }:
+        raise ValueError(
+            "cosmos.train.train_policy.trainer_type must be alpagym_grpo, "
+            "alpagym_ppo, or alpagym_flow_ppo"
+        )
     if train_policy.step_mini_batch is not None and (
         isinstance(train_policy.step_mini_batch, bool)
         or train_policy.step_mini_batch <= 0
@@ -431,6 +549,20 @@ def _validate_training_policy_config(config: RunConfig) -> None:
     ):
         raise ValueError(
             "PPO ppo_value_clip_range must be finite and positive when set"
+        )
+    if train_policy.ppo_dual_clip_ratio is not None and (
+        not math.isfinite(train_policy.ppo_dual_clip_ratio)
+        or train_policy.ppo_dual_clip_ratio <= 1.0
+    ):
+        raise ValueError(
+            "PPO ppo_dual_clip_ratio must be finite and greater than one when set"
+        )
+    if train_policy.ppo_value_huber_delta is not None and (
+        not math.isfinite(train_policy.ppo_value_huber_delta)
+        or train_policy.ppo_value_huber_delta <= 0.0
+    ):
+        raise ValueError(
+            "PPO ppo_value_huber_delta must be finite and positive when set"
         )
     if not 0.0 <= train_policy.ppo_gamma <= 1.0:
         raise ValueError("PPO ppo_gamma must be in [0, 1]")
@@ -618,6 +750,66 @@ def _require_host_path_identity_mounted(
             "AlpaGym passes absolute host paths to cosmos workers, so the container "
             "mount destination must match the host source path. "
             f"Non-identity covering mounts: {covering_non_identity_mounts}"
+        )
+
+
+def _validate_wenhao_slurm_worker_mounts(config: RunConfig) -> None:
+    """Require every host-authored Wenhao worker path to survive Slurm unchanged."""
+    humanoid = config.alpasim.humanoid
+    if (
+        ExecutionBackend(config.execution.backend) is not ExecutionBackend.slurm
+        or config.policy.model.kind != "g1_wenhao_vla"
+        or humanoid is None
+        or humanoid.execution_profile is not HumanoidExecutionProfile.motion_reference
+    ):
+        return
+
+    model_path = Path(config.policy.model.path)
+    if not model_path.expanduser().is_absolute():
+        raise ValueError(
+            "policy.model.path must be an absolute path for Wenhao Slurm runs, "
+            f"got {model_path!s}"
+        )
+    model_root = _resolve_path(model_path)
+    required_paths: list[tuple[str, Path]] = [
+        ("Wenhao policy_eval_root", model_root.parent.parent),
+        ("alpasim.humanoid.repo_path", Path(humanoid.repo_path)),
+        ("alpasim.humanoid.scene_store_path", Path(humanoid.scene_store_path)),
+    ]
+    if humanoid.grail_root_path is None:
+        raise ValueError("Wenhao motion_reference requires grail_root_path")
+    required_paths.append(
+        ("alpasim.humanoid.grail_root_path", Path(humanoid.grail_root_path))
+    )
+    if humanoid.scene_cache_path is None:
+        raise ValueError("Wenhao policy camera requires scene_cache_path")
+    required_paths.append(
+        ("alpasim.humanoid.scene_cache_path", Path(humanoid.scene_cache_path))
+    )
+    if config.alpasim.repo_path is not None:
+        required_paths.append(("alpasim.repo_path", Path(config.alpasim.repo_path)))
+    elif config.alpasim.checkout_cache_dir is not None:
+        required_paths.append(
+            (
+                "alpasim.checkout_cache_dir",
+                Path(config.alpasim.checkout_cache_dir),
+            )
+        )
+    else:
+        raise ValueError(
+            "Wenhao Slurm runs require either alpasim.repo_path or "
+            "alpasim.checkout_cache_dir"
+        )
+
+    for label, path in required_paths:
+        if not path.expanduser().is_absolute():
+            raise ValueError(
+                f"{label} must be an absolute path for Slurm, got {path!s}"
+            )
+        _require_host_path_identity_mounted(
+            config=config,
+            path=path,
+            label=label,
         )
 
 

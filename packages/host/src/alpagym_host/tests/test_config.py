@@ -1,17 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import hashlib
 import json
+import re
 import tarfile
 import tomllib
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import alpagym_host.cli as host_cli
 import pytest
-import torch
 import yaml
 from alpagym_host.cli import load_or_create_run_config
 from alpagym_host.config import (
@@ -21,13 +21,18 @@ from alpagym_host.config import (
     ExecutionBackend,
     HumanoidAlpaSimConfig,
     HumanoidExecutionProfile,
+    HumanoidPolicyCameraProfile,
     RunConfig,
     SeparateNodesSlurmTopologyConfig,
     TransportKind,
     load_run_config,
     register_config_schema,
 )
-from alpagym_host.config_validation import validate_run_config
+from alpagym_host.config_validation import (
+    _validate_humanoid_config,
+    _validate_wenhao_slurm_worker_mounts,
+    validate_run_config,
+)
 from alpagym_host.humanoid_scene_identity import freeze_humanoid_scene_fingerprints
 from alpagym_host.run_artifacts import (
     build_artifact_paths,
@@ -35,7 +40,6 @@ from alpagym_host.run_artifacts import (
     write_run_artifacts,
 )
 from hydra import compose, initialize_config_module
-from safetensors.torch import save_file
 
 
 def test_host_writes_and_loads_handoff_artifacts(
@@ -171,6 +175,67 @@ def test_host_writes_alpagym_ppo_trainer_config(
         "normalize_advantages": False,
         "gamma": 0.97,
         "gae_lambda": 0.9,
+        "min_action_std": 0.02,
+        "max_action_std": 2.0,
+    }
+
+
+def test_host_writes_wenhao_flow_ppo_config(tmp_path: Path) -> None:
+    """Host serializes the exact Flow-PPO optimizer and loss configuration."""
+    register_config_schema()
+    with initialize_config_module(version_base=None, config_module="alpagym_host.conf"):
+        cfg = compose(
+            config_name="default",
+            overrides=[
+                f"run_root={tmp_path.as_posix()}",
+                "deploy=local",
+                "topology=local_colocated_1gpu",
+                "policy.model.kind=alpamayo_r1",
+                f"policy.model.path={(tmp_path / 'model_bundle').as_posix()}",
+                "cosmos.train.optm_part_lrs=[5e-6,1e-4]",
+                "cosmos.train.epsilon=1e-8",
+                "cosmos.train.optm_weight_decay=0.01",
+                "cosmos.train.optm_betas=[0.9,0.999]",
+                "cosmos.train.optm_grad_norm_clip=1.0",
+                "cosmos.train.optm_warmup_steps=0",
+                "cosmos.train.train_policy.trainer_type=alpagym_flow_ppo",
+                "cosmos.train.train_policy.grpo_ratio_clip_low=0.2",
+                "cosmos.train.train_policy.grpo_ratio_clip_high=0.28",
+                "cosmos.train.train_policy.ppo_value_loss_coef=1.0",
+                "cosmos.train.train_policy.ppo_value_clip_range=0.2",
+                "cosmos.train.train_policy.ppo_dual_clip_ratio=3.0",
+                "cosmos.train.train_policy.ppo_value_huber_delta=10.0",
+                "cosmos.train.train_policy.ppo_normalize_advantages=true",
+                "cosmos.train.train_policy.ppo_gamma=0.99",
+                "cosmos.train.train_policy.ppo_gae_lambda=0.95",
+                "cosmos.train.train_policy.kl_beta=0.0",
+            ],
+        )
+
+    artifact_paths = build_artifact_paths(cfg)
+    write_run_artifacts(build_run_config(cfg, artifact_paths))
+    cosmos_config = tomllib.loads(artifact_paths.cosmos_config_path.read_text())
+
+    train_policy = cosmos_config["train"]["train_policy"]
+    assert train_policy["trainer_type"] == "alpagym_flow_ppo"
+    assert train_policy["epsilon_low"] == 0.2
+    assert train_policy["epsilon_high"] == 0.28
+    assert train_policy["kl_beta"] == 0.0
+    train = cosmos_config["train"]
+    assert train["optm_lr"] == [5.0e-6, 1.0e-4]
+    assert train["epsilon"] == 1.0e-8
+    assert train["optm_weight_decay"] == 0.01
+    assert train["optm_betas"] == [0.9, 0.999]
+    assert train["optm_grad_norm_clip"] == 1.0
+    assert train["optm_warmup_steps"] == 0
+    assert cosmos_config["custom"]["ppo"] == {
+        "value_loss_coef": 1.0,
+        "value_clip_range": 0.2,
+        "dual_clip_ratio": 3.0,
+        "value_huber_delta": 10.0,
+        "normalize_advantages": True,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
         "min_action_std": 0.02,
         "max_action_std": 2.0,
     }
@@ -664,6 +729,150 @@ def test_humanoid_config_rejects_vector_env_until_lane_local_gae_exists() -> Non
         )
 
 
+def test_humanoid_policy_camera_requires_typed_writable_cache() -> None:
+    with pytest.raises(ValueError, match="scene_cache_path is required"):
+        HumanoidAlpaSimConfig(
+            repo_path="/tmp/alpasim-humanoid",
+            scene_store_path="/tmp/humanoid-scenes",
+            scenario_ids_by_scene={"stairs": "ascend"},
+            execution_profile=HumanoidExecutionProfile.motion_reference,
+            grail_root_path="/tmp/GRAIL",
+            policy_camera_profile=HumanoidPolicyCameraProfile.wenhao_d455,
+            service_image="alpasim-humanoid-nurec:local",
+            reward_profile_id="reference_route_centered.v3",
+        )
+
+
+def test_humanoid_policy_camera_profile_round_trips_resolved_config(
+    tmp_path: Path,
+) -> None:
+    """External Hydra-group values must not leak into the typed YAML enum field."""
+    run_config = _make_run_config(tmp_path)
+    humanoid = HumanoidAlpaSimConfig(
+        repo_path="/tmp/alpasim-humanoid",
+        scene_store_path="/tmp/humanoid-scenes",
+        scene_cache_path="/tmp/humanoid-cache",
+        scenario_ids_by_scene={"stairs": "ascend"},
+        execution_profile=HumanoidExecutionProfile.motion_reference,
+        grail_root_path="/tmp/GRAIL",
+        policy_camera_profile=HumanoidPolicyCameraProfile.wenhao_d455,
+        service_image="alpasim-humanoid-nurec:local",
+        reward_profile_id="reference_route_centered.v3",
+    )
+    run_config = replace(
+        run_config,
+        alpasim=replace(
+            run_config.alpasim,
+            simulation_domain="humanoid",
+            humanoid=humanoid,
+        ),
+    )
+
+    write_run_artifacts(run_config)
+
+    raw_config = yaml.safe_load(
+        run_config.artifact_paths.resolved_config_path.read_text(encoding="utf-8")
+    )
+    loaded_config = load_run_config(run_config.artifact_paths.resolved_config_path)
+    assert raw_config["alpasim"]["humanoid"]["policy_camera_profile"] == "wenhao_d455"
+    assert HumanoidPolicyCameraProfile.wenhao_d455.value == "wenhao_d455"
+    assert (
+        HumanoidPolicyCameraProfile.wenhao_d455.wizard_config_group
+        == "humanoid_wenhao_d455"
+    )
+    assert loaded_config.alpasim.humanoid is not None
+    assert (
+        loaded_config.alpasim.humanoid.policy_camera_profile
+        is HumanoidPolicyCameraProfile.wenhao_d455
+    )
+
+
+def test_humanoid_motion_reference_without_camera_remains_supported() -> None:
+    config = HumanoidAlpaSimConfig(
+        repo_path="/tmp/alpasim-humanoid",
+        scene_store_path="/tmp/humanoid-scenes",
+        scenario_ids_by_scene={"stairs": "ascend"},
+        execution_profile=HumanoidExecutionProfile.motion_reference,
+        grail_root_path="/tmp/GRAIL",
+        reward_profile_id="reference_route_centered.v3",
+    )
+
+    assert config.policy_camera_profile is None
+    assert config.scene_cache_path is None
+
+
+def test_wenhao_policy_rejects_av_runtime_route() -> None:
+    """The VLA must fail before an AV runtime can dispatch the wrong factory."""
+    config = _make_valid_wenhao_validation_config()
+    config.alpasim.simulation_domain = "av"
+
+    with pytest.raises(ValueError, match="simulation_domain=humanoid"):
+        _validate_humanoid_config(config)
+
+
+def test_wenhao_policy_rejects_av_policy_dispatch() -> None:
+    """The VLA model cannot enter the AV policy factory through an override."""
+    config = _make_valid_wenhao_validation_config()
+    config.policy.kind = "alpamayo"
+
+    with pytest.raises(ValueError, match="policy.kind=humanoid"):
+        _validate_humanoid_config(config)
+
+
+def test_wenhao_policy_rejects_direct_action_runtime_route() -> None:
+    """The one-second VLA output cannot enter the direct-action execution ABI."""
+    config = _make_valid_wenhao_validation_config()
+    assert config.alpasim.humanoid is not None
+    config.alpasim.humanoid.execution_profile = HumanoidExecutionProfile.direct_action
+
+    with pytest.raises(ValueError, match="execution_profile=motion_reference"):
+        _validate_humanoid_config(config)
+
+
+@pytest.mark.parametrize("factory_spec", [None, "zero"])
+def test_wenhao_policy_requires_native_runtime_factory(
+    factory_spec: str | None,
+) -> None:
+    """Missing or smoke-test factories cannot silently replace the VLA."""
+    config = _make_valid_wenhao_validation_config()
+    if factory_spec is None:
+        config.policy.model.bundle_config.pop("humanoid_policy_factory")
+    else:
+        config.policy.model.bundle_config["humanoid_policy_factory"] = factory_spec
+
+    with pytest.raises(ValueError, match="native humanoid_policy_factory"):
+        _validate_humanoid_config(config)
+
+
+@pytest.mark.parametrize("camera_requirement", [None, False])
+def test_wenhao_policy_requires_strict_camera_runtime(
+    camera_requirement: bool | None,
+) -> None:
+    """A visual VLA cannot run after its strict D455 camera ABI is disabled."""
+    config = _make_valid_wenhao_validation_config()
+    if camera_requirement is None:
+        config.policy.model.bundle_config.pop("require_policy_camera")
+    else:
+        config.policy.model.bundle_config["require_policy_camera"] = camera_requirement
+
+    with pytest.raises(ValueError, match="require_policy_camera=true"):
+        _validate_humanoid_config(config)
+
+
+def test_humanoid_policy_camera_rejects_dynamics_only_image() -> None:
+    with pytest.raises(ValueError, match="combined image"):
+        HumanoidAlpaSimConfig(
+            repo_path="/tmp/alpasim-humanoid",
+            scene_store_path="/tmp/humanoid-scenes",
+            scene_cache_path="/tmp/humanoid-cache",
+            scenario_ids_by_scene={"stairs": "ascend"},
+            execution_profile=HumanoidExecutionProfile.motion_reference,
+            grail_root_path="/tmp/GRAIL",
+            policy_camera_profile=HumanoidPolicyCameraProfile.wenhao_d455,
+            reward_profile_id="reference_route_centered.v3",
+        )
+
+
 @pytest.mark.parametrize("rollout_seed_base", [-1, 1 << 64, True, 1.5])
 def test_humanoid_config_rejects_non_uint64_rollout_seed_base(
     rollout_seed_base: object,
@@ -736,7 +945,7 @@ def test_humanoid_config_rejects_reward_profiles_outside_execution_abi(
 def test_motion_reference_freeze_injects_single_source_paths_and_fingerprint(
     tmp_path: Path,
 ) -> None:
-    model_path = _write_h70_planner_bundle_dir(tmp_path)
+    model_path = _write_hf_bundle_dir(tmp_path)
     scene_store = tmp_path / "scene_store"
     scene_root = scene_store / "scenes" / "stairs"
     scene_root.mkdir(parents=True)
@@ -772,9 +981,8 @@ def test_motion_reference_freeze_injects_single_source_paths_and_fingerprint(
             run_config.policy,
             model=replace(
                 run_config.policy.model,
-                kind="g1_videomimic_planner",
+                kind="g1_mjlab",
                 path=str(model_path),
-                bundle_config={"planner_mode": "shadow_rollout"},
                 step_dt_us=500_000,
             ),
         ),
@@ -792,96 +1000,6 @@ def test_motion_reference_freeze_injects_single_source_paths_and_fingerprint(
     )
     assert frozen.policy.model.bundle_config["expected_scene_fingerprints_json"] == (
         '{"stairs":"' + digest + '"}'
-    )
-
-
-@pytest.mark.parametrize(
-    ("reward_profile_override", "expected_reward_profile_id"),
-    [
-        (None, "reference_route_centered.v3"),
-        (
-            "alpasim.humanoid.reward_profile_id=reference_route_centered.v2",
-            "reference_route_centered.v2",
-        ),
-        (
-            "alpasim.humanoid.reward_profile_id=reference_route_centered.v3",
-            "reference_route_centered.v3",
-        ),
-    ],
-)
-def test_motion_reference_experiment_resolves_seed_panel_and_horizon(
-    tmp_path: Path,
-    reward_profile_override: str | None,
-    expected_reward_profile_id: str,
-) -> None:
-    """The preset resolves its horizon, panel seed, and opt-in reward profile."""
-    model_path = _write_h70_planner_bundle_dir(tmp_path)
-    scene_root = tmp_path / "scene_store" / "scenes" / "hq_stairs"
-    scene_root.mkdir(parents=True)
-    (scene_root / "manifest.json").write_text(
-        json.dumps(
-            {
-                "scene_id": "hq_stairs",
-                "identity": {"scene_content_sha256": "a" * 64},
-            }
-        ),
-        encoding="utf-8",
-    )
-    register_config_schema()
-    with initialize_config_module(version_base=None, config_module="alpagym_host.conf"):
-        cfg = compose(
-            config_name="default",
-            overrides=[
-                "experiment=g1_videomimic_planner_hq_stairs_current_policy",
-                f"run_root={tmp_path.as_posix()}",
-                f"policy.model.path={model_path.as_posix()}",
-                f"alpasim.repo_path={(tmp_path / 'alpasim').as_posix()}",
-                "alpasim.repo_url=null",
-                "alpasim.repo_ref=null",
-                f"alpasim.humanoid.repo_path={(tmp_path / 'humanoid').as_posix()}",
-                "alpasim.humanoid.scene_store_path="
-                f"{(tmp_path / 'scene_store').as_posix()}",
-                f"alpasim.humanoid.grail_root_path={(tmp_path / 'GRAIL').as_posix()}",
-                "alpasim.humanoid.rollout_seed_base=9000",
-                *([reward_profile_override] if reward_profile_override else []),
-            ],
-        )
-    run_config = freeze_humanoid_scene_fingerprints(
-        build_run_config(cfg, build_artifact_paths(cfg))
-    )
-
-    validate_run_config(run_config, "run")
-    write_run_artifacts(run_config)
-    resolved_config = yaml.safe_load(
-        run_config.artifact_paths.resolved_config_path.read_text(encoding="utf-8")
-    )
-
-    assert (
-        run_config.alpasim.wizard_args.n_sim_steps
-        == run_config.expected_valid_steps
-        == 60
-    )
-    assert run_config.alpasim.wizard_args.control_timestep_us == 500_000
-    assert run_config.cosmos.train.optm_lr == pytest.approx(1.0e-6)
-    assert run_config.cosmos.train.train_policy.step_mini_batch == 60
-    assert run_config.cosmos.train.train_policy.grpo_optimization_iterations == 1
-    assert run_config.cosmos.train.train_policy.kl_beta == pytest.approx(0.1)
-    assert run_config.cosmos.train.train_policy.reference_reset_interval == 0
-    assert run_config.cosmos.train.train_policy.ppo_gamma == pytest.approx(0.99)
-    assert run_config.cosmos.train.train_policy.ppo_gae_lambda == pytest.approx(0.95)
-    assert run_config.cosmos.train.train_policy.ppo_min_action_std == pytest.approx(
-        0.05
-    )
-    assert run_config.cosmos.train.train_policy.ppo_max_action_std == pytest.approx(
-        0.15
-    )
-    assert run_config.alpasim.humanoid is not None
-    assert run_config.alpasim.humanoid.rollout_seed_base == 9000
-    assert resolved_config["alpasim"]["humanoid"]["rollout_seed_base"] == 9000
-    assert run_config.alpasim.humanoid.reward_profile_id == expected_reward_profile_id
-    assert (
-        resolved_config["alpasim"]["humanoid"]["reward_profile_id"]
-        == expected_reward_profile_id
     )
 
 
@@ -1007,6 +1125,162 @@ def test_cosmos_config_accepts_grpo_batch_geometry(tmp_path: Path) -> None:
     validate_run_config(run_config, "run")
 
     assert run_config.cosmos.train.train_batch_per_replica == 8
+
+
+@pytest.mark.parametrize(
+    "missing_label",
+    [
+        "Wenhao policy_eval_root",
+        "alpasim.humanoid.repo_path",
+        "alpasim.humanoid.scene_store_path",
+        "alpasim.humanoid.grail_root_path",
+        "alpasim.humanoid.scene_cache_path",
+        "alpasim.repo_path",
+    ],
+)
+def test_wenhao_slurm_requires_every_worker_path_identity_mounted(
+    tmp_path: Path,
+    missing_label: str,
+) -> None:
+    """A model-leaf mount cannot hide missing Wenhao source/service mounts."""
+    policy_eval_root = tmp_path / "policy_eval"
+    model_root = policy_eval_root / "models" / "wenhao-model"
+    required_paths = {
+        "Wenhao policy_eval_root": policy_eval_root,
+        "alpasim.humanoid.repo_path": tmp_path / "humanoid_repo",
+        "alpasim.humanoid.scene_store_path": tmp_path / "scene_store",
+        "alpasim.humanoid.grail_root_path": tmp_path / "grail",
+        "alpasim.humanoid.scene_cache_path": tmp_path / "scene_cache",
+        "alpasim.repo_path": tmp_path / "alpasim_repo",
+    }
+    mounts = [f"{model_root}:{model_root}"]
+    mounts.extend(
+        f"{path}:{path}"
+        for label, path in required_paths.items()
+        if label != missing_label
+    )
+    config = SimpleNamespace(
+        execution=SimpleNamespace(
+            backend=ExecutionBackend.slurm,
+            slurm=SimpleNamespace(container_mounts=mounts),
+        ),
+        policy=SimpleNamespace(
+            model=SimpleNamespace(kind="g1_wenhao_vla", path=str(model_root))
+        ),
+        alpasim=SimpleNamespace(
+            repo_path=str(required_paths["alpasim.repo_path"]),
+            checkout_cache_dir=None,
+            humanoid=SimpleNamespace(
+                execution_profile=HumanoidExecutionProfile.motion_reference,
+                repo_path=str(required_paths["alpasim.humanoid.repo_path"]),
+                scene_store_path=str(
+                    required_paths["alpasim.humanoid.scene_store_path"]
+                ),
+                grail_root_path=str(required_paths["alpasim.humanoid.grail_root_path"]),
+                scene_cache_path=str(
+                    required_paths["alpasim.humanoid.scene_cache_path"]
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match=re.escape(missing_label)):
+        _validate_wenhao_slurm_worker_mounts(cast(RunConfig, config))
+
+
+def test_wenhao_slurm_accepts_all_worker_mounts_and_local_needs_none(
+    tmp_path: Path,
+) -> None:
+    """Complete Slurm visibility passes while local execution remains unchanged."""
+    policy_eval_root = tmp_path / "policy_eval"
+    model_root = policy_eval_root / "models" / "wenhao-model"
+    worker_paths = [
+        policy_eval_root,
+        tmp_path / "humanoid_repo",
+        tmp_path / "scene_store",
+        tmp_path / "grail",
+        tmp_path / "scene_cache",
+        tmp_path / "alpasim_checkout_cache",
+    ]
+    config = SimpleNamespace(
+        execution=SimpleNamespace(
+            backend=ExecutionBackend.slurm,
+            slurm=SimpleNamespace(
+                container_mounts=[f"{path}:{path}" for path in worker_paths]
+            ),
+        ),
+        policy=SimpleNamespace(
+            model=SimpleNamespace(kind="g1_wenhao_vla", path=str(model_root))
+        ),
+        alpasim=SimpleNamespace(
+            repo_path=None,
+            checkout_cache_dir=str(worker_paths[-1]),
+            humanoid=SimpleNamespace(
+                execution_profile=HumanoidExecutionProfile.motion_reference,
+                repo_path=str(worker_paths[1]),
+                scene_store_path=str(worker_paths[2]),
+                grail_root_path=str(worker_paths[3]),
+                scene_cache_path=str(worker_paths[4]),
+            ),
+        ),
+    )
+
+    _validate_wenhao_slurm_worker_mounts(cast(RunConfig, config))
+    config.policy.model.path = "models/wenhao-model"
+    with pytest.raises(ValueError, match="policy.model.path must be an absolute path"):
+        _validate_wenhao_slurm_worker_mounts(cast(RunConfig, config))
+    config.policy.model.path = str(model_root)
+    config.alpasim.checkout_cache_dir = None
+    with pytest.raises(ValueError, match="alpasim.repo_path or"):
+        _validate_wenhao_slurm_worker_mounts(cast(RunConfig, config))
+    config.execution.backend = ExecutionBackend.local_process
+    config.execution.slurm.container_mounts = []
+    _validate_wenhao_slurm_worker_mounts(cast(RunConfig, config))
+
+
+def test_wenhao_mount_preflight_precedes_unqualified_slurm_mode_rejection(
+    tmp_path: Path,
+) -> None:
+    """A candidate Slurm run reports its latent model-root mount first."""
+    policy_eval_root = tmp_path / "policy_eval"
+    model_root = policy_eval_root / "models" / "wenhao-model"
+    run_config = _make_run_config(
+        tmp_path,
+        f"policy.model.path={model_root}",
+        "topology=slurm_partial_node_1_2_1",
+        "execution.slurm.container_image=/containers/alpagym.sqsh",
+    )
+    humanoid_paths = {
+        "repo": tmp_path / "humanoid_repo",
+        "scene_store": tmp_path / "scene_store",
+        "grail": tmp_path / "grail",
+        "scene_cache": tmp_path / "scene_cache",
+    }
+    run_config.alpasim.simulation_domain = "humanoid"
+    run_config.alpasim.humanoid = HumanoidAlpaSimConfig(
+        repo_path=str(humanoid_paths["repo"]),
+        scene_store_path=str(humanoid_paths["scene_store"]),
+        scenario_ids_by_scene={"stairs": "ascend"},
+        execution_profile=HumanoidExecutionProfile.motion_reference,
+        grail_root_path=str(humanoid_paths["grail"]),
+        policy_camera_profile=HumanoidPolicyCameraProfile.wenhao_d455,
+        scene_cache_path=str(humanoid_paths["scene_cache"]),
+        service_image="combined-humanoid:latest",
+        reward_profile_id="reference_route_centered.v3",
+    )
+    run_config.policy.model.kind = "g1_wenhao_vla"
+    run_config.policy.model.path = str(model_root)
+    run_config.execution.slurm.container_mounts = [
+        f"{model_root}:{model_root}",
+        *[f"{path}:{path}" for path in humanoid_paths.values()],
+        (
+            f"{run_config.alpasim.checkout_cache_dir}:"
+            f"{run_config.alpasim.checkout_cache_dir}"
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="Wenhao policy_eval_root"):
+        validate_run_config(run_config, "run")
 
 
 def test_slurm_cosmos_capacity_rejects_replicas_that_do_not_fit(
@@ -1239,68 +1513,90 @@ def _make_run_config(tmp_path: Path, *overrides: str) -> RunConfig:
     return build_run_config(cfg, artifact_paths)
 
 
+def _make_valid_wenhao_validation_config() -> RunConfig:
+    """Build the complete config slice consumed by humanoid preflight."""
+    fingerprints = {"stairs": "a" * 64}
+    humanoid_repo_path = "/tmp/humanoid-support"
+    scene_store_path = "/tmp/humanoid-scenes"
+    return cast(
+        RunConfig,
+        SimpleNamespace(
+            policy=SimpleNamespace(
+                kind="humanoid",
+                model=SimpleNamespace(
+                    kind="g1_wenhao_vla",
+                    step_dt_us=500_000,
+                    use_cameras=["wenhao_d455_policy_rgb"],
+                    bundle_config={
+                        "humanoid_policy_factory": (
+                            "alpagym_g1_wenhao_vla.humanoid_policy:"
+                            "build_humanoid_policy_factory"
+                        ),
+                        "require_policy_camera": True,
+                        "expected_scene_fingerprints_json": json.dumps(
+                            fingerprints,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        "humanoid_repo_path": humanoid_repo_path,
+                        "scene_store_path": scene_store_path,
+                    },
+                ),
+            ),
+            alpasim=SimpleNamespace(
+                simulation_domain="humanoid",
+                humanoid=SimpleNamespace(
+                    repo_path=humanoid_repo_path,
+                    scene_store_path=scene_store_path,
+                    scenario_ids_by_scene={"stairs": "ascend"},
+                    expected_scene_fingerprints=fingerprints,
+                    execution_profile=HumanoidExecutionProfile.motion_reference,
+                    reference_frame_count=50,
+                    policy_camera_profile=HumanoidPolicyCameraProfile.wenhao_d455,
+                ),
+                wizard_args=SimpleNamespace(
+                    control_timestep_us=500_000,
+                    force_gt_duration_us=0,
+                    n_sim_steps=30,
+                ),
+            ),
+            dataset=SimpleNamespace(scene_ids=["stairs"]),
+            cosmos=SimpleNamespace(
+                mode=CosmosRLMode.colocated,
+                rollout=SimpleNamespace(prefetch_rollout=False),
+                train=SimpleNamespace(
+                    train_policy=SimpleNamespace(
+                        trainer_type="alpagym_flow_ppo",
+                        grpo_ratio_clip_low=0.2,
+                        grpo_ratio_clip_high=0.28,
+                        ppo_value_loss_coef=1.0,
+                        ppo_value_clip_range=0.2,
+                        ppo_gamma=0.99,
+                        ppo_gae_lambda=0.95,
+                        ppo_dual_clip_ratio=3.0,
+                        ppo_value_huber_delta=10.0,
+                        ppo_normalize_advantages=True,
+                        kl_beta=0.0,
+                    ),
+                    optm_part_lrs=[5.0e-6, 1.0e-4],
+                    epsilon=1.0e-8,
+                    optm_weight_decay=0.01,
+                    optm_betas=[0.9, 0.999],
+                    optm_grad_norm_clip=1.0,
+                    optm_warmup_steps=0,
+                ),
+            ),
+            expected_valid_steps=30,
+        ),
+    )
+
+
 def _model_overrides(tmp_path: Path) -> list[str]:
     """Return policy overrides for tests that do not validate model files."""
     return [
         "policy.model.kind=alpamayo_r1",
         f"policy.model.path={(tmp_path / 'model_bundle').as_posix()}",
     ]
-
-
-def _write_h70_planner_bundle_dir(tmp_path: Path) -> Path:
-    """Create a minimal provenance-valid current-policy H70 actor bundle."""
-
-    bundle_dir = tmp_path / "model_bundle"
-    bundle_dir.mkdir()
-    weights_path = bundle_dir / "model.safetensors"
-    save_file(
-        {
-            "actor.0.weight": torch.tensor([[1.0]], dtype=torch.float32),
-            "std": torch.tensor([0.15], dtype=torch.float32),
-            "critic.0.weight": torch.tensor([[2.0]], dtype=torch.float32),
-        },
-        str(weights_path),
-    )
-    weights_sha256 = hashlib.sha256(weights_path.read_bytes()).hexdigest()
-    initialization = {
-        "schema": "videomimic_v9_actor_initialization.v1",
-        "source_v9_checkpoint_sha256": "b" * 64,
-        "source_v9_actor_parity_samples": 16,
-        "source_v9_actor_parity_max_abs": 0.0,
-        "planner_critic_seed": 0,
-    }
-    initialization_sha256 = hashlib.sha256(
-        json.dumps(initialization, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    lineage = {
-        "schema": "videomimic_planner_actor_update_lineage.v1",
-        "current_actor_status": "v9_initialized_unmodified",
-        "initialization_attestation_sha256": initialization_sha256,
-        "current_model_weights_sha256": weights_sha256,
-        "parent_model_weights_sha256": None,
-        "parent_update_lineage_sha256": None,
-        "training_export_step": 0,
-    }
-    config = {
-        "model_type": "g1_videomimic_planner_actor_critic",
-        "shadow_action_steps": 69,
-        "checkpoint_path": "model.safetensors",
-        **{
-            key: initialization[key]
-            for key in (
-                "source_v9_checkpoint_sha256",
-                "source_v9_actor_parity_samples",
-                "source_v9_actor_parity_max_abs",
-                "planner_critic_seed",
-            )
-        },
-        "actor_initialization_attestation": initialization,
-        "actor_update_lineage": lineage,
-    }
-    (bundle_dir / "config.json").write_text(
-        json.dumps(config, sort_keys=True), encoding="utf-8"
-    )
-    return bundle_dir
 
 
 def _write_hf_bundle_dir(

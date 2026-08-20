@@ -17,7 +17,11 @@ from alpagym_runtime.types import EpisodeOutput
 TENSOR_KEY_MARKER = "__tensor_key__"
 _DATACLASS_TYPE_MARKER = "__dataclass_type__"
 _BOOL_TENSOR_MARKER = "__bool_tensor__"
-_RESERVED_DICT_MARKERS = {TENSOR_KEY_MARKER, _DATACLASS_TYPE_MARKER, _BOOL_TENSOR_MARKER}
+_RESERVED_DICT_MARKERS = {
+    TENSOR_KEY_MARKER,
+    _DATACLASS_TYPE_MARKER,
+    _BOOL_TENSOR_MARKER,
+}
 _ALLOWED_DATACLASS_TYPE_PREFIX = "alpagym_runtime."
 
 
@@ -47,16 +51,26 @@ def unpack(payload: WirePayload) -> EpisodeOutput:
     return _unpack(payload.manifest, EpisodeOutput, payload.tensors)
 
 
-def _pack(value: Any, tensors: dict[str, torch.Tensor]) -> Any:
+def _pack(
+    value: Any,
+    tensors: dict[str, torch.Tensor],
+    *,
+    reject_empty_tensors: bool = True,
+    encode_bool_as_uint8: bool = True,
+) -> Any:
     """Recursively pack a value; extract tensors to the flat ``tensors`` map.
 
     Dataclass instances are stamped with a ``__dataclass_type__`` marker
     alongside their field values so unpack can recover the original type
     even when the surrounding slot is ``dict[str, Any]`` and would
     otherwise dispatch through :func:`_resolve_tensor_refs`.
+
+    The defaults implement NCCL's wire constraints. The colocated disk
+    transport reuses the manifest ABI but disables the empty-tensor rejection
+    and bool-to-uint8 conversion because ``torch.save`` supports both natively.
     """
     if isinstance(value, torch.Tensor):
-        if value.numel() == 0:
+        if reject_empty_tensors and value.numel() == 0:
             # pynccl rejects empty buffers; fail here at pack time rather than
             # after the manifest is published and the rendezvous is open, which
             # would raise mid-send and poison the communicator.
@@ -66,31 +80,60 @@ def _pack(value: Any, tensors: dict[str, torch.Tensor]) -> Any:
         key = f"tensor_{len(tensors)}"
         # pynccl cannot send torch.bool; ship bool tensors as uint8 and restore
         # the bool dtype on unpack (see _resolve_tensor_leaf).
-        wire = value.to(torch.uint8) if value.dtype == torch.bool else value
+        wire = (
+            value.to(torch.uint8)
+            if encode_bool_as_uint8 and value.dtype == torch.bool
+            else value
+        )
         tensors[key] = wire
         leaf: dict[str, Any] = {
             TENSOR_KEY_MARKER: key,
             "shape": list(value.shape),
             "dtype": str(wire.dtype),
         }
-        if value.dtype == torch.bool:
+        if encode_bool_as_uint8 and value.dtype == torch.bool:
             leaf[_BOOL_TENSOR_MARKER] = True
         return leaf
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         packed = {
-            field.name: _pack(getattr(value, field.name), tensors)
+            field.name: _pack(
+                getattr(value, field.name),
+                tensors,
+                reject_empty_tensors=reject_empty_tensors,
+                encode_bool_as_uint8=encode_bool_as_uint8,
+            )
             for field in dataclasses.fields(value)
         }
         value_type = type(value)
-        packed[_DATACLASS_TYPE_MARKER] = f"{value_type.__module__}.{value_type.__qualname__}"
+        packed[_DATACLASS_TYPE_MARKER] = (
+            f"{value_type.__module__}.{value_type.__qualname__}"
+        )
         return packed
     if isinstance(value, (list, tuple)):
-        return [_pack(item, tensors) for item in value]
+        return [
+            _pack(
+                item,
+                tensors,
+                reject_empty_tensors=reject_empty_tensors,
+                encode_bool_as_uint8=encode_bool_as_uint8,
+            )
+            for item in value
+        ]
     if isinstance(value, dict):
         reserved_keys = sorted(set(value) & _RESERVED_DICT_MARKERS)
         if reserved_keys:
-            raise ValueError(f"NCCL payload dict uses reserved manifest keys: {reserved_keys}")
-        return {k: _pack(v, tensors) for k, v in value.items()}
+            raise ValueError(
+                f"Transport payload dict uses reserved manifest keys: {reserved_keys}"
+            )
+        return {
+            k: _pack(
+                v,
+                tensors,
+                reject_empty_tensors=reject_empty_tensors,
+                encode_bool_as_uint8=encode_bool_as_uint8,
+            )
+            for k, v in value.items()
+        }
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, np.generic):
@@ -98,7 +141,9 @@ def _pack(value: Any, tensors: dict[str, torch.Tensor]) -> Any:
     return value
 
 
-def _resolve_tensor_leaf(leaf: dict[str, Any], tensors: dict[str, torch.Tensor]) -> torch.Tensor:
+def _resolve_tensor_leaf(
+    leaf: dict[str, Any], tensors: dict[str, torch.Tensor]
+) -> torch.Tensor:
     """Return the tensor for a manifest tensor-ref leaf, restoring bool dtype if marked."""
     tensor = tensors[leaf[TENSOR_KEY_MARKER]]
     if leaf.get(_BOOL_TENSOR_MARKER):
@@ -183,7 +228,9 @@ def _resolve_tensor_refs(value: Any, tensors: dict[str, torch.Tensor]) -> Any:
     return value
 
 
-def _reconstruct_dataclass(value: dict[str, Any], tensors: dict[str, torch.Tensor]) -> Any:
+def _reconstruct_dataclass(
+    value: dict[str, Any], tensors: dict[str, torch.Tensor]
+) -> Any:
     """Rebuild a dataclass instance from its packed dict using the embedded type path."""
     type_path = value[_DATACLASS_TYPE_MARKER]
     if not type_path.startswith(_ALLOWED_DATACLASS_TYPE_PREFIX):

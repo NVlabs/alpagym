@@ -106,11 +106,12 @@ def test_replay_packer_extracts_transition_signal_and_zero_pads_it(
         build_model_inputs=_generic_build_model_inputs(),
     )
     outputs = []
-    for output, reward, terminated, old_value in zip(
+    for output, reward, terminated, old_value, actor_valid in zip(
         _generic_outputs([-1.0, -2.0]),
         [0.5, -1.5],
         [False, True],
         [0.25, 0.75],
+        [True, False],
     ):
         assert output.replay_data is not None
         payload = dict(output.replay_data.payload)
@@ -119,6 +120,7 @@ def test_replay_packer_extracts_transition_signal_and_zero_pads_it(
             "terminated": terminated,
             "truncated": False,
             "old_value": torch.tensor(old_value),
+            "actor_valid": actor_valid,
             "behavior_policy_version": 7,
         }
         replay_data = replace(output.replay_data, payload=payload)
@@ -146,6 +148,10 @@ def test_replay_packer_extracts_transition_signal_and_zero_pads_it(
     torch.testing.assert_close(
         batch.training_signal.old_values,
         torch.tensor([0.25, 0.75, 0.0], dtype=torch.float32),
+    )
+    assert torch.equal(
+        batch.training_signal.actor_valid,
+        torch.tensor([True, False, False], dtype=torch.bool),
     )
     assert bool(batch.training_signal.is_padding[-1].item())
     assert torch.equal(batch.weight_versions, torch.full((3,), 7, dtype=torch.int64))

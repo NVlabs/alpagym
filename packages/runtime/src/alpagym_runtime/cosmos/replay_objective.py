@@ -7,6 +7,11 @@ from __future__ import annotations
 
 import torch
 
+from alpagym_runtime.third_party.rlinf.ppo import (
+    compute_ppo_actor_loss,
+    compute_ppo_value_loss,
+)
+
 
 def assert_replay_shapes(
     new_logprobs: torch.Tensor,
@@ -66,6 +71,7 @@ def compute_ppo_surrogate(
     ratio_clip_low: float,
     ratio_clip_high: float,
     is_padding: torch.Tensor,
+    dual_clip_ratio: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute the PPO clipped surrogate loss and importance ratio.
 
@@ -75,86 +81,61 @@ def compute_ppo_surrogate(
     minibatch happens to contain. An all-padding minibatch yields a
     graph-connected zero so every DP worker still backprops in lockstep.
     """
-    # Bound the exponent input for numeric stability; PPO ratio clipping is below.
-    log_ratio = (new_logprobs - old_logprobs).clamp(min=-5.0, max=5.0)
-    ratio = torch.exp(log_ratio)
-    surr1 = ratio * advantages
-    surr2 = torch.clamp(ratio, 1.0 - ratio_clip_low, 1.0 + ratio_clip_high) * advantages
-    per_row = -torch.min(surr1, surr2)
-    valid = (~is_padding).to(per_row.dtype)
-    return (per_row * valid).sum() / valid.sum().clamp_min(1.0), ratio
+    return compute_ppo_actor_loss(
+        new_logprobs,
+        old_logprobs,
+        ratio_clip_low,
+        ratio_clip_high,
+        advantages,
+        loss_mask=~is_padding,
+        clip_log_ratio_min=-5.0,
+        clip_log_ratio_max=5.0,
+        dual_clip_ratio=dual_clip_ratio,
+    )
 
 
-def compute_token_ppo_surrogate(
-    new_token_logprobs: torch.Tensor,
-    old_token_logprobs: torch.Tensor,
+def compute_flow_ppo_surrogate(
+    new_element_logprobs: torch.Tensor,
+    old_element_logprobs: torch.Tensor,
+    new_joint_logprobs: torch.Tensor,
+    old_joint_logprobs: torch.Tensor,
     advantages: torch.Tensor,
+    *,
     ratio_clip_low: float,
     ratio_clip_high: float,
+    dual_clip_ratio: float,
     is_padding: torch.Tensor,
-    token_causality_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute a clipped PPO objective independently for each action token.
-
-    A planner macro-decision may contain a fixed sequence of stochastic action
-    tokens.  Treating the sum of their log-probabilities as one importance ratio
-    makes the ratio variance grow with sequence length and clips the whole block
-    when only one token moved.  This objective broadcasts the macro advantage to
-    every token, clips each token ratio independently, and averages over valid
-    tokens. Row padding removes a whole macro-decision. An optional token mask
-    removes a shadow tail generated after an early controller terminal, which
-    cannot have affected the realized reward.
-    """
-    if new_token_logprobs.ndim != 2:
-        raise ValueError(
-            "token log-probabilities must have shape [B, H], got "
-            f"{tuple(new_token_logprobs.shape)}"
-        )
-    if old_token_logprobs.shape != new_token_logprobs.shape:
-        raise ValueError(
-            "new token log-probabilities shape "
-            f"{tuple(new_token_logprobs.shape)} != old token log-probabilities "
-            f"shape {tuple(old_token_logprobs.shape)}"
-        )
-    batch_size = int(new_token_logprobs.shape[0])
-    if tuple(advantages.shape) != (batch_size,):
-        raise ValueError(
-            f"advantages must have shape ({batch_size},), got {tuple(advantages.shape)}"
-        )
-    if tuple(is_padding.shape) != (batch_size,):
-        raise ValueError(
-            f"is_padding must have shape ({batch_size},), got {tuple(is_padding.shape)}"
-        )
-    if token_causality_mask is not None:
-        if tuple(token_causality_mask.shape) != tuple(new_token_logprobs.shape):
-            raise ValueError(
-                "token_causality_mask must match token log-probabilities shape "
-                f"{tuple(new_token_logprobs.shape)}, got "
-                f"{tuple(token_causality_mask.shape)}"
-            )
-        if token_causality_mask.dtype is not torch.bool:
-            raise TypeError("token_causality_mask must have dtype bool")
-    if not torch.isfinite(new_token_logprobs).all():
-        raise FloatingPointError("model returned non-finite token log-probabilities")
-    if not torch.isfinite(old_token_logprobs).all():
-        raise FloatingPointError(
-            "replay contains non-finite old token log-probabilities"
-        )
-
-    log_ratio = (new_token_logprobs - old_token_logprobs).clamp(min=-5.0, max=5.0)
-    ratio = torch.exp(log_ratio)
-    token_advantages = advantages.unsqueeze(-1)
-    surr1 = ratio * token_advantages
-    surr2 = (
-        torch.clamp(ratio, 1.0 - ratio_clip_low, 1.0 + ratio_clip_high)
-        * token_advantages
+    """Apply PPO to the full selected Flow-SDE transition density."""
+    if new_element_logprobs.ndim != 2 or new_element_logprobs.shape[1] == 0:
+        raise ValueError("Flow-PPO element log-probabilities must have shape [B, D]")
+    if old_element_logprobs.shape != new_element_logprobs.shape:
+        raise ValueError("Flow-PPO new and old element log-probabilities must match")
+    if not torch.allclose(
+        new_element_logprobs.sum(dim=-1),
+        new_joint_logprobs,
+        rtol=1.0e-5,
+        atol=1.0e-5,
+    ):
+        raise ValueError("Flow-PPO new joint log-probability differs from its elements")
+    if not torch.allclose(
+        old_element_logprobs.sum(dim=-1),
+        old_joint_logprobs,
+        rtol=1.0e-5,
+        atol=1.0e-5,
+    ):
+        raise ValueError("Flow-PPO old joint log-probability differs from its elements")
+    return compute_ppo_actor_loss(
+        new_joint_logprobs,
+        old_joint_logprobs,
+        ratio_clip_low,
+        ratio_clip_high,
+        advantages,
+        loss_mask=~is_padding,
+        clip_log_ratio_min=-5.0,
+        clip_log_ratio_max=5.0,
+        dual_clip_ratio=dual_clip_ratio,
     )
-    per_token = -torch.min(surr1, surr2)
-    valid_mask = (~is_padding).unsqueeze(-1).expand_as(per_token)
-    if token_causality_mask is not None:
-        valid_mask = valid_mask & token_causality_mask
-    valid = valid_mask.to(per_token.dtype)
-    return (per_token * valid).sum() / valid.sum().clamp_min(1.0), ratio
 
 
 def compute_kl_penalty(
@@ -178,6 +159,7 @@ def compute_value_loss(
     is_padding: torch.Tensor,
     old_values: torch.Tensor | None = None,
     value_clip_range: float | None = None,
+    huber_delta: float | None = None,
 ) -> torch.Tensor:
     """Compute PPO value-function loss over valid rows.
 
@@ -190,6 +172,20 @@ def compute_value_loss(
     if value_clip_range is not None and value_clip_range <= 0.0:
         raise ValueError(
             f"value_clip_range must be positive when set, got {value_clip_range}"
+        )
+
+    if huber_delta is not None:
+        if old_values is None or value_clip_range is None:
+            raise ValueError(
+                "PPO Huber value loss requires old_values and value_clip_range"
+            )
+        return compute_ppo_value_loss(
+            values,
+            returns,
+            old_values,
+            value_clip=value_clip_range,
+            huber_delta=huber_delta,
+            loss_mask=~is_padding,
         )
 
     value_error = values - returns

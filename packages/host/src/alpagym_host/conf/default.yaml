@@ -67,9 +67,9 @@ alpasim:
   repo_path: null
   # Optional directory for cached AlpaSim checkouts. Defaults to XDG_CACHE_HOME.
   checkout_cache_dir: null
-  # AlpaSim mirror cloned for the Wizard checkout. Shared default for all
-  # deploys; set repo_path to start Wizard from a local checkout instead.
-  repo_url: https://github.com/NVlabs/alpasim.git
+  # AlpaSim fork containing the exact humanoid gRPC/runtime ABI pinned by this
+  # workspace. Set repo_path to start Wizard from a local checkout instead.
+  repo_url: ssh://git@github.com/chenyx09/alpasim.git
   repo_ref: ${alpasim_grpc_repo_ref:}
   startup_timeout_s: 1200.0
   simulation_timeout_s: 600.0
@@ -114,6 +114,13 @@ cosmos:
     max_num_steps: 1
     num_epochs: 1
     optm_lr: 1.0e-6
+    # Optional per-model-part learning rates. When non-empty, generated Cosmos
+    # config uses this list as train.optm_lr instead of the scalar above.
+    optm_part_lrs: []
+    epsilon: 1.0e-6
+    optm_weight_decay: 0.01
+    optm_betas: [0.9, 0.999]
+    optm_grad_norm_clip: 1.0
     # Linear warmup steps for the learning rate (Cosmos-RL default: 20).
     optm_warmup_steps: 20
     # Checkpoint settings. With `enable_checkpoint: true` the cosmos resume
@@ -150,6 +157,9 @@ cosmos:
       # PPO-only value-function settings. Ignored by alpagym_grpo.
       ppo_value_loss_coef: 0.5
       ppo_value_clip_range: null
+      # Optional Flow-PPO refinements. Generic Gaussian PPO keeps both disabled.
+      ppo_dual_clip_ratio: null
+      ppo_value_huber_delta: null
       ppo_normalize_advantages: true
       ppo_gamma: 0.99
       ppo_gae_lambda: 0.95

@@ -63,6 +63,7 @@ _FLOAT_TRANSITION_SIGNAL_ALIASES = {
 _BOOL_TRANSITION_SIGNAL_ALIASES = {
     "terminateds": ("terminated", "terminateds"),
     "truncateds": ("truncated", "truncateds"),
+    "actor_valid": ("actor_valid",),
 }
 _PRIMITIVE_REWARD_ALIASES = ("primitive_rewards", "controller_tick_rewards")
 _PRIMITIVE_REWARD_MASK_ALIASES = (
@@ -89,6 +90,8 @@ class AlpagymDataPacker(DataPacker):
             [PolicyReplayData], tuple[dict[str, Any], torch.Tensor]
         ],
         writer: EpisodeWriter | None = None,
+        collate_samples: Callable[[list[TrainerReplayData]], TrainerReplayDataBatch]
+        | None = None,
     ) -> None:
         """Store replay collation settings and the optional rollout writer.
 
@@ -100,11 +103,14 @@ class AlpagymDataPacker(DataPacker):
                 logprob; supplied by the selected ``PolicyBundle`` so this
                 packer stays policy-agnostic.
             writer: Rollout-side egress, or ``None`` on the trainer/controller.
+            collate_samples: Optional policy-owned minibatch collator. ``None``
+                retains rectangular ``torch.stack`` collation.
         """
         super().__init__()
         self._expected_valid_steps = config.expected_valid_steps
         self._build_model_inputs = build_model_inputs
         self._writer = writer
+        self._collate_samples = collate_samples
         # cosmos's CommMixin assigns this and then calls post_redis_injection();
         # the packer only forwards it to the writer's cleanup subscriber.
         self.redis_client: redis.Redis | None = None
@@ -302,7 +308,10 @@ class AlpagymDataPacker(DataPacker):
         consumes, where ``B`` is the minibatch step count.
         """
         del computed_max_len
-        batch = TrainerReplayDataBatch.stack(processed_samples)
+        if self._collate_samples is None:
+            batch = TrainerReplayDataBatch.stack(processed_samples)
+        else:
+            batch = self._collate_samples(processed_samples)
         logger.info(
             "Collated AlpaGym replay minibatch steps=%d padding_rows=%d",
             len(processed_samples),
@@ -417,6 +426,8 @@ def build_alpagym_data_packer(
     build_model_inputs: Callable[
         [PolicyReplayData], tuple[dict[str, Any], torch.Tensor]
     ],
+    collate_samples: Callable[[list[TrainerReplayData]], TrainerReplayDataBatch]
+    | None = None,
 ) -> AlpagymDataPacker:
     """Construct the role's packer with its transport endpoint wired in.
 
@@ -435,6 +446,7 @@ def build_alpagym_data_packer(
             config,
             build_model_inputs,
             writer=_build_episode_writer(run_config, is_nccl=is_nccl),
+            collate_samples=collate_samples,
         )
     elif cosmos_role == "Policy":
         if is_nccl:
@@ -447,6 +459,7 @@ def build_alpagym_data_packer(
                 store=store,
                 receiver=receiver,
                 target_device=target_device,
+                collate_samples=collate_samples,
             )
         # Disk Policy reads JSON artifacts back by handle. In colocated mode this
         # one process also runs the rollout worker, which shares this packer and
@@ -457,10 +470,19 @@ def build_alpagym_data_packer(
             if run_config.cosmos.mode == CosmosRLMode.colocated
             else None
         )
-        return AlpagymDataPacker(config, build_model_inputs, writer=writer)
+        return AlpagymDataPacker(
+            config,
+            build_model_inputs,
+            writer=writer,
+            collate_samples=collate_samples,
+        )
     else:
         # The controller owns no data plane.
-        return AlpagymDataPacker(config, build_model_inputs)
+        return AlpagymDataPacker(
+            config,
+            build_model_inputs,
+            collate_samples=collate_samples,
+        )
 
 
 def _build_episode_writer(run_config: RunConfig, is_nccl: bool) -> EpisodeWriter:

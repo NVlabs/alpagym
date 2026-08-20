@@ -67,7 +67,11 @@ def write_run_artifacts(config: RunConfig) -> None:
         encoding="utf-8",
     )
 
-    config_dict = cast(dict[str, Any], _to_plain_data(asdict(config)))
+    # OmegaConf's structured Enum loader accepts member names, not arbitrary
+    # wire values.  Keep the host-owned resolved artifact round-trippable even
+    # when an Enum value names an external Hydra group (for example
+    # ``wenhao_d455 -> humanoid_wenhao_d455``).
+    config_dict = cast(dict[str, Any], _to_resolved_config_data(asdict(config)))
     artifact_paths.resolved_config_path.write_text(
         yaml.safe_dump(config_dict, sort_keys=False),
         encoding="utf-8",
@@ -99,6 +103,9 @@ def _build_cosmos_config(config: RunConfig) -> dict[str, Any]:
     artifact_paths = config.artifact_paths
     cosmos = cast(dict[str, Any], _to_plain_data(asdict(config.cosmos)))
     train = dict(cosmos["train"])
+    part_learning_rates = train.pop("optm_part_lrs")
+    if part_learning_rates:
+        train["optm_lr"] = part_learning_rates
     train["epoch"] = train.pop("num_epochs")
     logging = dict(cosmos["logging"])
     logging["log_interval"] = logging.pop("log_training_metrics_every_n_steps")
@@ -107,6 +114,8 @@ def _build_cosmos_config(config: RunConfig) -> dict[str, Any]:
     ppo_config = {
         "value_loss_coef": train_policy.pop("ppo_value_loss_coef", 0.5),
         "value_clip_range": train_policy.pop("ppo_value_clip_range", None),
+        "dual_clip_ratio": train_policy.pop("ppo_dual_clip_ratio", None),
+        "value_huber_delta": train_policy.pop("ppo_value_huber_delta", None),
         "normalize_advantages": train_policy.pop("ppo_normalize_advantages", True),
         "gamma": train_policy.pop("ppo_gamma", 0.99),
         "gae_lambda": train_policy.pop("ppo_gae_lambda", 0.95),
@@ -135,7 +144,7 @@ def _build_cosmos_config(config: RunConfig) -> dict[str, Any]:
     custom_config: dict[str, Any] = {
         "resolved_config_path": str(artifact_paths.resolved_config_path),
     }
-    if trainer_type == "alpagym_ppo":
+    if trainer_type in {"alpagym_ppo", "alpagym_flow_ppo"}:
         custom_config["ppo"] = ppo_config
 
     cosmos_config = {
@@ -232,6 +241,19 @@ def _to_plain_data(value: Any) -> Any:
         return {key: _to_plain_data(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_to_plain_data(item) for item in value]
+    return value
+
+
+def _to_resolved_config_data(value: Any) -> Any:
+    """Convert typed config to an OmegaConf-round-trippable YAML tree."""
+    if isinstance(value, Enum):
+        return value.name
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _to_resolved_config_data(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_resolved_config_data(item) for item in value]
     return value
 
 

@@ -23,6 +23,7 @@ from alpagym_host.config import (
     ExecutionBackend,
     HumanoidAlpaSimConfig,
     HumanoidExecutionProfile,
+    HumanoidPolicyCameraProfile,
 )
 
 
@@ -106,7 +107,6 @@ def test_wizard_command_selects_strict_motion_reference_profile(
             force_gt_duration_us=0,
             control_timestep_us=500_000,
             n_sim_steps=60,
-            extra_overrides="cameras=motion_reference_debug",
         )
     )
     config.simulation_domain = "humanoid"
@@ -116,6 +116,9 @@ def test_wizard_command_selects_strict_motion_reference_profile(
         scenario_ids_by_scene={"hq_stairs": "ascend"},
         execution_profile=HumanoidExecutionProfile.motion_reference,
         grail_root_path="/workspace/GRAIL",
+        policy_camera_profile=HumanoidPolicyCameraProfile.wenhao_d455,
+        scene_cache_path="/workspace/cache/hq_stairs",
+        service_image="alpasim-humanoid-nurec:local",
         reward_profile_id="reference_route_centered.v3",
         expected_scene_fingerprints={"hq_stairs": "a" * 64},
     )
@@ -128,8 +131,9 @@ def test_wizard_command_selects_strict_motion_reference_profile(
         checkout_root=tmp_path,
     )
 
-    assert "runtime_domain=humanoid_reference_h70" in command
+    assert "runtime_domain=humanoid_reference" in command
     assert "defines.humanoid_grail_root=/workspace/GRAIL" in command
+    assert "defines.humanoid_image=alpasim-humanoid-nurec:local" in command
     assert (
         'defines.humanoid_scene_fingerprints_json="{\\"hq_stairs\\":\\"'
         + "a" * 64
@@ -153,7 +157,8 @@ def test_wizard_command_selects_strict_motion_reference_profile(
         'runtime.humanoid.controller.options.max_control_ticks="1500"'
     )
     assert derived_horizon_override in command
-    assert "cameras=motion_reference_debug" in command
+    assert command.count("cameras=humanoid_wenhao_d455") == 1
+    assert command.count("defines.humanoid_scene_cache=/workspace/cache/hq_stairs") == 1
 
 
 @pytest.mark.parametrize(
@@ -165,6 +170,12 @@ def test_wizard_command_selects_strict_motion_reference_profile(
         "~runtime.humanoid.controller.options",
         "runtime.humanoid.controller.module=untrusted_backend",
         "runtime.humanoid.controller@runtime.humanoid.controller=untrusted_backend",
+        "cameras=motion_reference_debug",
+        "runtime.simulation_config.cameras=[]",
+        "runtime.simulation_config.image_format=jpeg",
+        "runtime.humanoid.policy_camera.schema=untrusted.v0",
+        "defines.humanoid_scene_cache=/tmp/untrusted",
+        "services.runtime.volumes=[]",
         "runtime_domain=humanoid",
     ],
 )
@@ -235,6 +246,51 @@ def test_start_wizard_uses_separate_process_group(
 
     assert isinstance(process, FakeProcess)
     assert calls[0]["start_new_session"] is True
+
+
+def test_start_wizard_creates_typed_policy_camera_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Creates the writable renderer cache before Wizard validates mounts."""
+
+    class FakeProcess:
+        """Minimal process returned by the patched launcher."""
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+    config = _alpasim_config(
+        AlpaSimWizardArgs(
+            deploy="local",
+            topology="1gpu",
+            driver_source="external_dynamic",
+            force_gt_duration_us=0,
+            control_timestep_us=500_000,
+            n_sim_steps=60,
+        )
+    )
+    config.simulation_domain = "humanoid"
+    cache_path = tmp_path / "render-cache"
+    config.humanoid = HumanoidAlpaSimConfig(
+        repo_path="/workspace/humanoid",
+        scene_store_path="/workspace/scenes",
+        scene_cache_path=str(cache_path),
+        scenario_ids_by_scene={"hq_stairs": "ascend"},
+        execution_profile=HumanoidExecutionProfile.motion_reference,
+        grail_root_path="/workspace/GRAIL",
+        policy_camera_profile=HumanoidPolicyCameraProfile.wenhao_d455,
+        service_image="alpasim-humanoid-nurec:local",
+        reward_profile_id="reference_route_centered.v3",
+    )
+
+    start_wizard(
+        config=config,
+        execution_backend=ExecutionBackend.local_process,
+        dataset=DatasetConfig(scene_ids=["hq_stairs"], test_suite_id=None),
+        alpasim_run_dir=tmp_path / "alpasim",
+        cwd=tmp_path,
+    )
+
+    assert cache_path.is_dir()
 
 
 def test_ensure_process_terminated_signals_process_group(

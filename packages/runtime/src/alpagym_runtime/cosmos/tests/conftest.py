@@ -7,14 +7,23 @@ import importlib
 import importlib.util
 import sys
 import types
+from collections.abc import Iterator
+from contextlib import contextmanager
+from importlib.machinery import PathFinder
 from typing import Any, cast
 
 import pytest
-from alpagym_runtime.alpasim.tests.test_proto_conversion import install_alpasim_grpc_stubs
+from alpagym_runtime.alpasim.tests.test_proto_conversion import (
+    install_alpasim_grpc_stubs,
+)
 
 
 def _install_cosmos_stubs() -> None:
     """Install minimal Cosmos-RL stubs needed by alpagym runtime unit tests."""
+    installed_cosmos = sys.modules.get("cosmos_rl")
+    if getattr(installed_cosmos, "__alpagym_test_stub__", False):
+        return
+
     if "grpc" not in sys.modules and importlib.util.find_spec("grpc") is None:
         grpc_module: Any = types.ModuleType("grpc")
 
@@ -126,7 +135,12 @@ def _install_cosmos_stubs() -> None:
         transformers.PreTrainedModel = PreTrainedModel
         sys.modules["transformers"] = transformers
 
+    cosmos_spec = PathFinder.find_spec("cosmos_rl", sys.path)
     cosmos_rl: Any = types.ModuleType("cosmos_rl")
+    cosmos_rl.__alpagym_test_stub__ = True
+    cosmos_rl.__path__ = list(
+        cosmos_spec.submodule_search_locations or () if cosmos_spec is not None else ()
+    )
     sys.modules["cosmos_rl"] = cosmos_rl
 
     packer_base: Any = types.ModuleType("cosmos_rl.dispatcher.data.packer.base")
@@ -149,7 +163,9 @@ def _install_cosmos_stubs() -> None:
 
     dispatcher_status.PolicyStatusManager = PolicyStatusManager
     sys.modules["cosmos_rl.dispatcher.status"] = dispatcher_status
-    sys.modules["cosmos_rl.dispatcher.data"] = types.ModuleType("cosmos_rl.dispatcher.data")
+    sys.modules["cosmos_rl.dispatcher.data"] = types.ModuleType(
+        "cosmos_rl.dispatcher.data"
+    )
     sys.modules["cosmos_rl.dispatcher.data.packer"] = types.ModuleType(
         "cosmos_rl.dispatcher.data.packer"
     )
@@ -200,7 +216,9 @@ def _install_cosmos_stubs() -> None:
             param_map = {}
             state_dict = cast(Any, self).get_underlying_model().state_dict()
             for name, param in state_dict.items():
-                mapped_name = cast(Any, weight_mapper).rollout_map_local_key_to_hf_key(name)
+                mapped_name = cast(Any, weight_mapper).rollout_map_local_key_to_hf_key(
+                    name
+                )
                 param_map[mapped_name] = param
             param_map.update(self.get_quantized_tensors(weight_mapper))
             self._model_param_map = param_map
@@ -292,11 +310,15 @@ def _install_cosmos_stubs() -> None:
     policy_config.Config = Config
     policy_config.GrpoConfig = GrpoConfig
     sys.modules["cosmos_rl.policy.config"] = policy_config
-    sys.modules["cosmos_rl.policy.trainer"] = types.ModuleType("cosmos_rl.policy.trainer")
+    sys.modules["cosmos_rl.policy.trainer"] = types.ModuleType(
+        "cosmos_rl.policy.trainer"
+    )
     sys.modules["cosmos_rl.policy.trainer.base"] = trainer_base
 
     llm_trainer: Any = types.ModuleType("cosmos_rl.policy.trainer.llm_trainer")
-    grpo_trainer: Any = types.ModuleType("cosmos_rl.policy.trainer.llm_trainer.grpo_trainer")
+    grpo_trainer: Any = types.ModuleType(
+        "cosmos_rl.policy.trainer.llm_trainer.grpo_trainer"
+    )
 
     class GRPOTrainer(Trainer):
         """Tiny stand-in for Cosmos-RL GRPOTrainer."""
@@ -335,7 +357,9 @@ def _install_cosmos_stubs() -> None:
         @classmethod
         def get_weight_mapper(cls, model_type: str) -> type:
             """Return the registered mapper for ``model_type``."""
-            return cls._MODEL_WEIGHT_MAPPER_REGISTRY.get(model_type, IdentityWeightMapper)
+            return cls._MODEL_WEIGHT_MAPPER_REGISTRY.get(
+                model_type, IdentityWeightMapper
+            )
 
         def policy_map_local_key_to_hf_key(self, param_name: str) -> str:
             """Return the unchanged policy parameter name."""
@@ -362,7 +386,9 @@ def _install_cosmos_stubs() -> None:
 
         @property
         def trainable_params(self) -> list[str]:
-            return [name for name, param in self.named_parameters() if param.requires_grad]
+            return [
+                name for name, param in self.named_parameters() if param.requires_grad
+            ]
 
         @property
         def weight_sync_transforms(self) -> list[tuple[str, object]]:
@@ -429,6 +455,18 @@ def _install_cosmos_stubs() -> None:
 
     util: Any = types.ModuleType("cosmos_rl.utils.util")
     util.setup_tokenizer = lambda path: object()
+
+    @contextmanager
+    def cosmos_default_dtype(dtype: torch.dtype) -> Iterator[None]:
+        """Temporarily set PyTorch's process-wide default dtype."""
+        previous_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(dtype)
+        try:
+            yield
+        finally:
+            torch.set_default_dtype(previous_dtype)
+
+    util.cosmos_default_dtype = cosmos_default_dtype
     distributed.HighAvailabilitylNccl = HighAvailabilitylNccl
     parallelism.ParallelDims = ParallelDims
     # payload_transport: stub the cosmos NCCL completion prefix + prefetch mixin
@@ -437,7 +475,9 @@ def _install_cosmos_stubs() -> None:
     # stubbed prefix must match the real "nccl:" so handle parsing stays
     # consistent across stub and real runs.
     payload_transport: Any = types.ModuleType("cosmos_rl.utils.payload_transport")
-    payload_transport_nccl: Any = types.ModuleType("cosmos_rl.utils.payload_transport.nccl")
+    payload_transport_nccl: Any = types.ModuleType(
+        "cosmos_rl.utils.payload_transport.nccl"
+    )
     payload_transport_nccl.NCCL_COMPLETION_PREFIX = "nccl:"
     payload_transport_nccl.build_nccl_prefix = lambda *, experiment_name, job_id: (
         f"{experiment_name}:{job_id}"
@@ -457,7 +497,11 @@ def _install_cosmos_stubs() -> None:
     payload_transport.nccl = payload_transport_nccl
     payload_transport.prefetch_mixin = payload_transport_prefetch
 
+    utils_spec = PathFinder.find_spec("cosmos_rl.utils", cosmos_rl.__path__)
     utils_pkg: Any = types.ModuleType("cosmos_rl.utils")
+    utils_pkg.__path__ = list(
+        utils_spec.submodule_search_locations or () if utils_spec is not None else ()
+    )
     utils_pkg.distributed = distributed
     utils_pkg.parallelism = parallelism
     utils_pkg.util = util
@@ -468,7 +512,9 @@ def _install_cosmos_stubs() -> None:
     sys.modules["cosmos_rl.utils.util"] = util
     sys.modules["cosmos_rl.utils.payload_transport"] = payload_transport
     sys.modules["cosmos_rl.utils.payload_transport.nccl"] = payload_transport_nccl
-    sys.modules["cosmos_rl.utils.payload_transport.prefetch_mixin"] = payload_transport_prefetch
+    sys.modules["cosmos_rl.utils.payload_transport.prefetch_mixin"] = (
+        payload_transport_prefetch
+    )
 
     for module_name in (
         "alpagym_runtime.cosmos.rollout_backend",

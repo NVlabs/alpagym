@@ -12,6 +12,7 @@ import types
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from alpagym_host.config import CosmosRLMode, TransportKind
@@ -41,7 +42,9 @@ def _episode(session_uuid: str) -> EpisodeOutput:
     )
 
 
-def _rollout_packer(writer: _StubWriter | None, *, non_text: bool = True) -> AlpagymDataPacker:
+def _rollout_packer(
+    writer: _StubWriter | None, *, non_text: bool = True
+) -> AlpagymDataPacker:
     """Build a packer with a stub writer and a minimal cosmos config."""
     packer = AlpagymDataPacker(
         DataPackerConfig(expected_valid_steps=1),
@@ -161,6 +164,34 @@ def test_disaggregated_disk_policy_packer_is_read_only(tmp_path: Path) -> None:
         packer.get_rollout_output([_episode("a")], [], [], [])
 
 
+def test_nccl_policy_packer_preserves_policy_collator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The NCCL wrapper must retain the same policy-owned collation hook."""
+    from alpagym_runtime.cosmos import packer as packer_module
+    from alpagym_runtime.transport.nccl.endpoints import NcclAlpagymDataPacker
+
+    def _custom_collator(samples: list[Any]) -> Any:
+        return samples
+
+    monkeypatch.setattr(
+        packer_module,
+        "_build_nccl_receiver",
+        lambda run_config: (object(), object(), "cpu"),
+    )
+
+    packer = build_alpagym_data_packer(
+        _nccl_run_config(tmp_path),
+        cosmos_role="Policy",
+        build_model_inputs=lambda replay_data: ({}, None),
+        collate_samples=_custom_collator,
+    )
+
+    assert isinstance(packer, NcclAlpagymDataPacker)
+    assert packer._collate_samples is _custom_collator
+
+
 def test_nccl_tcpstore_clients_use_configured_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -168,10 +199,15 @@ def test_nccl_tcpstore_clients_use_configured_timeout(
     """Both NCCL client roles give TCPStore the configured rendezvous timeout."""
     from alpagym_host.endpoint_registry import FileTopologyRegistry
     from alpagym_runtime.cosmos import packer as packer_module
-    from alpagym_runtime.transport.nccl import receiver as receiver_module, sender as sender_module
+    from alpagym_runtime.transport.nccl import (
+        receiver as receiver_module,
+        sender as sender_module,
+    )
 
     run_config = _nccl_run_config(tmp_path)
-    FileTopologyRegistry(run_config.artifact_paths.topology_registry_dir).publish_nccl_master(
+    FileTopologyRegistry(
+        run_config.artifact_paths.topology_registry_dir
+    ).publish_nccl_master(
         host="controller-node",
         port=29501,
     )
@@ -251,7 +287,10 @@ def test_nccl_tcpstore_clients_use_configured_timeout(
         timedelta(seconds=7),
         timedelta(seconds=7),
     ]
-    assert [call["host_name"] for call in tcpstore_calls] == ["controller-node", "controller-node"]
+    assert [call["host_name"] for call in tcpstore_calls] == [
+        "controller-node",
+        "controller-node",
+    ]
     assert [call["port"] for call in tcpstore_calls] == [29501, 29501]
     assert len(fake_senders) == 1
     assert fake_senders[0].drain_timeout_seconds == 7

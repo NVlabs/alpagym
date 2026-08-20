@@ -14,10 +14,11 @@ wires them to a driving policy and keeps the interfaces small enough to swap any
 one piece.
 
 AlpaGym is in early but active development. It supports the
-[Alpamayo 1.5](https://github.com/NVlabs/alpamayo1.5) model with 10b parameters;
-the humanoid integration adds direct VideoMimic and current-policy
-VideoMimic-to-GRAIL actor-critic bundles. Current work focuses on throughput,
-scaling, and additional models and training algorithms.
+[Alpamayo 1.5](https://github.com/NVlabs/alpamayo1.5) model with 10b parameters.
+This branch also carries a SceneStore-backed G1 path: direct VideoMimic remains
+a baseline, while the active policy/controller-separated experiment trains the
+pinned Wenhao Qwen3-VL 2B VLA with Flow-PPO and executes its one-second H50
+motion reference through the existing SONIC/GRAIL controller in AlpaSim.
 
 ## Table of Contents
 
@@ -85,7 +86,7 @@ workspace is designed to make adding new packages straightforward.
   policies and model adapters (`policies/`), the reward terms (`rewards/`), and
   the episode transport (`transport/`).
 - **`packages/policies`** — policy-owned bundles, replay parsers, configs, and
-  checkpoint tools for Alpamayo 1.5 and the G1 direct/planner actors.
+  checkpoint tools for Alpamayo 1.5, the G1 direct baseline, and the Wenhao VLA.
 - **`packages/alpasim_configs`** — AlpaSim topology configs used by AlpaGym.
 - **`packages/plugins`** — utilities for discovering optioninal plugin packages.
 
@@ -103,10 +104,11 @@ On the host (control plane):
 
 In the runtime (GPU):
 
-5. The rollout backend pulls scenes and runs episodes against AlpaSim. Each
-   tick, AlpaSim sends camera, ego, and route observations to the egodriver
-   gRPC server; the policy steps and returns a trajectory; AlpaSim advances the
-   ego car and asks again.
+5. The rollout backend pulls scenes and runs episodes against AlpaSim. Driving
+   policies receive camera, ego, and route observations through the egodriver
+   API. The humanoid Wenhao path instead receives a receipt-bound, same-shot
+   D455 image plus robot state and returns a versioned H50 motion-reference
+   buffer while AlpaSim advances SONIC/MuJoCo asynchronously.
 6. Completed episodes are scored and written as artifacts.
 7. The trainer consumes the artifacts and applies the configured GRPO or PPO
    update; updated weights sync back to the rollout workers.
@@ -119,8 +121,6 @@ cluster.
 
 - [Onboarding Guide](docs/ONBOARDING.md) — host setup, auth, getting a model, and running locally.
 - [G1 SceneStore RL handoff](docs/HUMANOID_ALPAGYM_ALPASIM_HANDOFF_YUXIAO.md) —
-  standalone AlpaGym/AlpaSim ownership, direct V9, and the canonical
-  current-actor H70-to-GRAIL PPO contract, including token-level causal credit,
-  immutable checkpoint lineage, the 30-second horizon, and qualification
-  boundaries.
+  the current Wenhao VLA, asynchronous H50-to-SONIC execution, Flow-PPO replay,
+  immutable checkpoint/camera/scene lineage, and qualification boundaries.
 - [Contributing](CONTRIBUTING.md) — code style and review process.

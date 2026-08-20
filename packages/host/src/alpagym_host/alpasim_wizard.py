@@ -23,16 +23,25 @@ from alpagym_host.config import (
 
 
 _MOTION_REFERENCE_RESERVED_OVERRIDE_PREFIXES = (
+    "cameras",
     "runtime_domain",
+    "runtime.simulation_config.cameras",
+    "runtime.simulation_config.image_format",
     "runtime.humanoid.reference",
     "runtime.humanoid.controller",
+    "runtime.humanoid.policy_camera",
     "runtime.humanoid.num_envs",
     "defines.humanoid_repo",
     "defines.humanoid_scene_store",
+    "defines.humanoid_scene_cache",
+    "defines.humanoid_policy_camera_profile",
     "defines.humanoid_scene_fingerprints_json",
     "defines.humanoid_grail_root",
     "defines.humanoid_image",
     "defines.humanoid_dynamics_gpus",
+    "services.runtime.volumes",
+    "services.runtime.environments",
+    "services.runtime.gpus",
 )
 
 
@@ -120,9 +129,9 @@ def _build_wizard_command(
         )
         runtime_domain = "humanoid"
         if reference_mode:
-            if config.humanoid.reference_frame_count != 70:
-                raise ValueError("motion_reference frame count must be H70")
-            runtime_domain = "humanoid_reference_h70"
+            if config.humanoid.reference_frame_count != 50:
+                raise ValueError("motion_reference frame count must be H50")
+            runtime_domain = "humanoid_reference"
         argv.extend(
             (
                 f"runtime_domain={runtime_domain}",
@@ -133,6 +142,15 @@ def _build_wizard_command(
                 f"runtime.humanoid.num_envs={config.humanoid.num_envs}",
             )
         )
+        if config.humanoid.policy_camera_profile is not None:
+            assert config.humanoid.scene_cache_path is not None
+            argv.extend(
+                (
+                    "cameras="
+                    f"{config.humanoid.policy_camera_profile.wizard_config_group}",
+                    f"defines.humanoid_scene_cache={config.humanoid.scene_cache_path}",
+                )
+            )
         # Direct-action tasks consume these through registration_options;
         # motion-reference tasks consume them in the trusted controller plugin.
         # Keep the authored reward identity in the generated Wizard config so
@@ -212,6 +230,12 @@ def start_wizard(
 ) -> subprocess.Popen[str]:
     """Start Wizard as a subprocess."""
     alpasim_run_dir = alpasim_run_dir.resolve()
+    if (
+        config.humanoid is not None
+        and config.humanoid.policy_camera_profile is not None
+    ):
+        assert config.humanoid.scene_cache_path is not None
+        Path(config.humanoid.scene_cache_path).mkdir(parents=True, exist_ok=True)
     argv = _build_wizard_command(
         config=config,
         execution_backend=execution_backend,

@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+import pytest
 import torch
 from alpagym_runtime.inference.types import NUM_ROUTE_WAYPOINTS, ModelInput
 from alpagym_runtime.replay import ActionSelection, PolicyReplayData
@@ -105,6 +107,15 @@ def _make_full_episode_output() -> EpisodeOutput:
     )
 
 
+def _read_v2_artifact(path: Path) -> tuple[dict[str, Any], Path]:
+    """Return a v2 manifest envelope and its referenced tensor sidecar."""
+    artifact = json.loads(path.read_text(encoding="utf-8"))
+    assert artifact["artifact_schema"] == "alpagym.disk_episode.v2"
+    descriptor = artifact["tensor_sidecar"]
+    sidecar_path = path.parent / descriptor["filename"]
+    return artifact, sidecar_path
+
+
 def _assert_policy_output_equal(actual: PolicyOutput, expected: PolicyOutput) -> None:
     """Assert a single PolicyOutput round-trips identically across fields."""
     assert actual.chosen_xyz.dtype == expected.chosen_xyz.dtype
@@ -155,7 +166,7 @@ def _assert_policy_output_equal(actual: PolicyOutput, expected: PolicyOutput) ->
 def test_write_episode_json_creates_parent_dirs(
     tmp_path: Path,
 ) -> None:
-    """`write_episode_json` writes JSON at the requested nested path."""
+    """`write_episode_json` writes a manifest and sidecar under the target dir."""
     episode = _make_full_episode_output()
     target_path = tmp_path / "nested" / "scene_001.json"
 
@@ -163,6 +174,9 @@ def test_write_episode_json_creates_parent_dirs(
 
     assert target_path.is_file()
     assert target_path.read_text(encoding="utf-8").startswith("{")
+    artifact, sidecar_path = _read_v2_artifact(target_path)
+    assert artifact["manifest_sha256"]
+    assert sidecar_path.is_file()
 
 
 def test_rollout_artifact_round_trips_full_episode_output(tmp_path: Path) -> None:
@@ -177,10 +191,8 @@ def test_rollout_artifact_round_trips_full_episode_output(tmp_path: Path) -> Non
     assert loaded.session_uuid == episode.session_uuid
     assert loaded.num_steps == episode.num_steps
     assert loaded.rollout_seed == (1 << 64) - 1
-    assert (
-        json.loads(target_path.read_text(encoding="utf-8"))["rollout_seed"]
-        == (1 << 64) - 1
-    )
+    artifact, _ = _read_v2_artifact(target_path)
+    assert artifact["episode_manifest"]["rollout_seed"] == (1 << 64) - 1
     assert loaded.is_valid == episode.is_valid
     assert loaded.route_waypoints == episode.route_waypoints
     assert loaded.executed_ego_trajectory == episode.executed_ego_trajectory
@@ -193,8 +205,8 @@ def test_rollout_artifact_round_trips_full_episode_output(tmp_path: Path) -> Non
         _assert_policy_output_equal(actual_output, expected_output)
 
 
-def test_write_episode_json_handles_tensor_replay_payload(tmp_path: Path) -> None:
-    """Trace-mode payloads serialize to JSON-safe lists."""
+def test_write_episode_json_extracts_tensor_replay_payload(tmp_path: Path) -> None:
+    """Trace tensors become manifest references backed by the tensor sidecar."""
     source_logprobs = torch.tensor(
         [[-0.1, -0.2]], dtype=torch.float32, requires_grad=True
     )
@@ -234,28 +246,23 @@ def test_write_episode_json_handles_tensor_replay_payload(tmp_path: Path) -> Non
 
     write_episode_json(target_path, episode)
 
-    payload = target_path.read_text(encoding="utf-8")
-    raw_replay = json.loads(payload)["policy_outputs"][0]["replay_data"]
+    artifact, sidecar_path = _read_v2_artifact(target_path)
+    manifest = artifact["episode_manifest"]
+    raw_replay = manifest["policy_outputs"][0]["replay_data"]
     assert isinstance(raw_replay, dict)
     assert isinstance(raw_replay["payload"], dict)
     assert isinstance(raw_replay["payload"]["model_input"], dict)
-    assert isinstance(raw_replay["payload"]["per_traj_logprob"], list)
-    assert "model_input" in payload
-    assert "per_traj_logprob" in payload
-    assert "cot_tensor" in payload
+    assert "__tensor_key__" in raw_replay["payload"]["per_traj_logprob"]
+    assert (
+        "__tensor_key__" in manifest["policy_outputs"][0]["model_extra"]["cot_tensor"]
+    )
+    assert sidecar_path.is_file()
 
 
-def test_disk_round_trip_restores_model_input_uint8_via_from_payload(
+def test_disk_round_trip_preserves_typed_model_input_and_uint8(
     tmp_path: Path,
 ) -> None:
-    """JSON disk drops tensor dtype to lists; ``ModelInput.from_payload`` restores it.
-
-    The disk transport flattens tensor leaves to plain lists (dtype dropped). The
-    trainer recovers the dtypes by calling ``ModelInput.from_payload`` on the read-back
-    payload (the same seam ``get_policy_input`` uses). This pins that round-trip for a
-    non-float field -- uint8 ``camera_frames`` -- which the packer tests obscure by
-    normalizing ``image_frames`` to float32.
-    """
+    """Any-slot dataclasses and non-float tensor dtypes survive disk round-trip."""
     model_input = ModelInput(
         ego_history_xyz=torch.zeros((1, 2, 3), dtype=torch.float32),
         ego_history_rot=torch.eye(3, dtype=torch.float32)
@@ -286,9 +293,8 @@ def test_disk_round_trip_restores_model_input_uint8_via_from_payload(
 
     assert loaded.policy_outputs[0].replay_data is not None
     payload = loaded.policy_outputs[0].replay_data.payload
-    # Disk drops dtype: the tensor leaf comes back as a plain nested list.
-    assert isinstance(payload["model_input"]["camera_frames"], list)
-    restored = ModelInput.from_payload(payload["model_input"])
+    restored = payload["model_input"]
+    assert isinstance(restored, ModelInput)
     assert restored.camera_frames.dtype == torch.uint8
     assert restored.camera_frames.shape == (2, 3, 4, 5)
     assert restored.camera_indices.dtype == torch.int64
@@ -297,7 +303,7 @@ def test_disk_round_trip_restores_model_input_uint8_via_from_payload(
 def test_replay_data_round_trips_as_typed_envelope_with_json_payload(
     tmp_path: Path,
 ) -> None:
-    """`replay_data` reads back typed while payload leaves remain JSON values."""
+    """Replay dataclasses and tensor leaves read back with their original types."""
     model_input = ModelInput(
         ego_history_xyz=torch.zeros((1, 2, 3), dtype=torch.float32),
         ego_history_rot=torch.eye(3, dtype=torch.float32)
@@ -324,6 +330,7 @@ def test_replay_data_round_trips_as_typed_envelope_with_json_payload(
         ),
         model_extra={
             "cot_tensor": torch.tensor([1.0, 2.0]),
+            "valid_mask": torch.tensor([True, False], dtype=torch.bool),
             "cot_ndarray": np.array([3.0, 4.0], dtype=np.float32),
         },
     )
@@ -348,24 +355,31 @@ def test_replay_data_round_trips_as_typed_envelope_with_json_payload(
     assert isinstance(actual_policy.replay_data, PolicyReplayData)
 
     rehydrated_model_input = actual_policy.replay_data.payload["model_input"]
-    assert isinstance(rehydrated_model_input, dict)
-    assert isinstance(rehydrated_model_input["ego_history_xyz"], list)
-    assert rehydrated_model_input["ego_history_xyz"] == [
-        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
-    ]
+    assert isinstance(rehydrated_model_input, ModelInput)
+    assert rehydrated_model_input.camera_frames.dtype == torch.uint8
+    assert rehydrated_model_input.camera_frames.shape == (0, 3, 1, 1)
+    assert torch.equal(
+        rehydrated_model_input.ego_history_xyz,
+        model_input.ego_history_xyz,
+    )
 
     rehydrated_logprob = actual_policy.replay_data.payload["per_traj_logprob"]
-    assert isinstance(rehydrated_logprob, list)
-    assert rehydrated_logprob == [[-0.10000000149011612, -0.20000000298023224]] or (
-        rehydrated_logprob == per_traj_logprob.tolist()
-    )
+    assert isinstance(rehydrated_logprob, torch.Tensor)
+    assert torch.equal(rehydrated_logprob, per_traj_logprob)
 
     assert actual_policy.replay_data.payload["set_ix"] == 0
     assert actual_policy.replay_data.payload["sample_ix"] == 1
 
     assert actual_policy.model_extra is not None
-    assert isinstance(actual_policy.model_extra["cot_tensor"], list)
-    assert actual_policy.model_extra["cot_tensor"] == [1.0, 2.0]
+    assert torch.equal(
+        actual_policy.model_extra["cot_tensor"],
+        torch.tensor([1.0, 2.0]),
+    )
+    assert actual_policy.model_extra["valid_mask"].dtype == torch.bool
+    assert torch.equal(
+        actual_policy.model_extra["valid_mask"],
+        torch.tensor([True, False]),
+    )
     assert isinstance(actual_policy.model_extra["cot_ndarray"], list)
     assert actual_policy.model_extra["cot_ndarray"] == [3.0, 4.0]
 
@@ -401,3 +415,91 @@ def test_rollout_artifact_round_trips_minimal_episode_output(tmp_path: Path) -> 
     assert len(loaded.policy_outputs) == 1
     actual_policy = loaded.policy_outputs[0]
     _assert_policy_output_equal(actual_policy, minimal_policy)
+
+
+def test_read_episode_json_accepts_legacy_plain_json(tmp_path: Path) -> None:
+    """Artifacts written by the original JSON-only transport remain readable."""
+    legacy_artifact = {
+        "scene_id": "legacy_scene",
+        "session_uuid": "legacy_session",
+        "num_steps": 1,
+        "policy_outputs": [
+            {
+                "chosen_xyz": [[0.0, 0.0, 0.0]],
+                "chosen_quat": [[1.0, 0.0, 0.0, 0.0]],
+                "chosen_dt_us": [0],
+                "chosen_logprob": None,
+                "replay_data": None,
+                "all_pred_xyz": None,
+                "all_pred_quat": None,
+                "model_extra": None,
+            }
+        ],
+        "executed_ego_trajectory": [],
+        "route_waypoints": [],
+        "metrics": None,
+        "reward": None,
+        "is_valid": True,
+    }
+    target_path = tmp_path / "legacy.json"
+    target_path.write_text(json.dumps(legacy_artifact), encoding="utf-8")
+
+    loaded = read_episode_json(target_path)
+
+    assert loaded.scene_id == "legacy_scene"
+    assert loaded.session_uuid == "legacy_session"
+    assert loaded.rollout_seed is None
+    assert loaded.policy_outputs[0].chosen_xyz.dtype == torch.float32
+    assert loaded.policy_outputs[0].chosen_dt_us.dtype == torch.int64
+
+
+def test_read_episode_json_rejects_corrupted_tensor_sidecar(tmp_path: Path) -> None:
+    """A byte-level tensor-file mutation is rejected before deserialization."""
+    target_path = tmp_path / "corrupt_tensor.json"
+    write_episode_json(target_path, _make_full_episode_output())
+    _, sidecar_path = _read_v2_artifact(target_path)
+    sidecar_bytes = bytearray(sidecar_path.read_bytes())
+    sidecar_bytes[len(sidecar_bytes) // 2] ^= 0x01
+    sidecar_path.write_bytes(sidecar_bytes)
+
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        read_episode_json(target_path)
+
+
+def test_read_episode_json_rejects_corrupted_manifest(tmp_path: Path) -> None:
+    """A manifest mutation fails its digest instead of producing plausible data."""
+    target_path = tmp_path / "corrupt_manifest.json"
+    write_episode_json(target_path, _make_full_episode_output())
+    artifact, _ = _read_v2_artifact(target_path)
+    artifact["episode_manifest"]["num_steps"] = 99
+    target_path.write_text(json.dumps(artifact), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="manifest SHA-256 mismatch"):
+        read_episode_json(target_path)
+
+
+def test_read_episode_json_rejects_sidecar_path_traversal(tmp_path: Path) -> None:
+    """A sidecar descriptor cannot escape the artifact directory."""
+    target_path = tmp_path / "unsafe_path.json"
+    write_episode_json(target_path, _make_full_episode_output())
+    artifact, _ = _read_v2_artifact(target_path)
+    artifact["tensor_sidecar"]["filename"] = "../outside.tensors.pt"
+    target_path.write_text(json.dumps(artifact), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must be a basename"):
+        read_episode_json(target_path)
+
+
+def test_rewriting_artifact_releases_previous_sidecar(tmp_path: Path) -> None:
+    """Atomic replacement does not leak the superseded tensor sidecar."""
+    target_path = tmp_path / "replace.json"
+    episode = _make_full_episode_output()
+    write_episode_json(target_path, episode)
+    _, previous_sidecar = _read_v2_artifact(target_path)
+
+    write_episode_json(target_path, episode)
+    _, current_sidecar = _read_v2_artifact(target_path)
+
+    assert current_sidecar != previous_sidecar
+    assert current_sidecar.is_file()
+    assert not previous_sidecar.exists()

@@ -1,115 +1,112 @@
-# G1 SceneStore RL on standalone AlpaGym, AlpaSim, and Cosmos-RL
+# G1 visual-policy RL on AlpaGym, AlpaSim, and Cosmos-RL
 
-Handoff for Yuxiao  
-Status date: 2026-08-19
+Status date: 2026-08-20
 
-## Supported scope
+## Ownership
 
-This branch integrates the SceneStore-backed G1 stack without copying AlpaSim into AlpaGym:
+- AlpaGym owns Flow-PPO training, replay, behavior-policy versions, weight
+  publication, and launch topology.
+- AlpaSim owns rollout scheduling, same-shot camera transport, H50
+  motion-reference dispatch, dynamics feedback, and metrics transport.
+- humanoid-rl-joint-sim owns SceneStore resolution, NuRec camera rendering,
+  MuJoCo dynamics, the GRAIL/SONIC controller backend, rewards, and termination.
 
-- AlpaGym owns launch topology, rollout versions, replay packing, PPO, weight publication, and checkpoints.
-- AlpaSim owns RuntimeService scheduling, policy/dynamics sessions, tick joins, and metrics transport.
-- humanoid-rl-joint-sim owns SceneStore resolution, MuJoCo/MJLab dynamics, the VideoMimic observation contract, GRAIL tracking, reward profiles, and termination.
+The currently qualified development topology is one GPU, colocated, and one
+humanoid environment. Distributed asynchronous placement is not yet qualified.
 
-The qualified deployment shape is one-GPU colocated mode with one humanoid environment. Distributed asynchronous placement and vectorized humanoid lanes remain unsupported and fail closed in host validation.
+## Policy/controller boundary
 
-NuRec RGB is outside this RL loop. Direct VideoMimic uses the simulator state and raycast heightmap. The motion-reference path uses realized MuJoCo state and the frozen GRAIL controller's terrain observations.
+`g1_wenhao_vla` consumes one receipt-checked D455 frame and the image-paired
+robot state. The policy samples a one-second `30 x 38` Flow-SDE action chunk at
+30 Hz. A deterministic adapter resamples it into
+`g1_motion_reference_29d_50hz_h50.v1`:
 
-## Repository layout
+- frames 0..49 are policy targets at 50 Hz;
+- frame 0 remains a policy target and is not overwritten by live joint state;
+- at source cursor 25 (0.5 seconds), AlpaSim launches one asynchronous request
+  for the next policy sample;
+- the active H50 is not truncated at that trigger: dynamics may continue it
+  across requests;
+- after the H50 is exhausted, the backend repeats its terminal pose with zero
+  joint velocity until a new plan arrives;
+- a new H50 replaces the active buffer atomically, with no crossfade.
+- if a late replacement is already at or beyond cursor 25, it executes one
+  source tick before the next policy snapshot; continuing predecessor-only
+  feedback is rejected.
 
-Use the matching thomast/humanoid-alpagym-integration branches of:
+The fixed 25 ticks are therefore a nominal replan/transport interval, not a
+fake-plan horizon and not a controller-buffer lifetime. There is no shadow
+rollout, completion policy, native chunk RPC, LowCmd transport, or
+AlpaGym-owned SONIC process supervisor.
 
-- humanoid-rl-joint-sim
-- alpasim
-- standalone NVlabs/alpagym
+The motion-reference runner keeps exactly one policy request in flight. It
+freezes the request's image/state observation, advances the already-active H50
+one SONIC tick per zero-update dynamics call, and installs the returned H50 once
+at the source-time cursor implied by the delay. Repeated calls to the policy are
+not used as a polling mechanism: each call remains one model sample and one
+replay identity. This is simulation-time asynchronous overlap, not wall-clock
+pacing; realized overlap ticks reflect the relative policy/dynamics service
+throughput.
 
-AlpaGym remains a normal standalone repository. For a local unpublished AlpaSim humanoid ABI, set ALPASIM_GRPC_ROOT to that checkout explicitly. A configured but missing path is an error.
+## Flow PPO
 
-## Canonical policy/controller boundary
+The raw stochastic action is always the `30 x 38` Flow sample. H50 is a derived
+controller representation, never a second policy action. Replay stores the
+selected denoise transition, element log-probabilities, rollout value,
+D455/BATS condition, raw action, and realized controller feedback. All 1,140
+element log-probabilities are summed into one joint chunk density before PPO
+forms its ratio.
 
-The supported planner preset is g1_videomimic_planner_hq_stairs_current_policy. It emits the g1_motion_reference_29d_50hz_h70.v1 wire schema:
+RTC hard-prefix sampling and replay are implemented: fixed prefix elements
+remain unchanged and contribute zero Gaussian density. The policy derives its
+delay history from realized mixed-reference feedback, records the exact prefix
+and mask, and replay checks the source/applied reference receipts and action
+indices before training.
 
-- one boundary pose plus 69 autoregressive VideoMimic actions at 20 ms;
-- a 70-frame reference consumed by unchanged GRAIL/SONIC tracking;
-- a fixed K25 execution window, so the outer planner rate is 2 Hz;
-- 60 macro decisions, 1,500 controller ticks, and 30 seconds per episode.
+The Wenhao configuration uses asymmetric clipping 0.2/0.28, dual clip 3.0,
+value-loss coefficient 1.0, value clip 0.2, Huber delta 10.0, normalized
+advantages, gamma 0.99, lambda 0.95, and no KL penalty. The trainer is
+`alpagym_flow_ppo`; Gaussian PPO and GRPO are not substitutes. The action head
+and critic use separate AdamW learning rates of `5e-6` and `1e-4`, with epsilon
+`1e-8`, betas `(0.9, 0.999)`, weight decay `0.01`, and gradient clipping at
+`1.0`.
 
-At each real macro-boundary observation, the same current actor generates all 69 actions while a private MuJoCo state advances autoregressively. In the qualified colocated mode, rollout generation and weight publication are synchronous, and the policy captures the live model once for the complete H70 plan. The old fake-planner behavior—one current-policy action followed by a separately loaded frozen V9 completion actor—is not supported.
+Primitive rewards from one realized controller interval are deliberately
+summed without intra-interval discount. The nominal duration is 25 ticks;
+variable-duration bootstrap discount is `gamma ** (duration_ticks / 25)`,
+while GAE lambda is applied once per sampled policy decision. This is the
+chosen undiscounted macro-sum objective, not standard discounted intra-option
+SMDP accumulation; changing it requires separate qualification.
 
-Replay, the AlpaSim response, the episode artifact, and Cosmos must all agree on the behavior-policy version. Session-scoped immutable model leases are reserved for a future disaggregated mode; host validation rejects that mode until its asynchronous weight synchronization is qualified end to end.
+If termination or the outer horizon occurs while a replan is still in flight,
+AlpaSim waits for that single RPC before FINALIZE so its replay row is not lost.
+A predecessor-only interval marks the newly sampled action `actor_valid=false`:
+its reward and boundary value remain in SMDP GAE/value training, but PPO actor,
+KL, ratio, and clip diagnostics exclude it because the new reference never
+reached the controller.
 
-H70 provides the complete look-ahead required by GRAIL. With K25 execution, the controller can consume through reference frame 69. There is no repeated-action fill, terminal-hold padding, or completion-policy path.
+## Integrity checks
 
-## Replay and PPO
+The stack rejects mismatched behavior-policy versions, SceneStore fingerprints,
+camera render receipts, observation decision IDs, reference identities,
+non-contiguous 20 ms controller ticks, and malformed feedback. The camera used
+by the policy must be a zero-shutter frame rendered from the same qpos as its
+observation.
 
-Replay stores all 69 shadow observations, raw sampled actions, applied clip(action, -8, 8) actions, and per-token old log probabilities. Their sum must equal the scalar audit log probability.
+Formal execution accepts only H50. Historical H70 helpers may still exist in
+standalone VideoMimic tooling, but they are not selectable by the AlpaGym /
+AlpaSim Wenhao path.
 
-The physical plant commits a realized prefix K in [1, 25]. Replay retains:
+## Local run
 
-- all K primitive rewards in temporal order;
-- duration_ticks=K and a matching contiguous reward mask;
-- termination/truncation facts and final realized state;
-- a critic-only bootstrap value for truncation.
+Use the `g1_wenhao_vla_hq_stairs_local_1gpu` experiment and provide:
 
-Termination bootstraps with zero. Truncation evaluates the critic without sampling an action, advancing planner RNG, or creating another reference.
+- the Wenhao model root;
+- the AlpaSim and humanoid repository paths;
+- SceneStore and GRAIL paths.
 
-For an early terminal prefix, the causal action-token count is 44 + K. A full K25 transition credits all 69 action tokens. PPO clips each token likelihood ratio independently and averages only over valid causal tokens; it does not exponentiate a summed 69-action log ratio or duplicate one macro reward into 69 transitions.
+The lockfile installs the matching humanoid camera ABI from the exact AlpaSim
+revision. Set `ALPASIM_GRPC_ROOT` only while developing uncommitted gRPC changes
+in a local AlpaSim checkout.
 
-Semi-Markov GAE interprets gamma and lambda per 50 Hz controller tick. For duration d, the transition reward is sum_i gamma^i r_i, the bootstrap factor is gamma^d, and the GAE continuation factor is (gamma * lambda)^d.
-
-The canonical configuration uses reference_route_centered.v3, gamma=0.99, lambda=0.95, action standard-deviation bounds [0.05, 0.15], and a fixed initial-policy KL reference. These are the maintained defaults, not an experimental recipe matrix.
-
-## Checkpoint and provenance contract
-
-Run preparation snapshots the supplied planner bundle and records its immutable identity. The raw V9 export records source-checkpoint identity, deterministic actor parity, critic initialization identity, and actor lineage.
-
-Current-policy H70 training requires checkpointing on every applied update. Each checkpoint contains:
-
-- Cosmos model, optimizer, scheduler, and data-position state;
-- a policy-native config.json plus model.safetensors export;
-- actor update lineage linked to the parent actor and source attestation.
-
-Resume fails closed when checkpoint lineage, actor-state identity, or checkpoint step disagree. Evaluation and training must load the policy-native exported bundle rather than infer weights from an unrelated path.
-
-## Runtime integrity checks
-
-The stack rejects:
-
-- missing or mixed behavior-policy versions;
-- mismatched reset, environment, step, timestamp, or transition metrics;
-- missing truncation bootstrap values;
-- a non-K25 motion-reference control timestep;
-- H70 references whose applied hash differs from the emitted reference;
-- raw Wizard overrides of host-owned runtime/controller settings;
-- SceneStore identity or fingerprint drift.
-
-Padding rows retain the correct behavior version and remain masked. They are fixed-shape transport rows, not transitions.
-
-## Local colocated run
-
-First export a planner bundle from the raw VideoMimic V9 checkpoint:
-
-    UV_NO_SYNC=1 .venv/bin/python \
-      packages/policies/g1_videomimic_planner/scripts/export_v9_planner_checkpoint.py \
-      --source-checkpoint /absolute/path/to/ppo_ft_best_v9_raw.pt \
-      --output-dir /tmp/g1_videomimic_current_h70 \
-      --critic-seed 0
-
-Then launch the canonical preset:
-
-    CUDA_VISIBLE_DEVICES=0 UV_NO_SYNC=1 .venv/bin/python -m alpagym_host.cli \
-      experiment=g1_videomimic_planner_hq_stairs_current_policy \
-      policy.model.path=/tmp/g1_videomimic_current_h70 \
-      alpasim.repo_path=/absolute/path/to/alpasim \
-      alpasim.humanoid.repo_path=/absolute/path/to/humanoid-rl-joint-sim \
-      alpasim.humanoid.scene_store_path=/absolute/path/to/scene_store \
-      alpasim.humanoid.grail_root_path=/absolute/path/to/GRAIL \
-      run_root=/tmp/alpagym-humanoid-runs
-
-For more than one rollout per update, change cosmos.rollout.n_generation, cosmos.train.train_batch_per_replica, and step_mini_batch together. One 30-second episode contributes 60 valid macro transitions.
-
-## Qualification boundary
-
-The retained tests establish the current-actor H70 plan, K25 controller receipt, token replay geometry, pure critic bootstrap, behavior-version agreement, checkpoint cadence, actor/full-model lineage, and policy-native export. They do not establish convergence, model improvement, multi-node throughput, or VLA-from-RGB training.
-
-Assets remain external: the raw VideoMimic checkpoint, exported planner bundle, GRAIL checkout, SceneStore, and matching AlpaSim humanoid ABI are not embedded in AlpaGym.
+Assets remain external and are not embedded in AlpaGym.

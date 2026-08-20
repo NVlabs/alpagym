@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import logging
 import math
 import os
@@ -18,7 +20,11 @@ from typing import Callable, Iterable, Mapping, Protocol, runtime_checkable
 
 import grpc
 import torch
-from alpagym_runtime.alpasim.grpc_import import ensure_alpasim_grpc_source
+from PIL import Image, UnidentifiedImageError
+from alpagym_runtime.alpasim.grpc_import import (
+    ensure_alpasim_grpc_source,
+    ensure_humanoid_policy_camera_abi,
+)
 
 ensure_alpasim_grpc_source()
 from alpagym_host.endpoint_registry import TopologyEndpoint
@@ -58,7 +64,7 @@ from alpagym_runtime.types import PolicyOutput
 logger = logging.getLogger(__name__)
 
 _LOWERCASE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_MOTION_REFERENCE_SCHEMA_H70 = "g1_motion_reference_29d_50hz_h70.v1"
+_MOTION_REFERENCE_SCHEMA_H50 = "g1_motion_reference_29d_50hz_h50.v1"
 MOTION_REFERENCE_JOINT_NAMES = (
     "left_hip_pitch_joint",
     "right_hip_pitch_joint",
@@ -93,6 +99,70 @@ MOTION_REFERENCE_JOINT_NAMES = (
 
 
 @dataclass(frozen=True)
+class HumanoidCameraFrame:
+    """One immutable camera frame routed to its matching humanoid env lane."""
+
+    env_id: int
+    frame_start_us: int
+    frame_end_us: int
+    logical_id: str
+    image_bytes: bytes
+    render_timestamp_us: int
+    observation_decision_id: int
+    render_qpos: tuple[float, ...]
+    render_state_sha256: str
+    camera_contract_sha256: str
+    image_sha256: str
+    render_receipt_sha256: str
+
+    @property
+    def policy_joint_position(self) -> tuple[float, ...]:
+        """Return the image-paired 29-D joint state, never a later live state."""
+        if len(self.render_qpos) != 36:
+            raise ValueError("camera frame does not carry a 36-D G1 render_qpos")
+        return self.render_qpos[7:]
+
+
+@dataclass(frozen=True)
+class HumanoidCameraFrameIdentity:
+    """Compact audit identity for a camera frame; never contains pixels/qpos."""
+
+    env_id: int
+    frame_start_us: int
+    frame_end_us: int
+    logical_id: str
+    byte_length: int
+    sha256: str
+    render_timestamp_us: int
+    observation_decision_id: int
+    render_state_sha256: str
+    camera_contract_sha256: str
+    image_sha256: str
+    render_receipt_sha256: str
+
+
+@dataclass(frozen=True)
+class HumanoidPolicyCameraContract:
+    """Immutable session contract for policy-visible humanoid RGB."""
+
+    schema: str
+    logical_id: str
+    width: int
+    height: int
+    image_format: str
+    max_frame_age_us: int
+    contract_sha256: str
+
+
+@dataclass(frozen=True)
+class _HumanoidCameraRouting:
+    """Policy-visible and all-packet views of one camera observation."""
+
+    policy_frames_by_env: dict[int, tuple[HumanoidCameraFrame, ...]]
+    all_frames_by_env: dict[int, tuple[HumanoidCameraFrame, ...]]
+
+
+@dataclass(frozen=True)
 class HumanoidPolicyInput:
     """One humanoid env-lane observation delivered to a policy."""
 
@@ -105,6 +175,8 @@ class HumanoidPolicyInput:
     qvel: torch.Tensor
     observation: torch.Tensor
     scalars: Mapping[str, float]
+    camera_frames: tuple[HumanoidCameraFrame, ...] = ()
+    camera_frame_identities: tuple[HumanoidCameraFrameIdentity, ...] = ()
     decision_id: int = 0
     feedback_trace: HumanoidRealizedFeedbackTrace | None = None
     bootstrap_requested: bool = False
@@ -143,7 +215,7 @@ class HumanoidRealizedFeedbackTrace:
 
 @dataclass(frozen=True)
 class HumanoidMotionReferenceFrame:
-    """One 50 Hz frame in a planner-produced motion reference."""
+    """One 50 Hz frame in a policy-produced motion reference."""
 
     timestamp_us: int
     joint_position: torch.Tensor
@@ -223,7 +295,9 @@ class _Session:
     action_size: int
     observation_schema: str
     observation_terms: tuple[tuple[str, int], ...]
+    joint_names: tuple[str, ...]
     execution_mode: int
+    policy_camera_contract: HumanoidPolicyCameraContract | None = None
     reference_joint_names: tuple[str, ...] = ()
     reference_frame_count: int = 0
     reference_sample_period_us: int = 0
@@ -251,8 +325,10 @@ class _Session:
     def attach_feedback_traces(
         self,
         traces: Mapping[int, HumanoidRealizedFeedbackTrace],
+        *,
+        outer_truncated_env_ids: frozenset[int],
     ) -> None:
-        """Join next-request controller receipts to their source plan rows."""
+        """Join realized async controller intervals to their policy samples."""
         if not traces:
             return
         with self.lock:
@@ -279,36 +355,119 @@ class _Session:
                 if "feedback_trace" in payload:
                     raise ValueError("source plan already has a feedback trace")
                 reference_id = int(payload.get("reference_id", -1))
-                reference_sha256 = str(payload.get("reference_sha256", ""))
+                reference_sha256 = _require_lowercase_sha256(
+                    "source plan reference_sha256",
+                    payload.get("reference_sha256", ""),
+                )
                 root_z_offset = float(
                     payload.get("root_z_alignment_offset_m", math.nan)
                 )
+                source_timestamp_us = int(output.chosen_dt_us[0].item())
+
+                predecessor: PolicyOutput | None = None
+                for index in reversed(range(match_index)):
+                    extra = self.outputs[index].model_extra or {}
+                    if int(extra.get("humanoid_env_id", -1)) == env_id:
+                        predecessor = self.outputs[index]
+                        break
+                predecessor_identity: tuple[int, str, float, int] | None = None
+                if predecessor is not None:
+                    if predecessor.replay_data is None:
+                        raise ValueError("predecessor plan has no replay payload")
+                    predecessor_payload = predecessor.replay_data.payload
+                    predecessor_identity = (
+                        int(predecessor_payload.get("reference_id", -1)),
+                        _require_lowercase_sha256(
+                            "predecessor plan reference_sha256",
+                            predecessor_payload.get("reference_sha256", ""),
+                        ),
+                        float(
+                            predecessor_payload.get(
+                                "root_z_alignment_offset_m", math.nan
+                            )
+                        ),
+                        int(predecessor.chosen_dt_us[0].item()),
+                    )
+
+                seen_source = False
+                active_segment: str | None = None
+                applied_sha256_by_segment: dict[str, str] = {}
                 for tick in trace.ticks:
-                    if tick.active_reference_id != reference_id:
-                        raise ValueError(
-                            "feedback active_reference_id does not match source plan"
-                        )
-                    if tick.active_reference_sha256 != reference_sha256:
-                        raise ValueError(
-                            "feedback active_reference_sha256 does not match source plan"
-                        )
-                    if (
-                        self.reference_frame_count == 70
-                        and tick.applied_reference_sha256 != reference_sha256
+                    active_identity = (
+                        tick.active_reference_id,
+                        tick.active_reference_sha256,
+                    )
+                    if active_identity == (reference_id, reference_sha256):
+                        segment = "source"
+                        expected_root_z_offset = root_z_offset
+                        segment_timestamp_us = source_timestamp_us
+                        seen_source = True
+                    elif (
+                        predecessor_identity is not None
+                        and active_identity == predecessor_identity[:2]
                     ):
+                        if seen_source:
+                            raise ValueError(
+                                "feedback reference sequence reversed from source "
+                                "to predecessor"
+                            )
+                        segment = "predecessor"
+                        expected_root_z_offset = predecessor_identity[2]
+                        segment_timestamp_us = predecessor_identity[3]
+                    else:
                         raise ValueError(
-                            "H70 feedback applied_reference_sha256 does not match "
-                            "the unmodified source plan"
+                            "feedback contains a third or unknown active reference"
                         )
+                    if active_segment is not None and segment != active_segment:
+                        if active_segment != "predecessor" or segment != "source":
+                            raise ValueError(
+                                "feedback reference sequence must be predecessor then source"
+                            )
+                    active_segment = segment
                     if not math.isclose(
                         tick.root_z_alignment_offset_m,
-                        root_z_offset,
+                        expected_root_z_offset,
                         rel_tol=0.0,
                         abs_tol=1.0e-6,
                     ):
                         raise ValueError(
-                            "feedback root_z_alignment_offset_m does not match source plan"
+                            "feedback root_z_alignment_offset_m does not match its "
+                            "active plan"
                         )
+                    action_timestamp_us = (
+                        tick.timestamp_us - self.reference_sample_period_us
+                    )
+                    delta_us = action_timestamp_us - segment_timestamp_us
+                    if delta_us < 0 or delta_us % self.reference_sample_period_us:
+                        raise ValueError(
+                            "feedback reference_action_index is off the source time grid"
+                        )
+                    expected_action_index = min(
+                        delta_us // self.reference_sample_period_us,
+                        self.reference_frame_count - 1,
+                    )
+                    if tick.reference_action_index != expected_action_index:
+                        raise ValueError(
+                            "feedback reference_action_index does not match its "
+                            "active plan timestamp"
+                        )
+                    previous_applied_sha256 = applied_sha256_by_segment.setdefault(
+                        segment, tick.applied_reference_sha256
+                    )
+                    if tick.applied_reference_sha256 != previous_applied_sha256:
+                        raise ValueError(
+                            "feedback applied_reference_sha256 changed within an "
+                            "active-reference segment"
+                        )
+                if not seen_source and not (
+                    trace.ticks[-1].terminated
+                    or trace.ticks[-1].truncated
+                    or env_id in outer_truncated_env_ids
+                ):
+                    raise ValueError(
+                        "a predecessor-only feedback interval must end in "
+                        "termination or truncation"
+                    )
                 payload["feedback_trace"] = _feedback_trace_payload(trace)
                 self.outputs[match_index] = replace(
                     output,
@@ -463,9 +622,14 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
         self,
         policy_factory: Callable[[str, HumanoidPolicySessionRequest], HumanoidPolicy],
         model_lease_registry: SessionModelLeaseRegistry | None = None,
+        *,
+        require_policy_camera: bool = False,
     ) -> None:
+        if require_policy_camera:
+            ensure_humanoid_policy_camera_abi()
         self._policy_factory = policy_factory
         self._model_lease_registry = model_lease_registry
+        self._require_policy_camera = require_policy_camera
         self._sessions: dict[str, _Session] = {}
         self._sessions_lock = threading.Lock()
         self._session_records: dict[str, HumanoidSessionRecord] = {}
@@ -538,6 +702,30 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
                         reference_sample_period_us,
                         control_ticks_per_policy_step,
                     ) = _validate_motion_reference_session(request)
+                else:
+                    if _message_has_fields(getattr(request, "reference_spec", None)):
+                        raise ValueError(
+                            "direct-action session must not contain a motion reference spec"
+                        )
+                joint_names = tuple(
+                    str(name) for name in getattr(request, "joint_names", ())
+                )
+                policy_camera_contract = _policy_camera_contract(request)
+                if self._require_policy_camera and policy_camera_contract is None:
+                    raise ValueError(
+                        "strict policy-camera server requires a non-empty "
+                        "policy_camera_spec on every session"
+                    )
+                if policy_camera_contract is not None:
+                    ensure_humanoid_policy_camera_abi()
+                if policy_camera_contract is not None and (
+                    len(joint_names) != 29
+                    or len(set(joint_names)) != 29
+                    or any(not name for name in joint_names)
+                ):
+                    raise ValueError(
+                        "policy camera session requires 29 unique non-empty joint_names"
+                    )
                 policy = self._policy_factory(session_uuid, request)
                 save_camera_dir = _session_save_camera_dir(session_uuid, request)
                 session = _Session(
@@ -548,7 +736,9 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
                         (str(term.name), int(term.size))
                         for term in request.observation_terms
                     ),
+                    joint_names=joint_names,
                     execution_mode=execution_mode,
+                    policy_camera_contract=policy_camera_contract,
                     reference_joint_names=reference_joint_names,
                     reference_frame_count=reference_frame_count,
                     reference_sample_period_us=reference_sample_period_us,
@@ -583,7 +773,24 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
         session_uuid = str(request.session_uuid)
         with self._sessions_lock:
             session = self._sessions[session_uuid]
-        _save_camera_images(request.observation.camera_images, session.save_camera_dir)
+        states = tuple(request.observation.env_states)
+        decision_id = int(request.observation.decision_id)
+        camera_routing = _route_camera_frames(
+            states=states,
+            camera_images=request.observation.camera_images,
+            observation_timestamp_us=int(request.observation.timestamp_us),
+            observation_decision_id=decision_id,
+            joint_names=session.joint_names,
+            policy_camera_contract=session.policy_camera_contract,
+        )
+        _save_camera_images(
+            (
+                frame
+                for state in states
+                for frame in camera_routing.all_frames_by_env[int(state.env_id)]
+            ),
+            session.save_camera_dir,
+        )
         bootstrap_only = bool(request.bootstrap_only)
         request_kind = int(getattr(request, "request_kind", 0))
         is_finalize = (
@@ -595,7 +802,6 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
             if bootstrap_only or is_finalize
             else session.consume_step_index()
         )
-        decision_id = int(getattr(request.observation, "decision_id", 0))
         _validate_policy_request_kind(
             session=session,
             request_kind=request_kind,
@@ -607,12 +813,15 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
             session=session,
             step_index=step_index,
         )
-        session.attach_feedback_traces(feedback_traces)
         bootstrap_env_ids = frozenset(
             int(env_id) for env_id in request.bootstrap_env_ids
         )
         if len(bootstrap_env_ids) != len(tuple(request.bootstrap_env_ids)):
             raise ValueError("humanoid bootstrap_env_ids contains duplicates")
+        session.attach_feedback_traces(
+            feedback_traces,
+            outer_truncated_env_ids=(bootstrap_env_ids if is_finalize else frozenset()),
+        )
         if is_finalize:
             session.mark_outer_truncated(bootstrap_env_ids)
         policy_inputs = tuple(
@@ -625,8 +834,13 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
                 decision_id=decision_id,
                 feedback_trace=feedback_traces.get(int(state.env_id)),
                 bootstrap_requested=int(state.env_id) in bootstrap_env_ids,
+                camera_frames=camera_routing.policy_frames_by_env[int(state.env_id)],
+                camera_frame_identities=tuple(
+                    _camera_frame_identity(frame)
+                    for frame in camera_routing.all_frames_by_env[int(state.env_id)]
+                ),
             )
-            for state in request.observation.env_states
+            for state in states
         )
         policy_outputs = session.policy.step(
             policy_inputs,
@@ -736,8 +950,10 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
         del context
         session_uuid = str(request.session_uuid)
         with self._sessions_lock:
-            session = self._sessions.pop(session_uuid)
-            self._session_records[session_uuid] = session.get_record()
+            session = self._sessions[session_uuid]
+            record = session.get_record()
+            self._sessions.pop(session_uuid)
+            self._session_records[session_uuid] = record
         try:
             session.policy.close()
         finally:
@@ -792,6 +1008,7 @@ class HumanoidPolicyServer:
         policy_factory: Callable[[str, HumanoidPolicySessionRequest], HumanoidPolicy],
         publish_host: str = "localhost",
         model_lease_registry: SessionModelLeaseRegistry | None = None,
+        require_policy_camera: bool = False,
     ) -> None:
         self.name = name
         self.max_concurrent_rollouts = max_concurrent_rollouts
@@ -800,6 +1017,7 @@ class HumanoidPolicyServer:
         self._servicer = HumanoidPolicyGrpcServicer(
             policy_factory=policy_factory,
             model_lease_registry=model_lease_registry,
+            require_policy_camera=require_policy_camera,
         )
         self._grpc_server = grpc.server(
             futures.ThreadPoolExecutor(max_workers=2 * max_concurrent_rollouts + 2)
@@ -859,24 +1077,358 @@ def _image_suffix(image_bytes: bytes) -> str:
     return ".bin"
 
 
-def _save_camera_images(
+def _encoded_image_size(
+    image_bytes: bytes,
+    image_format: str,
+    *,
+    expected_size: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    """Fully decode and validate one policy-visible RGB image."""
+    expected_format = {"jpeg": "JPEG", "png": "PNG"}[image_format]
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            if image.format != expected_format:
+                raise ValueError(
+                    "policy camera encoded format does not match its session spec"
+                )
+            if image.mode != "RGB":
+                raise ValueError("policy camera image must be HWC uint8 RGB")
+            size = tuple(int(value) for value in image.size)
+            if expected_size is not None and size != expected_size:
+                raise ValueError(
+                    "policy camera encoded raster does not match its session spec"
+                )
+            image.verify()
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image.load()
+            if image.format != expected_format or image.mode != "RGB":
+                raise ValueError("policy camera decoded image contract changed")
+            if tuple(int(value) for value in image.size) != size:
+                raise ValueError("policy camera decoded raster size changed")
+    except (OSError, SyntaxError, UnidentifiedImageError) as exc:
+        raise ValueError("policy camera image cannot be fully decoded") from exc
+    return size
+
+
+def _policy_camera_contract(
+    request: HumanoidPolicySessionRequest,
+) -> HumanoidPolicyCameraContract | None:
+    """Parse the optional strict policy-camera session contract."""
+    raw = getattr(request, "policy_camera_spec", None)
+    if raw is None:
+        return None
+    schema = str(raw.schema)
+    logical_id = str(raw.logical_id)
+    width = int(raw.width)
+    height = int(raw.height)
+    image_format = str(raw.image_format)
+    max_frame_age_us = int(raw.max_frame_age_us)
+    contract_sha256 = str(raw.contract_sha256)
+    if not any(
+        (
+            schema,
+            logical_id,
+            width,
+            height,
+            image_format,
+            max_frame_age_us,
+            contract_sha256,
+        )
+    ):
+        return None
+    if schema != "humanoid_policy_camera_rgb_qpos.v1":
+        raise ValueError("unsupported humanoid policy camera schema")
+    if not logical_id.strip() or width <= 0 or height <= 0:
+        raise ValueError(
+            "policy camera requires a logical_id and positive width/height"
+        )
+    if image_format not in {"jpeg", "png"}:
+        raise ValueError("policy camera image_format must be 'jpeg' or 'png'")
+    if max_frame_age_us < 0:
+        raise ValueError("policy camera max_frame_age_us must be non-negative")
+    contract_sha256 = _require_lowercase_sha256(
+        "policy camera contract_sha256", contract_sha256
+    )
+    return HumanoidPolicyCameraContract(
+        schema=schema,
+        logical_id=logical_id,
+        width=width,
+        height=height,
+        image_format=image_format,
+        max_frame_age_us=max_frame_age_us,
+        contract_sha256=contract_sha256,
+    )
+
+
+def _route_camera_frames(
+    *,
+    states: Iterable[HumanoidEnvState],
     camera_images: Iterable[object],
+    observation_timestamp_us: int,
+    observation_decision_id: int,
+    joint_names: tuple[str, ...],
+    policy_camera_contract: HumanoidPolicyCameraContract | None,
+) -> _HumanoidCameraRouting:
+    """Validate all packets and select the strict policy camera per env lane."""
+    states = tuple(states)
+    state_by_env = {int(state.env_id): state for state in states}
+    env_ids = tuple(int(state.env_id) for state in states)
+    if len(set(env_ids)) != len(env_ids):
+        raise ValueError("humanoid observation contains duplicate env_ids")
+    grouped: dict[int, list[HumanoidCameraFrame]] = {env_id: [] for env_id in env_ids}
+    identities: set[tuple[int, str, int, int]] = set()
+    for image in camera_images:
+        env_id = int(image.env_id)
+        if env_id not in grouped:
+            raise ValueError(f"humanoid camera frame targets unknown env_id={env_id}")
+        frame_start_us = int(image.frame_start_us)
+        frame_end_us = int(image.frame_end_us)
+        if frame_start_us < 0 or frame_end_us < frame_start_us:
+            raise ValueError(
+                "humanoid camera frame timestamps must define a non-negative interval"
+            )
+        if frame_end_us > int(state_by_env[env_id].timestamp_us):
+            raise ValueError(
+                "humanoid camera frame_end_us must not exceed its env state timestamp"
+            )
+        logical_id = str(image.logical_id)
+        if not logical_id.strip():
+            raise ValueError("humanoid camera frame logical_id must be non-empty")
+        identity = (env_id, logical_id, frame_start_us, frame_end_us)
+        if identity in identities:
+            raise ValueError("humanoid observation contains a duplicate camera frame")
+        identities.add(identity)
+        image_bytes = bytes(image.image_bytes)
+        if not image_bytes:
+            raise ValueError("humanoid camera frame image_bytes must be non-empty")
+        render_qpos = tuple(float(value) for value in getattr(image, "render_qpos", ()))
+        if any(not math.isfinite(value) for value in render_qpos):
+            raise ValueError("humanoid camera render_qpos must be finite")
+        frame = HumanoidCameraFrame(
+            env_id=env_id,
+            frame_start_us=frame_start_us,
+            frame_end_us=frame_end_us,
+            logical_id=logical_id,
+            image_bytes=image_bytes,
+            render_timestamp_us=int(getattr(image, "render_timestamp_us", 0)),
+            observation_decision_id=int(getattr(image, "observation_decision_id", 0)),
+            render_qpos=render_qpos,
+            render_state_sha256=str(getattr(image, "render_state_sha256", "")),
+            camera_contract_sha256=str(getattr(image, "camera_contract_sha256", "")),
+            image_sha256=str(getattr(image, "image_sha256", "")),
+            render_receipt_sha256=str(getattr(image, "render_receipt_sha256", "")),
+        )
+        if (
+            policy_camera_contract is not None
+            and frame.logical_id == policy_camera_contract.logical_id
+        ):
+            encoded_size = _encoded_image_size(
+                frame.image_bytes,
+                policy_camera_contract.image_format,
+                expected_size=(
+                    policy_camera_contract.width,
+                    policy_camera_contract.height,
+                ),
+            )
+            if encoded_size != (
+                policy_camera_contract.width,
+                policy_camera_contract.height,
+            ):
+                raise ValueError(
+                    "policy camera encoded raster does not match its session spec"
+                )
+            if not (
+                frame.frame_start_us == frame.frame_end_us == frame.render_timestamp_us
+            ):
+                raise ValueError(
+                    "policy camera requires zero-shutter frame_start_us == "
+                    "frame_end_us == render_timestamp_us"
+                )
+            if frame.render_timestamp_us > observation_timestamp_us:
+                raise ValueError("policy camera frame is newer than its observation")
+            if (
+                observation_timestamp_us - frame.render_timestamp_us
+                > policy_camera_contract.max_frame_age_us
+            ):
+                raise ValueError("policy camera frame exceeds max_frame_age_us")
+            if frame.observation_decision_id != observation_decision_id:
+                raise ValueError("policy camera observation_decision_id does not match")
+            state = state_by_env[env_id]
+            if frame.render_timestamp_us != int(state.timestamp_us):
+                raise ValueError(
+                    "policy camera render timestamp does not match its captured state"
+                )
+            if len(frame.render_qpos) != 36 or len(joint_names) != 29:
+                raise ValueError(
+                    "policy camera requires 36-D render_qpos in session joint order"
+                )
+            state_qpos = tuple(float(value) for value in state.qpos)
+            if frame.render_qpos != state_qpos:
+                raise ValueError(
+                    "policy camera render_qpos does not match its captured state"
+                )
+            if frame.camera_contract_sha256 != policy_camera_contract.contract_sha256:
+                raise ValueError("policy camera contract identity changed")
+            _require_lowercase_sha256(
+                "policy camera render_state_sha256", frame.render_state_sha256
+            )
+            _require_lowercase_sha256("policy camera image_sha256", frame.image_sha256)
+            _require_lowercase_sha256(
+                "policy camera render_receipt_sha256",
+                frame.render_receipt_sha256,
+            )
+            from alpasim_grpc.v0.humanoid_contracts import (
+                HUMANOID_RENDER_STATE_SCHEMA,
+                HumanoidRenderState,
+                humanoid_image_sha256,
+                humanoid_render_receipt_sha256,
+            )
+
+            render_state = HumanoidRenderState(
+                schema=HUMANOID_RENDER_STATE_SCHEMA,
+                env_id=frame.env_id,
+                timestamp_us=frame.render_timestamp_us,
+                observation_decision_id=frame.observation_decision_id,
+                camera_logical_id=frame.logical_id,
+                joint_names=joint_names,
+                qpos=frame.render_qpos,
+                camera_contract_sha256=frame.camera_contract_sha256,
+            )
+            if frame.render_state_sha256 != render_state.canonical_sha256():
+                raise ValueError("policy camera render-state receipt is invalid")
+            if frame.image_sha256 != humanoid_image_sha256(frame.image_bytes):
+                raise ValueError("policy camera encoded-image receipt is invalid")
+            expected_render_receipt = humanoid_render_receipt_sha256(
+                render_state_sha256=frame.render_state_sha256,
+                camera_contract_sha256=frame.camera_contract_sha256,
+                image_sha256=frame.image_sha256,
+                image_format=policy_camera_contract.image_format,
+                width=policy_camera_contract.width,
+                height=policy_camera_contract.height,
+            )
+            if frame.render_receipt_sha256 != expected_render_receipt:
+                raise ValueError("policy camera combined render receipt is invalid")
+        grouped[env_id].append(frame)
+    all_frames_by_env = {
+        env_id: tuple(
+            sorted(
+                frames,
+                key=lambda frame: (
+                    frame.frame_end_us,
+                    frame.logical_id,
+                    frame.frame_start_us,
+                ),
+            )
+        )
+        for env_id, frames in grouped.items()
+    }
+    if policy_camera_contract is not None:
+        policy_frames_by_env = {
+            env_id: tuple(
+                frame
+                for frame in frames
+                if frame.logical_id == policy_camera_contract.logical_id
+            )
+            for env_id, frames in all_frames_by_env.items()
+        }
+        missing_or_repeated = {
+            env_id: len(frames)
+            for env_id, frames in policy_frames_by_env.items()
+            if len(frames) != 1
+        }
+        if missing_or_repeated:
+            raise ValueError(
+                "policy camera requires exactly one current frame per env lane; "
+                f"counts={missing_or_repeated}"
+            )
+    else:
+        policy_frames_by_env = all_frames_by_env
+    return _HumanoidCameraRouting(
+        policy_frames_by_env=policy_frames_by_env,
+        all_frames_by_env=all_frames_by_env,
+    )
+
+
+def _camera_frames_by_env(
+    *,
+    states: Iterable[HumanoidEnvState],
+    camera_images: Iterable[object],
+    observation_timestamp_us: int,
+    observation_decision_id: int,
+    joint_names: tuple[str, ...],
+    policy_camera_contract: HumanoidPolicyCameraContract | None,
+) -> dict[int, tuple[HumanoidCameraFrame, ...]]:
+    """Return only policy-visible frames; strict sessions filter auxiliaries."""
+    return _route_camera_frames(
+        states=states,
+        camera_images=camera_images,
+        observation_timestamp_us=observation_timestamp_us,
+        observation_decision_id=observation_decision_id,
+        joint_names=joint_names,
+        policy_camera_contract=policy_camera_contract,
+    ).policy_frames_by_env
+
+
+def _camera_frame_identity(frame: HumanoidCameraFrame) -> HumanoidCameraFrameIdentity:
+    """Build compact immutable audit metadata without retaining pixels/qpos."""
+    return HumanoidCameraFrameIdentity(
+        env_id=frame.env_id,
+        frame_start_us=frame.frame_start_us,
+        frame_end_us=frame.frame_end_us,
+        logical_id=frame.logical_id,
+        byte_length=len(frame.image_bytes),
+        sha256=hashlib.sha256(frame.image_bytes).hexdigest(),
+        render_timestamp_us=frame.render_timestamp_us,
+        observation_decision_id=frame.observation_decision_id,
+        render_state_sha256=frame.render_state_sha256,
+        camera_contract_sha256=frame.camera_contract_sha256,
+        image_sha256=frame.image_sha256,
+        render_receipt_sha256=frame.render_receipt_sha256,
+    )
+
+
+def _save_camera_images(
+    camera_images: Iterable[HumanoidCameraFrame],
     save_camera_dir: Path | None,
 ) -> None:
     if save_camera_dir is None:
         return
     for index, image in enumerate(camera_images):
-        image_bytes = bytes(getattr(image, "image_bytes", b""))
-        if not image_bytes:
-            continue
-        frame_start_us = int(getattr(image, "frame_start_us", 0))
-        env_id = int(getattr(image, "env_id", 0))
-        logical_id = _safe_filename_component(getattr(image, "logical_id", "camera"))
+        image_bytes = image.image_bytes
+        frame_start_us = image.frame_start_us
+        env_id = image.env_id
+        logical_id = _safe_filename_component(image.logical_id)
+        image_sha256 = hashlib.sha256(image_bytes).hexdigest()
+        render_state_sha256 = image.render_state_sha256 or "none"
         filename = (
-            f"frame_{frame_start_us:012d}_env{env_id:03d}_{index:02d}_"
-            f"{logical_id}{_image_suffix(image_bytes)}"
+            f"frame_{frame_start_us:012d}_decision_"
+            f"{image.observation_decision_id:012d}_env{env_id:03d}_{index:02d}_"
+            f"{logical_id}_render_{render_state_sha256}_image_{image_sha256}"
+            f"{_image_suffix(image_bytes)}"
         )
         save_camera_dir.joinpath(filename).write_bytes(image_bytes)
+
+
+def _message_has_fields(value: object | None) -> bool:
+    """Return whether a protobuf-like nested message carries any value."""
+    if value is None:
+        return False
+    list_fields = getattr(value, "ListFields", None)
+    if callable(list_fields):
+        return bool(list_fields())
+    for item in vars(value).values() if hasattr(value, "__dict__") else ():
+        if isinstance(item, str) and item:
+            return True
+        if isinstance(item, (bytes, tuple, list, dict, set)) and item:
+            return True
+        if isinstance(item, (int, float)) and not isinstance(item, bool) and item != 0:
+            return True
+        if item is not None and not isinstance(
+            item, (str, bytes, tuple, list, dict, set, int, float, bool)
+        ):
+            if _message_has_fields(item):
+                return True
+    return False
 
 
 def _validate_motion_reference_session(
@@ -886,8 +1438,10 @@ def _validate_motion_reference_session(
     spec = request.reference_spec
     joint_names = tuple(str(name) for name in spec.joint_names)
     schema = str(spec.schema)
-    if schema != _MOTION_REFERENCE_SCHEMA_H70:
-        raise ValueError("motion-reference session requires the H70 G1 schema")
+    if schema != _MOTION_REFERENCE_SCHEMA_H50:
+        raise ValueError(
+            "motion-reference session requires the one-second H50 G1 schema"
+        )
     if str(request.action_schema) != schema:
         raise ValueError("motion-reference action_schema must match reference schema")
     if not joint_names or joint_names != tuple(
@@ -904,11 +1458,11 @@ def _validate_motion_reference_session(
     frame_count = int(spec.frame_count)
     sample_period_us = int(spec.sample_period_us)
     control_ticks = int(spec.control_ticks_per_policy_step)
-    if frame_count != 70 or sample_period_us != 20_000 or control_ticks != 25:
+    if frame_count != 50 or sample_period_us != 20_000 or control_ticks != 25:
         raise ValueError(
             "motion-reference spec does not match its schema; got "
             f"H={frame_count}, period={sample_period_us}, K={control_ticks}; "
-            "expected H=70, period=20000us, K=25"
+            "expected H=50, period=20000us, replan_ticks=25"
         )
     return joint_names, frame_count, sample_period_us, control_ticks
 
@@ -920,7 +1474,7 @@ def _validate_policy_request_kind(
     bootstrap_only: bool,
     step_index: int,
 ) -> None:
-    """Require explicit planner lifecycle requests in motion-reference mode."""
+    """Require explicit policy lifecycle requests in motion-reference mode."""
     if session.execution_mode != HUMANOID_EXECUTION_MODE_MOTION_REFERENCE:
         return
     if request_kind == HUMANOID_POLICY_REQUEST_KIND_FINALIZE_WITH_FEEDBACK:
@@ -943,7 +1497,7 @@ def _feedback_traces_from_request(
     session: _Session,
     step_index: int,
 ) -> dict[int, HumanoidRealizedFeedbackTrace]:
-    """Parse and validate exact K-prefix post-controller feedback traces."""
+    """Parse realized intervals between consecutive policy samples."""
     raw_traces = tuple(getattr(request.observation, "feedback_traces", ()))
     if session.execution_mode != HUMANOID_EXECUTION_MODE_MOTION_REFERENCE:
         if raw_traces:
@@ -978,21 +1532,19 @@ def _feedback_traces_from_request(
                 "feedback source_decision_id must equal current decision_id - 1"
             )
         ticks = tuple(raw_trace.ticks)
-        if not 1 <= len(ticks) <= session.control_ticks_per_policy_step:
-            raise ValueError(
-                "feedback ticks must be a non-empty K-prefix no longer than "
-                f"{session.control_ticks_per_policy_step}"
-            )
+        if not ticks:
+            raise ValueError("feedback ticks must contain a non-empty interval")
         parsed_ticks: list[HumanoidRealizedControlTick] = []
-        for action_index, tick in enumerate(ticks):
-            expected_offset = action_index + 1
+        for tick_index, tick in enumerate(ticks):
+            expected_offset = tick_index + 1
             if int(tick.control_tick_offset) != expected_offset:
                 raise ValueError(
                     "feedback control_tick_offset must be contiguous from one"
                 )
-            if int(tick.reference_action_index) != action_index:
+            reference_action_index = int(tick.reference_action_index)
+            if not 0 <= reference_action_index < session.reference_frame_count:
                 raise ValueError(
-                    "feedback reference_action_index must be contiguous from zero"
+                    "feedback reference_action_index is outside the reference horizon"
                 )
             state_input = _policy_input_from_state(
                 session_uuid=str(request.session_uuid),
@@ -1001,10 +1553,15 @@ def _feedback_traces_from_request(
                 observation_schema=session.observation_schema,
                 observation_terms=session.observation_terms,
             )
+            if state_input.env_id != env_id:
+                raise ValueError("native feedback tick state env_id changed")
             active_sha = _require_lowercase_sha256(
                 "feedback active_reference_sha256",
                 tick.active_reference_sha256,
             )
+            active_reference_id = int(tick.active_reference_id)
+            if active_reference_id <= 0:
+                raise ValueError("feedback active_reference_id must be positive")
             applied_sha = _require_lowercase_sha256(
                 "feedback applied_reference_sha256",
                 tick.applied_reference_sha256,
@@ -1029,18 +1586,45 @@ def _feedback_traces_from_request(
                 raise ValueError(
                     "feedback tick cannot be both terminated and truncated"
                 )
-            if action_index < len(ticks) - 1 and (terminated or truncated):
+            if tick_index < len(ticks) - 1 and (terminated or truncated):
                 raise ValueError(
                     "only the final feedback tick may end a macro transition"
                 )
-            if action_index > 0:
-                previous_timestamp = parsed_ticks[-1].timestamp_us
+            if parsed_ticks:
+                previous = parsed_ticks[-1]
                 if (
                     state_input.timestamp_us
-                    != previous_timestamp + session.reference_sample_period_us
+                    != previous.timestamp_us + session.reference_sample_period_us
                 ):
                     raise ValueError(
                         "feedback tick timestamps must be contiguous at 20 ms"
+                    )
+                same_reference = (
+                    active_reference_id == previous.active_reference_id
+                    and active_sha == previous.active_reference_sha256
+                )
+                if same_reference and reference_action_index != min(
+                    previous.reference_action_index + 1,
+                    session.reference_frame_count - 1,
+                ):
+                    raise ValueError(
+                        "feedback reference_action_index must advance within each "
+                        "active-reference segment"
+                    )
+                if same_reference and applied_sha != previous.applied_reference_sha256:
+                    raise ValueError(
+                        "feedback applied_reference_sha256 changed within an "
+                        "active-reference segment"
+                    )
+                if same_reference and not math.isclose(
+                    root_z_offset,
+                    previous.root_z_alignment_offset_m,
+                    rel_tol=0.0,
+                    abs_tol=1.0e-6,
+                ):
+                    raise ValueError(
+                        "feedback root_z_alignment_offset_m changed within an "
+                        "active-reference segment"
                     )
             parsed_ticks.append(
                 HumanoidRealizedControlTick(
@@ -1050,8 +1634,8 @@ def _feedback_traces_from_request(
                     observation=state_input.observation,
                     scalars=state_input.scalars,
                     timestamp_us=state_input.timestamp_us,
-                    active_reference_id=int(tick.active_reference_id),
-                    reference_action_index=action_index,
+                    active_reference_id=active_reference_id,
+                    reference_action_index=reference_action_index,
                     active_reference_sha256=active_sha,
                     applied_reference_sha256=applied_sha,
                     root_z_alignment_offset_m=root_z_offset,
@@ -1061,12 +1645,6 @@ def _feedback_traces_from_request(
                     metrics=metrics,
                     control_episode_step=int(tick.control_episode_step),
                 )
-            )
-        if len(parsed_ticks) < session.control_ticks_per_policy_step and not (
-            parsed_ticks[-1].terminated or parsed_ticks[-1].truncated
-        ):
-            raise ValueError(
-                "a short feedback trace must end in termination or truncation"
             )
         if ticks[-1].state != current_states[env_id]:
             raise ValueError(
@@ -1089,7 +1667,7 @@ def _plan_update_from_output(
     policy_input: HumanoidPolicyInput,
     session: _Session,
 ) -> HumanoidPlanUpdate:
-    """Validate and serialize one typed planner output."""
+    """Validate and serialize one typed motion-reference output."""
     reference = output.motion_reference
     assert reference is not None
     if reference.reference_id <= 0:
@@ -1147,26 +1725,18 @@ def _plan_update_from_output(
         ):
             raise ValueError("motion root_quaternion_wxyz must be normalized")
         if frame_index == 0:
-            realized_joint_position = policy_input.qpos[7:]
-            realized_joint_velocity = policy_input.qvel[6:]
             realized_root_position = policy_input.qpos[:3].clone()
             realized_root_position[2] += float(reference.root_z_alignment_offset_m)
-            comparisons = (
-                (joint_position, realized_joint_position, "joint position"),
-                (joint_velocity, realized_joint_velocity, "joint velocity"),
-                (root_position, realized_root_position, "root position"),
-                (root_quaternion, policy_input.qpos[3:7], "root quaternion"),
-            )
-            for actual, expected, label in comparisons:
-                if actual.shape != expected.shape or not torch.allclose(
-                    actual,
-                    expected,
-                    rtol=0.0,
-                    atol=1.0e-5,
-                ):
-                    raise ValueError(
-                        f"motion reference frame zero {label} is not anchored to realized state"
-                    )
+            if not torch.allclose(
+                root_position,
+                realized_root_position,
+                rtol=0.0,
+                atol=1.0e-5,
+            ):
+                raise ValueError(
+                    "motion reference frame zero root position is not anchored "
+                    "to realized state"
+                )
         messages.append(
             HumanoidMotionFrame(
                 timestamp_us=timestamp_us,
@@ -1247,6 +1817,8 @@ def _policy_input_from_state(
     state: HumanoidEnvState,
     observation_schema: str,
     observation_terms: tuple[tuple[str, int], ...],
+    camera_frames: tuple[HumanoidCameraFrame, ...] = (),
+    camera_frame_identities: tuple[HumanoidCameraFrameIdentity, ...] = (),
     decision_id: int = 0,
     feedback_trace: HumanoidRealizedFeedbackTrace | None = None,
     bootstrap_requested: bool = False,
@@ -1313,6 +1885,8 @@ def _policy_input_from_state(
         qvel=qvel,
         observation=observation,
         scalars=scalars,
+        camera_frames=camera_frames,
+        camera_frame_identities=camera_frame_identities,
         decision_id=decision_id,
         feedback_trace=feedback_trace,
         bootstrap_requested=bootstrap_requested,
@@ -1328,11 +1902,43 @@ def _recorded_policy_output(
     motion_reference: HumanoidMotionReference | None,
 ) -> PolicyOutput:
     model_extra = dict(output.model_extra or {})
-    model_extra.setdefault("humanoid_env_id", int(output.env_id))
-    model_extra.setdefault("humanoid_episode_id", int(policy_input.episode_id))
-    model_extra.setdefault("humanoid_step_index", int(step_index))
-    model_extra.setdefault("humanoid_timestamp_us", int(policy_input.timestamp_us))
-    model_extra.setdefault("humanoid_decision_id", int(policy_input.decision_id))
+    server_owned_metadata = {
+        "humanoid_env_id": int(output.env_id),
+        "humanoid_episode_id": int(policy_input.episode_id),
+        "humanoid_step_index": int(step_index),
+        "humanoid_timestamp_us": int(policy_input.timestamp_us),
+        "humanoid_decision_id": int(policy_input.decision_id),
+    }
+    for name, expected in server_owned_metadata.items():
+        if model_extra.setdefault(name, expected) != expected:
+            raise ValueError(f"humanoid model metadata {name} changed")
+    audited_identities = policy_input.camera_frame_identities or tuple(
+        _camera_frame_identity(frame) for frame in policy_input.camera_frames
+    )
+    camera_frame_identities = [
+        {
+            "env_id": identity.env_id,
+            "frame_start_us": identity.frame_start_us,
+            "frame_end_us": identity.frame_end_us,
+            "logical_id": identity.logical_id,
+            "byte_length": identity.byte_length,
+            "sha256": identity.sha256,
+            "render_timestamp_us": identity.render_timestamp_us,
+            "observation_decision_id": identity.observation_decision_id,
+            "render_state_sha256": identity.render_state_sha256,
+            "camera_contract_sha256": identity.camera_contract_sha256,
+            "image_sha256": identity.image_sha256,
+            "render_receipt_sha256": identity.render_receipt_sha256,
+        }
+        for identity in audited_identities
+    ]
+    recorded_camera_frames = model_extra.setdefault(
+        "humanoid_camera_frames", camera_frame_identities
+    )
+    if recorded_camera_frames != camera_frame_identities:
+        raise ValueError(
+            "humanoid model metadata camera identities do not match policy input"
+        )
     if output.value is not None:
         model_extra.setdefault(
             "humanoid_value",
@@ -1351,8 +1957,12 @@ def _recorded_policy_output(
     if replay_data is not None:
         payload = dict(replay_data.payload)
         humanoid_payload = dict(payload.get("humanoid", {}))
-        humanoid_payload.setdefault("env_id", int(output.env_id))
-        humanoid_payload.setdefault("step_index", int(step_index))
+        for name, expected in (
+            ("env_id", int(output.env_id)),
+            ("step_index", int(step_index)),
+        ):
+            if humanoid_payload.setdefault(name, expected) != expected:
+                raise ValueError(f"humanoid replay {name} changed")
         if action_values is not None:
             humanoid_payload.setdefault("action", action_values.detach().cpu())
         if motion_reference is not None:
@@ -1368,7 +1978,7 @@ def _recorded_policy_output(
                 actual = payload.setdefault(name, expected)
                 if actual != expected:
                     raise ValueError(
-                        f"planner replay {name} does not match emitted motion reference"
+                        f"policy replay {name} does not match emitted motion reference"
                     )
         if output.value is not None:
             humanoid_payload.setdefault(

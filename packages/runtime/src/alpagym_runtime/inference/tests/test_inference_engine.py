@@ -66,6 +66,30 @@ class _FakeInferenceModel:
         return BatchedModelOutput(pred_xyz=pred_xyz, pred_rot=pred_rot)
 
 
+class _LeaseAwareModel(torch.nn.Module):
+    """Tiny model proving that heavyweight immutable storage need not be copied."""
+
+    def __init__(self, frozen_trunk: torch.nn.Module | None = None) -> None:
+        super().__init__()
+        self.frozen_trunk = frozen_trunk or torch.nn.Linear(2, 2)
+        self.frozen_trunk.requires_grad_(False)
+        self.actor = torch.nn.Linear(2, 1)
+        self.clone_calls = 0
+
+    def clone_for_inference_lease(self) -> "_LeaseAwareModel":
+        self.clone_calls += 1
+        clone = _LeaseAwareModel(self.frozen_trunk)
+        clone.actor.load_state_dict(self.actor.state_dict())
+        return clone
+
+
+class _InvalidLeaseModel(torch.nn.Module):
+    """Deliberately violates the independent-snapshot contract."""
+
+    def clone_for_inference_lease(self) -> "_InvalidLeaseModel":
+        return self
+
+
 def _sampling() -> SamplingParamsConfig:
     """Sampling params used by every test; values are arbitrary but fixed."""
     return SamplingParamsConfig(
@@ -228,6 +252,56 @@ def test_session_model_lease_survives_inplace_and_replacement_weight_sync() -> N
     inference_engine.release_session_model_lease("session-7")
     with pytest.raises(RuntimeError, match="no immutable model lease"):
         inference_engine.get_model_for_session("session-7")
+
+
+def test_session_model_lease_uses_model_owned_lightweight_clone() -> None:
+    """A model may share a frozen trunk while snapshotting its mutable actor."""
+
+    inference_model = _FakeInferenceModel()
+    live_model = _LeaseAwareModel()
+    inference_model.model = live_model
+    inference_engine = InferenceEngine(
+        inference_model=inference_model,
+        sampling=_sampling(),
+        return_trace_for_rl=False,
+        max_batch_size=1,
+        require_session_model_leases=True,
+    )
+    with torch.no_grad():
+        live_model.actor.weight.fill_(1.0)
+
+    lease = inference_engine.create_model_lease(behavior_policy_version=3)
+
+    assert isinstance(lease.model, _LeaseAwareModel)
+    assert live_model.clone_calls == 1
+    assert lease.model is not live_model
+    assert lease.model.frozen_trunk is live_model.frozen_trunk
+    assert lease.model.actor is not live_model.actor
+    assert not lease.model.training
+    assert all(not parameter.requires_grad for parameter in lease.model.parameters())
+    with torch.no_grad():
+        live_model.actor.weight.fill_(2.0)
+    torch.testing.assert_close(
+        lease.model.actor.weight,
+        torch.ones_like(lease.model.actor.weight),
+    )
+
+
+def test_session_model_lease_rejects_aliasing_clone_hook() -> None:
+    """A hook cannot hand the mutable live model back as its own snapshot."""
+
+    inference_model = _FakeInferenceModel()
+    inference_model.model = _InvalidLeaseModel()
+    inference_engine = InferenceEngine(
+        inference_model=inference_model,
+        sampling=_sampling(),
+        return_trace_for_rl=False,
+        max_batch_size=1,
+        require_session_model_leases=True,
+    )
+
+    with pytest.raises(ValueError, match="independent module"):
+        inference_engine.create_model_lease(behavior_policy_version=4)
 
 
 def test_engine_batches_fixed_route_inputs() -> None:

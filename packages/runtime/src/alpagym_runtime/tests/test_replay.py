@@ -77,7 +77,9 @@ def test_policy_replay_data_round_trips_opaque_payload_and_common_old_logprob() 
         parsed.payload["tokenized_data"]["input_ids"],
         torch.tensor([1, 2, 3], dtype=torch.int64),
     )
-    assert torch.equal(parsed.payload["token_logprob_count"], torch.tensor(2, dtype=torch.int64))
+    assert torch.equal(
+        parsed.payload["token_logprob_count"], torch.tensor(2, dtype=torch.int64)
+    )
 
 
 def test_policy_replay_data_to_dict_preserves_non_leaf_tensors() -> None:
@@ -115,6 +117,16 @@ def test_training_signal_requires_bool_padding_mask() -> None:
         TrainingSignal(
             old_logprobs=torch.zeros(2),
             is_padding=torch.zeros(2),
+        )
+
+
+def test_training_signal_requires_bool_actor_valid_mask() -> None:
+    """Actor eligibility cannot be represented by ambiguous numeric weights."""
+    with pytest.raises(ValueError, match="actor_valid dtype must be bool"):
+        TrainingSignal(
+            old_logprobs=torch.zeros(2),
+            is_padding=torch.zeros(2, dtype=torch.bool),
+            actor_valid=torch.ones(2),
         )
 
 
@@ -217,6 +229,7 @@ def test_trainer_replay_batch_stacks_optional_ppo_signals() -> None:
                 advantages=torch.tensor([float(index + 1)]),
                 returns=torch.tensor([float(index + 2)]),
                 old_values=torch.tensor([float(index + 3)]),
+                actor_valid=torch.tensor([index == 0]),
             ),
             rollout_id=f"rollout-{index}",
             weight_version=torch.tensor(index, dtype=torch.int64),
@@ -226,9 +239,17 @@ def test_trainer_replay_batch_stacks_optional_ppo_signals() -> None:
 
     batch = TrainerReplayDataBatch.stack(samples)
 
-    torch.testing.assert_close(batch.training_signal.advantages, torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(
+        batch.training_signal.advantages, torch.tensor([1.0, 2.0])
+    )
     torch.testing.assert_close(batch.training_signal.returns, torch.tensor([2.0, 3.0]))
-    torch.testing.assert_close(batch.training_signal.old_values, torch.tensor([3.0, 4.0]))
+    torch.testing.assert_close(
+        batch.training_signal.old_values, torch.tensor([3.0, 4.0])
+    )
+    torch.testing.assert_close(
+        batch.training_signal.actor_valid,
+        torch.tensor([True, False]),
+    )
 
 
 def test_trainer_replay_batch_rejects_mixed_optional_ppo_signals() -> None:

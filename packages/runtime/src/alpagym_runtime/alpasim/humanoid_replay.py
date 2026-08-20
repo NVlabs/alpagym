@@ -122,16 +122,31 @@ def attach_humanoid_transitions(
             motion_reference = "reference_sha256" in payload
             receipt_fields: dict[str, Any] = {}
             if motion_reference:
+                predecessor_payload: Mapping[str, Any] | None = None
+                predecessor_timestamp_us: int | None = None
+                if position > 0:
+                    predecessor_output = rows[position - 1][1]
+                    if (
+                        predecessor_output.replay_data is None
+                        or predecessor_output.model_extra is None
+                    ):
+                        raise AssertionError(
+                            "indexed predecessor lost replay data or model identity"
+                        )
+                    predecessor_payload = predecessor_output.replay_data.payload
+                    predecessor_timestamp_us = int(
+                        predecessor_output.model_extra["humanoid_timestamp_us"]
+                    )
                 reference_frame_count = int(output.chosen_xyz.shape[0])
-                if reference_frame_count != 70:
-                    raise ValueError("motion-reference replay must carry H70")
+                if reference_frame_count != 50:
+                    raise ValueError("motion-reference replay must carry H50")
                 controller_ticks, remainder_us = divmod(
                     control_timestep_us, _MOTION_REFERENCE_TICK_US
                 )
                 if remainder_us or controller_ticks != _MOTION_CONTROLLER_TICKS:
                     raise ValueError(
                         "motion-reference replay control_timestep_us must select "
-                        "K=25 on the 20000us controller grid"
+                        "the 25-tick native replan trigger on the 20000us controller grid"
                     )
                 (
                     reward,
@@ -142,13 +157,15 @@ def attach_humanoid_transitions(
                     receipt_fields,
                 ) = _motion_reference_receipt(
                     payload,
+                    predecessor_payload=predecessor_payload,
                     env_id=env_id,
                     expected_source_decision_id=int(extra["humanoid_decision_id"]),
+                    source_timestamp_us=int(extra["humanoid_timestamp_us"]),
+                    predecessor_timestamp_us=predecessor_timestamp_us,
                     expected_control_episode_step=expected_control_episode_step,
                     metric_reward=metric_reward,
                     metric_terminated=metric_terminated,
                     metric_truncated=metric_truncated,
-                    controller_ticks=controller_ticks,
                 )
             else:
                 expected_timestamp = (
@@ -231,15 +248,17 @@ def attach_humanoid_transitions(
 def _motion_reference_receipt(
     payload: Mapping[str, Any],
     *,
+    predecessor_payload: Mapping[str, Any] | None,
     env_id: int,
     expected_source_decision_id: int,
+    source_timestamp_us: int,
+    predecessor_timestamp_us: int | None,
     expected_control_episode_step: int,
     metric_reward: float,
     metric_terminated: bool,
     metric_truncated: bool,
-    controller_ticks: int,
 ) -> tuple[float, bool, bool, int, int, dict[str, Any]]:
-    """Validate one exact controller trace and derive its SMDP transition."""
+    """Validate one async controller interval and derive its SMDP transition."""
     trace = payload.get("feedback_trace")
     if not isinstance(trace, Mapping):
         raise ValueError("motion-reference replay row is missing feedback_trace")
@@ -261,50 +280,104 @@ def _motion_reference_receipt(
     if reference_id <= 0 or not math.isfinite(root_z_offset):
         raise ValueError("motion-reference replay has invalid reference identity")
     ticks = trace.get("ticks")
-    if not isinstance(ticks, list) or not 1 <= len(ticks) <= controller_ticks:
-        raise ValueError("motion-reference feedback ticks must be a non-empty K-prefix")
+    if not isinstance(ticks, list) or not ticks:
+        raise ValueError("motion-reference feedback ticks must be a non-empty interval")
 
-    primitive_rewards = [0.0] * controller_ticks
-    primitive_mask = [False] * controller_ticks
+    predecessor_identity: tuple[int, str, float, int] | None = None
+    if predecessor_payload is not None:
+        if predecessor_timestamp_us is None:
+            raise ValueError("predecessor plan timestamp is missing")
+        predecessor_identity = (
+            int(predecessor_payload.get("reference_id", -1)),
+            _require_sha256(
+                "predecessor replay reference_sha256",
+                predecessor_payload.get("reference_sha256"),
+            ),
+            float(predecessor_payload.get("root_z_alignment_offset_m", math.nan)),
+            predecessor_timestamp_us,
+        )
+        if predecessor_identity[0] <= 0 or not math.isfinite(predecessor_identity[2]):
+            raise ValueError("predecessor replay has invalid reference identity")
+
+    primitive_rewards: list[float] = []
     previous_timestamp: int | None = None
     applied_hashes: list[str] = []
-    for action_index, tick in enumerate(ticks):
+    seen_source = False
+    source_tick_count = 0
+    active_segment: str | None = None
+    applied_sha256_by_segment: dict[str, str] = {}
+    for tick_index, tick in enumerate(ticks):
         if not isinstance(tick, Mapping):
             raise TypeError("motion-reference feedback tick must be a mapping")
         tick = cast(Mapping[str, Any], tick)
-        expected_offset = action_index + 1
+        expected_offset = tick_index + 1
         if int(tick.get("control_tick_offset", -1)) != expected_offset:
             raise ValueError("feedback control_tick_offset must be contiguous from one")
-        if int(tick.get("reference_action_index", -1)) != action_index:
-            raise ValueError(
-                "feedback reference_action_index must be contiguous from zero"
-            )
-        if int(tick.get("active_reference_id", -1)) != reference_id:
-            raise ValueError("feedback active_reference_id does not match plan")
-        if (
+        active_identity = (
+            int(tick.get("active_reference_id", -1)),
             _require_sha256(
                 "feedback active_reference_sha256",
                 tick.get("active_reference_sha256"),
-            )
-            != reference_sha256
+            ),
+        )
+        if active_identity == (reference_id, reference_sha256):
+            segment = "source"
+            segment_root_z_offset = root_z_offset
+            segment_timestamp_us = source_timestamp_us
+            seen_source = True
+            source_tick_count += 1
+        elif (
+            predecessor_identity is not None
+            and active_identity == predecessor_identity[:2]
         ):
-            raise ValueError("feedback active reference digest does not match plan")
+            if seen_source:
+                raise ValueError(
+                    "feedback reference sequence reversed from source to predecessor"
+                )
+            segment = "predecessor"
+            segment_root_z_offset = predecessor_identity[2]
+            segment_timestamp_us = predecessor_identity[3]
+        else:
+            raise ValueError("feedback contains a third or unknown active reference")
+        if active_segment is not None and segment != active_segment:
+            if active_segment != "predecessor" or segment != "source":
+                raise ValueError(
+                    "feedback reference sequence must be predecessor then source"
+                )
+        active_segment = segment
+
+        reference_action_index = int(tick.get("reference_action_index", -1))
+        action_timestamp_us = int(tick.get("timestamp_us", -1)) - 20_000
+        delta_us = action_timestamp_us - segment_timestamp_us
+        if delta_us < 0 or delta_us % 20_000:
+            raise ValueError(
+                "feedback reference_action_index is off the source time grid"
+            )
+        expected_action_index = min(delta_us // 20_000, 49)
+        if reference_action_index != expected_action_index:
+            raise ValueError(
+                "feedback reference_action_index does not match its active plan timestamp"
+            )
         applied_sha256 = _require_sha256(
             "feedback applied_reference_sha256",
             tick.get("applied_reference_sha256"),
         )
-        if applied_sha256 != reference_sha256:
+        previous_applied_sha256 = applied_sha256_by_segment.setdefault(
+            segment, applied_sha256
+        )
+        if applied_sha256 != previous_applied_sha256:
             raise ValueError(
-                "H70 feedback applied reference digest does not match source plan"
+                "feedback applied reference digest changed within an "
+                "active-reference segment"
             )
         applied_hashes.append(applied_sha256)
         if not math.isclose(
             float(tick.get("root_z_alignment_offset_m", math.nan)),
-            root_z_offset,
+            segment_root_z_offset,
             rel_tol=0.0,
             abs_tol=1.0e-6,
         ):
-            raise ValueError("feedback root Z alignment does not match plan")
+            raise ValueError("feedback root Z alignment does not match active plan")
         timestamp_us = int(tick.get("timestamp_us", -1))
         if (
             previous_timestamp is not None
@@ -319,24 +392,26 @@ def _motion_reference_receipt(
         reward = float(tick.get("reward", math.nan))
         if not math.isfinite(reward):
             raise ValueError("feedback tick reward is non-finite")
-        primitive_rewards[action_index] = reward
-        primitive_mask[action_index] = True
+        primitive_rewards.append(reward)
         tick_terminated = bool(tick.get("terminated", False))
         tick_truncated = bool(tick.get("truncated", False))
         if tick_terminated and tick_truncated:
             raise ValueError("feedback tick cannot terminate and truncate together")
-        if action_index < len(ticks) - 1 and (tick_terminated or tick_truncated):
+        if tick_index < len(ticks) - 1 and (tick_terminated or tick_truncated):
             raise ValueError("only the final feedback tick may end a macro transition")
     assert previous_timestamp is not None
     final_tick = ticks[-1]
-    terminated = bool(final_tick.get("terminated", False))
-    truncated = bool(final_tick.get("truncated", False)) or bool(
-        payload.get("outer_truncated", False)
-    )
+    tick_terminated = bool(final_tick.get("terminated", False))
+    tick_truncated = bool(final_tick.get("truncated", False))
+    outer_truncated = bool(payload.get("outer_truncated", False))
+    if not seen_source and not (tick_terminated or tick_truncated or outer_truncated):
+        raise ValueError(
+            "a predecessor-only feedback interval must end in termination or truncation"
+        )
+    terminated = tick_terminated
+    truncated = tick_truncated or outer_truncated
     if terminated and truncated:
         raise ValueError("terminated motion lane cannot be outer-truncated")
-    if len(ticks) < controller_ticks and not (terminated or truncated):
-        raise ValueError("short motion-reference trace must end the transition")
     reward = float(sum(primitive_rewards))
     if not math.isclose(reward, metric_reward, rel_tol=1.0e-6, abs_tol=1.0e-6):
         raise ValueError("controller tick rewards do not sum to ScenarioEval reward")
@@ -350,8 +425,10 @@ def _motion_reference_receipt(
         expected_control_episode_step,
         {
             "primitive_rewards": primitive_rewards,
-            "primitive_reward_mask": primitive_mask,
+            "primitive_reward_mask": [True] * len(primitive_rewards),
             "duration_ticks": len(ticks),
+            "owning_reference_executed_ticks": source_tick_count,
+            "actor_valid": source_tick_count > 0,
             "reference_id": reference_id,
             "source_decision_id": source_decision_id,
             "reference_sha256": reference_sha256,

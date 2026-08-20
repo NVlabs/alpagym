@@ -167,3 +167,35 @@ def test_build_inference_engine_unknown_kind_raises(
     config = _make_resolved_config()
     with pytest.raises(PluginNotFoundError):
         factory.build_inference_engine(config)
+
+
+def test_visual_humanoid_policy_explicitly_requires_strict_camera_abi() -> None:
+    config = _make_resolved_config()
+    config.policy.model.bundle_config["require_policy_camera"] = True
+
+    assert factory.humanoid_policy_camera_required(config)
+
+
+def test_humanoid_policy_camera_requirement_rejects_string_boolean() -> None:
+    config = _make_resolved_config()
+    config.policy.model.bundle_config["require_policy_camera"] = "true"
+
+    with pytest.raises(TypeError, match="must be a boolean"):
+        factory.humanoid_policy_camera_required(config)
+
+
+def test_humanoid_policy_factory_requires_explicit_builder() -> None:
+    """A missing factory must not silently dispatch a zero-action policy."""
+    config = _make_resolved_config()
+
+    with pytest.raises(KeyError, match="humanoid_policy_factory"):
+        factory.build_humanoid_policy_factory(config, object())
+
+
+def test_humanoid_policy_factory_rejects_removed_zero_alias() -> None:
+    """The former smoke alias cannot enter the production config route."""
+    config = _make_resolved_config()
+    config.policy.model.bundle_config["humanoid_policy_factory"] = "zero"
+
+    with pytest.raises(ValueError, match="module:attribute"):
+        factory.build_humanoid_policy_factory(config, object())

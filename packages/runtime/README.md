@@ -222,21 +222,77 @@ resulting engine + factory to `EgodriverServer` and
 
 ### Model-bundle dispatch
 
-Today there is one **policy family** (`alpamayo`), statically pinned in
-`RunConfigSchema.policy: AlpamayoPolicyConfig`. `policies/factory.py` has no outer
-family branch: `build_inference_engine` and `build_policy_factory` construct
-the Alpamayo path directly. Adding a second family will need both a schema
-change in `host.config` (e.g. making `RunConfigSchema.policy` polymorphic) and a
-new outer branch in both factory functions.
-
-Within the Alpamayo family, `policy.model.kind` selects the **released-model
-bundle** (the `InferenceModel` implementation). The public release ships
-`"alpamayo_r1"`. Adding a new bundle means a new `InferenceModel`
+`policy.kind` selects the runtime family (`alpamayo` for the egodriver path or
+`humanoid` for the G1 callback path). The historical config dataclass name is
+still `AlpamayoPolicyConfig`, but its typed fields are shared by both families.
+`policy.model.kind` independently selects the **released-model bundle** (the
+`InferenceModel` implementation), including `alpamayo_r1`, `g1_mjlab`, and
+`g1_wenhao_vla`. Adding a new bundle means a new `InferenceModel`
 implementation under its per-bundle package
 (`packages/policies/<bundle>/...`) and an `alpagym.policy_bundles` entry
 point. The Cosmos-RL adapter in `cosmos/rollout_backend.py` stays
 family-agnostic: it only calls `build_inference_engine(...)` and
-`build_policy_factory(...)`.
+then selects the egodriver or humanoid per-session policy factory.
+
+### Strict humanoid policy camera ABI
+
+A visual humanoid/VLA bundle must set
+`policy.model.bundle_config.require_policy_camera: true`. This makes the
+policy server fail during construction unless the active `alpasim-grpc` source
+contains the matching `HumanoidPolicyCameraSpec`, all image/render receipt
+fields, and `alpasim_grpc.v0.humanoid_contracts`. Install the matching package
+from the exact Git revision in the workspace lockfile. `ALPASIM_GRPC_ROOT` is
+an optional local-development override for changing AlpaSim and AlpaGym in
+lockstep; a normal locked install does not require it. The runtime does not
+silently fall back to the legacy camera packet.
+
+For each env lane, the configured policy camera must have exactly one
+zero-shutter frame (`frame_start_us == frame_end_us == render_timestamp_us`).
+Other logical camera IDs are auxiliary: their compact identities are audited
+and their images may be saved, but only the configured frame enters
+`HumanoidPolicyInput.camera_frames`.
+
+### Wenhao Flow PPO over the motion-reference ABI
+
+The `g1_wenhao_vla` bundle uses Flow PPO, not Gaussian PPO or GRPO. The
+content-addressed Qwen3-VL 2B backbone is frozen, while the Psi action head and
+observation-only critic are trainable. Rollout keeps the exact Flow-SDE latent
+chain, sampled denoise transition, element log-probabilities, value, processed
+D455/BATS condition, and normalized/wire action views. Trainer replay scores
+that recorded transition under the current action head. A hard RTC prefix, when
+present, is frozen during sampling/replay and contributes zero Flow density.
+
+The policy converts each one-second `30 x 38` sample at 30 Hz into an H50
+motion-reference buffer at 50 Hz. Frame zero is the first policy target, not a
+copy of the realized robot state. A new inference is triggered after 25 SONIC
+ticks (0.5 seconds), but that trigger does not truncate the active one-second
+buffer. Dynamics can continue it across requests and, if no replacement has
+arrived after frame 49, terminal-holds the last pose with zero joint velocity.
+A new H50 replaces the buffer atomically with no crossfade. The strict D455
+path accepts one zero-shutter `224 x 140` same-shot RGB capture, preserves its
+render receipt, applies the training-compatible `224 x 224` letterbox, and
+selects deterministic BATS history without resampling in the trainer.
+
+AlpaSim launches one policy request at source cursor 25 and leaves it in flight
+while it advances the active H50 with one-tick no-update dynamics calls. The
+returned plan is installed once at its derived source cursor; feedback may
+therefore contain an initial predecessor-reference prefix followed by the new
+reference suffix. Policy decisions and dynamics RPCs use separate counters.
+This provides simulation-time asynchronous overlap; no wall-clock sleep is
+inserted, so the realized delay is determined by service throughput.
+
+At a terminal or outer-horizon race, the runtime awaits the one pending sample
+before FINALIZE. Replay marks it actor-ineligible when its reference executed
+zero ticks: critic/GAE still use the realized predecessor reward, while actor
+surrogate, KL, ratio, and clip metrics mask the unexecuted sample.
+
+Every humanoid simulation request carries the already-reserved Cosmos weight
+version in `RolloutSpec.expected_behavior_policy_version`. Reservation, policy
+response, physical H50 feedback, replay transition, and Cosmos rollout version
+must agree. Colocated mode uses the live leased model; distributed
+placement still requires deployment validation. See the
+[Wenhao package README](../policies/g1_wenhao_vla/README.md) for the Flow-PPO
+trace and replay contract.
 
 ## Cross-Cutting Layers
 
@@ -244,13 +300,13 @@ The per-tick layers above describe what happens on every drive tick. Once
 zoomed out, four additional layers do the orchestration, persistence, and
 Cosmos-RL integration work:
 
-- **Cosmos-RL adapter layer** (`cosmos/`) — registers and implements all the
-  plug-ins Cosmos-RL needs: `Dataset`, `DataPacker`, fake policy model +
-  tokenizer + weight mapper, fake trainer, reward callback, rollout backend,
-  and the `torchrun` entrypoint. Six of seven files are pure adapters; only
-  `rollout_backend.py` is also a thin construction site that builds the
-  inference engine + policy factory + driver server + streaming worker, and
-  spawns the long-lived engine thread.
+- **Cosmos-RL adapter layer** (`cosmos/`) — registers the shared `Dataset`,
+  policy-resolved `DataPacker`, replay trainer, reward callback, rollout
+  backend, and `torchrun` entrypoint. Policy bundles can install their own model,
+  tokenizer, and weight-mapper hooks; Wenhao registers its Cosmos model and
+  uses the Flow-PPO trainer. `rollout_backend.py` is also the thin
+  construction site that builds the inference engine + policy factory + driver
+  server + streaming worker and spawns the long-lived engine thread.
 - **Episode runner layer** (`episode_runner/`) — owns the streaming dispatch
   of rollouts. `StreamingRolloutWorker` (in
   `episode_runner/streaming_worker.py`) maintains up to

@@ -3,10 +3,11 @@
 """Contract tests for the disk rollout-transport writer.
 
 Asserts the disk writer satisfies its role protocol and that an egressed artifact
-reads back through ``read_episode_json`` (the trainer-side disk read). JSON
-encoding edge cases live in test_disk.py.
+reads back through ``read_episode_json`` (the trainer-side disk read). Encoding
+and integrity edge cases live in test_disk.py.
 """
 
+import json
 from pathlib import Path
 
 import torch
@@ -55,14 +56,19 @@ def test_disk_write_places_artifact_under_configured_dir(tmp_path: Path) -> None
 
 
 def test_disk_release_unlinks_artifact_and_is_idempotent(tmp_path: Path) -> None:
-    """Disk release removes the artifact and tolerates duplicate cleanup."""
+    """Disk release removes manifest and sidecar and tolerates duplicate cleanup."""
     writer = DiskEpisodeWriter(tmp_path)
     handle = writer.write(_make_episode())
+    artifact = Path(handle)
+    descriptor = json.loads(artifact.read_text(encoding="utf-8"))["tensor_sidecar"]
+    sidecar = artifact.parent / descriptor["filename"]
+    assert sidecar.is_file()
 
     writer.release(handle, "discarded")
     writer.release(handle, "discarded")
 
-    assert not Path(handle).exists()
+    assert not artifact.exists()
+    assert not sidecar.exists()
 
 
 def test_disk_writer_satisfies_role_protocol(tmp_path: Path) -> None:

@@ -233,6 +233,7 @@ def test_humanoid_worker_request_and_transition_payloads(tmp_path: Path) -> None
             or 1
         )
         assert request.rollout_specs[0].random_seed == expected_seed
+        assert request.rollout_specs[0].expected_behavior_policy_version == "7"
 
         rollout_job.random_seed = 17
         fixed_seed_request = worker._build_simulation_request(rollout_job)

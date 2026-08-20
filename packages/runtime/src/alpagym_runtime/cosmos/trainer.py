@@ -10,12 +10,8 @@ policy kind string. The cosmos entrypoint dispatches the data packer the same wa
 """
 
 import copy
-import hashlib
-import json
 import logging
 import os
-import re
-from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -30,9 +26,9 @@ from cosmos_rl.utils import distributed as dist_util, parallelism as _parallelis
 
 from alpagym_runtime.cosmos.replay_objective import (
     assert_replay_shapes,
+    compute_flow_ppo_surrogate,
     compute_kl_penalty,
     compute_ppo_surrogate,
-    compute_token_ppo_surrogate,
     compute_value_loss,
 )
 from alpagym_runtime.cosmos.rollout_filter import filter_trainable_rollouts
@@ -44,189 +40,6 @@ from alpagym_runtime.replay import TrainingSignal
 from alpagym_runtime.tensor_utils import to_device_recursive
 
 logger = logging.getLogger(__name__)
-
-_ACTOR_INITIALIZATION_SCHEMA = "videomimic_v9_actor_initialization.v1"
-_ACTOR_UPDATE_LINEAGE_SCHEMA = "videomimic_planner_actor_update_lineage.v1"
-_ACTOR_STATE_HASH_SCHEMA = "videomimic_planner_actor_state.safetensors.v1"
-_ACTOR_LINEAGE_CHECKPOINT_KEY = "alpagym_actor_update_lineage"
-_ACTOR_STATUS_TRAINED = "trained_descendant"
-_ACTOR_STATUS_UNCHANGED = "actor_bit_identical_to_parent"
-_ACTOR_STATE_LINEAGE_FIELDS = (
-    "actor_state_hash_schema",
-    "current_actor_state_sha256",
-    "parent_actor_state_sha256",
-)
-_ACTOR_INITIAL_STATUSES = frozenset(
-    (
-        "v9_initialized_unmodified",
-        "v9_actor_mean_initialized_std_clamped",
-    )
-)
-_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-
-
-def _canonical_mapping_sha256(value: Mapping[str, Any]) -> str:
-    encoded = json.dumps(dict(value), sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _model_actor_provenance(
-    model: Any,
-) -> tuple[Mapping[str, Any], Mapping[str, Any]] | None:
-    """Return canonical planner provenance, rejecting half-populated configs."""
-
-    config = getattr(model, "config", None)
-    initialization = getattr(config, "actor_initialization_attestation", None)
-    lineage = getattr(config, "actor_update_lineage", None)
-    if initialization is None and lineage is None:
-        return None
-    if not isinstance(initialization, Mapping) or not isinstance(lineage, Mapping):
-        raise RuntimeError(
-            "provenance-aware policy config must contain both actor "
-            "initialization and update lineage mappings"
-        )
-    return initialization, lineage
-
-
-def _validated_actor_lineage(
-    initialization: Mapping[str, Any],
-    lineage: Mapping[str, Any],
-    *,
-    expected_step: int,
-    expected_actor_state_sha256: str | None = None,
-    expected_model_weights_sha256: str | None = None,
-) -> dict[str, Any]:
-    """Validate one lineage snapshot before it crosses a resume boundary."""
-
-    if initialization.get("schema") != _ACTOR_INITIALIZATION_SCHEMA:
-        raise RuntimeError("actor initialization attestation schema is invalid")
-    if lineage.get("schema") != _ACTOR_UPDATE_LINEAGE_SCHEMA:
-        raise RuntimeError("actor update lineage schema is invalid")
-    if lineage.get("initialization_attestation_sha256") != (
-        _canonical_mapping_sha256(initialization)
-    ):
-        raise RuntimeError("actor update lineage identifies another initialization")
-    if lineage.get("training_export_step") != expected_step:
-        raise RuntimeError(
-            "actor update lineage step differs from the Cosmos checkpoint: "
-            f"lineage={lineage.get('training_export_step')!r}, "
-            f"checkpoint={expected_step}"
-        )
-    current_weights = lineage.get("current_model_weights_sha256")
-    if (
-        not isinstance(current_weights, str)
-        or _SHA256.fullmatch(current_weights) is None
-    ):
-        raise RuntimeError("actor update lineage has no valid current weight identity")
-    if (
-        expected_model_weights_sha256 is not None
-        and current_weights != expected_model_weights_sha256
-    ):
-        raise RuntimeError("actor update lineage does not match loaded model weights")
-    actor_extension_presence = tuple(
-        name in lineage for name in _ACTOR_STATE_LINEAGE_FIELDS
-    )
-    if any(actor_extension_presence) and not all(actor_extension_presence):
-        raise RuntimeError(
-            "actor update lineage has an incomplete actor-state identity"
-        )
-    has_actor_state_identity = all(actor_extension_presence)
-    current_actor_state: str | None = None
-    if has_actor_state_identity:
-        if lineage.get("actor_state_hash_schema") != _ACTOR_STATE_HASH_SCHEMA:
-            raise RuntimeError("actor update lineage has an invalid actor-state schema")
-        candidate = lineage.get("current_actor_state_sha256")
-        if not isinstance(candidate, str) or _SHA256.fullmatch(candidate) is None:
-            raise RuntimeError(
-                "actor update lineage has no valid current actor identity"
-            )
-        current_actor_state = candidate
-        if (
-            expected_actor_state_sha256 is not None
-            and current_actor_state != expected_actor_state_sha256
-        ):
-            raise RuntimeError("actor update lineage does not match loaded actor state")
-    if expected_step == 0:
-        if (
-            lineage.get("current_actor_status") not in _ACTOR_INITIAL_STATUSES
-            or lineage.get("parent_model_weights_sha256") is not None
-            or lineage.get("parent_update_lineage_sha256") is not None
-        ):
-            raise RuntimeError("initial actor update lineage is inconsistent")
-        if (
-            has_actor_state_identity
-            and lineage.get("parent_actor_state_sha256") is not None
-        ):
-            raise RuntimeError("initial actor update lineage identifies a parent actor")
-    else:
-        for name in (
-            "parent_model_weights_sha256",
-            "parent_update_lineage_sha256",
-        ):
-            value = lineage.get(name)
-            if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
-                raise RuntimeError(f"actor update lineage has invalid {name}")
-        if has_actor_state_identity:
-            parent_actor_state = lineage.get("parent_actor_state_sha256")
-            if (
-                not isinstance(parent_actor_state, str)
-                or _SHA256.fullmatch(parent_actor_state) is None
-            ):
-                raise RuntimeError(
-                    "actor update lineage has no valid parent actor identity"
-                )
-            expected_status = (
-                _ACTOR_STATUS_UNCHANGED
-                if current_actor_state == parent_actor_state
-                else _ACTOR_STATUS_TRAINED
-            )
-            if lineage.get("current_actor_status") != expected_status:
-                raise RuntimeError(
-                    "actor update lineage status disagrees with actor-state hashes"
-                )
-        elif lineage.get("current_actor_status") != _ACTOR_STATUS_TRAINED:
-            raise RuntimeError("legacy resumed actor must be a trained descendant")
-    return dict(lineage)
-
-
-def _model_actor_state_identity(
-    model: Any,
-    lineage: Mapping[str, Any],
-) -> str | None:
-    """Recompute actor identity only for lineage snapshots that declare it."""
-
-    presence = tuple(name in lineage for name in _ACTOR_STATE_LINEAGE_FIELDS)
-    if not any(presence):
-        return None
-    if not all(presence):
-        raise RuntimeError(
-            "actor update lineage has an incomplete actor-state identity"
-        )
-    identity = getattr(model, "actor_state_sha256", None)
-    if not callable(identity):
-        raise RuntimeError(
-            "actor-state-aware lineage requires model.actor_state_sha256()"
-        )
-    digest = identity()
-    if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
-        raise RuntimeError("model returned an invalid actor-state identity")
-    return digest
-
-
-def _model_weights_identity(model: Any) -> str:
-    """Recompute the full policy-native weight identity after load or before save."""
-
-    identity = getattr(model, "model_weights_sha256", None)
-    if not callable(identity):
-        raise RuntimeError(
-            "provenance-aware lineage requires model.model_weights_sha256()"
-        )
-    digest = identity()
-    if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
-        raise RuntimeError("model returned an invalid full-model weight identity")
-    return digest
 
 
 def _fixed_reference_reset_interval(value: int | None) -> int:
@@ -257,35 +70,6 @@ def _load_run_config(config: _cosmos_config.Config) -> RunConfig:
             "AlpaGym run config. Production cosmos invocations set this via --config."
         )
     return load_run_config(resolved_config_path)
-
-
-def _requires_planner_every_update_checkpoint(run_config: RunConfig) -> bool:
-    """Return whether this is trainable current-policy H70 PPO."""
-
-    bundle_config = dict(run_config.policy.model.bundle_config)
-    return (
-        run_config.policy.model.kind == "g1_videomimic_planner"
-        and bundle_config.get("planner_mode", "shadow_rollout") == "shadow_rollout"
-        and run_config.cosmos.train.train_policy.grpo_optimization_iterations > 0
-    )
-
-
-def _validate_planner_every_update_checkpoint_config(config: Any) -> None:
-    """Fail closed if Cosmos did not load the canonical checkpoint schedule."""
-
-    checkpoint = getattr(getattr(config, "train", None), "ckpt", None)
-    if (
-        not bool(getattr(checkpoint, "enable_checkpoint", False))
-        or int(getattr(checkpoint, "save_freq", 0)) != 1
-        or int(getattr(checkpoint, "save_freq_in_epoch", -1)) != 0
-        or not bool(getattr(checkpoint, "export_safetensors", False))
-        or int(getattr(checkpoint, "max_keep", 0)) != -1
-    ):
-        raise ValueError(
-            "current-policy H70 PPO requires Cosmos to load "
-            "enable_checkpoint=true, save_freq=1, save_freq_in_epoch=0, "
-            "export_safetensors=true, max_keep=-1"
-        )
 
 
 @_trainer_base.TrainerRegistry.register(trainer_type="alpagym_grpo")
@@ -335,11 +119,6 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         # Production cosmos invocations always set `custom.resolved_config_path` via
         # `--config`.
         run_config = _load_run_config(config)
-        self._planner_every_update_checkpoint = (
-            _requires_planner_every_update_checkpoint(run_config)
-        )
-        if self._planner_every_update_checkpoint:
-            _validate_planner_every_update_checkpoint_config(config)
         initialize_perf(run_config)
         # Cosmos's super-init resolves a tokenizer from
         # ``config.policy.model_name_or_path`` and calls ``ModelRegistry.build_model``.
@@ -459,26 +238,9 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         checkpoint_enabled = bool(
             getattr(checkpoint_config, "enable_checkpoint", False)
         )
-        planner_every_update_checkpoint = bool(
-            getattr(self, "_planner_every_update_checkpoint", False)
-        )
         final_checkpoint_fallback = checkpoint_enabled and current_step == total_steps
-        if is_master_replica and (
-            do_save_checkpoint
-            or planner_every_update_checkpoint
-            or final_checkpoint_fallback
-        ):
-            if planner_every_update_checkpoint and not do_save_checkpoint:
-                logger.info(
-                    "Cosmos did not request the current-policy H70 checkpoint on "
-                    "trainer step %d; applying AlpaGym every-update fallback",
-                    current_step,
-                )
-            if (
-                final_checkpoint_fallback
-                and not planner_every_update_checkpoint
-                and not do_save_checkpoint
-            ):
+        if is_master_replica and (do_save_checkpoint or final_checkpoint_fallback):
+            if final_checkpoint_fallback and not do_save_checkpoint:
                 # Some Cosmos colocated controller paths send the final real
                 # DataFetchCommand with do_save=False and then stop the policy
                 # worker before its synthetic TrainingCompleteCommand can run.
@@ -859,18 +621,19 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
     ) -> None:
         """Save policy weights at ``current_step``.
 
-        Mirrors the upstream ``GRPOTrainer.step_training`` checkpoint block:
-        exports HuggingFace-compatible safetensors when
-        ``config.train.ckpt.export_safetensors`` is set (always on the final
-        step), then writes the cosmos resume checkpoint (model + optimizer +
-        scheduler + ``remain_samples_num``) via ``self.ckpt_manager``.
+        Exports deployable weights when
+        ``config.train.ckpt.export_safetensors`` is set, then writes the cosmos
+        resume checkpoint (model + optimizer + scheduler +
+        ``remain_samples_num``) via ``self.ckpt_manager``. The resume checkpoint
+        is always written when this method is called, including on the final
+        step.
 
         The inherited ``ckpt_manager`` and ``export_safetensors`` come from
         ``LLMTrainer``; ``output_dir`` / ``ckpt`` / ``param_dtype`` come from
         ``cosmos_config.toml``.
         """
         is_last_step = current_step == total_steps
-        if is_last_step or self.config.train.ckpt.export_safetensors:
+        if self.config.train.ckpt.export_safetensors:
             export_rel_path = os.path.join("safetensors", f"step_{current_step}")
             export_hook = getattr(
                 getattr(self, "_policy_bundle", None),
@@ -901,22 +664,6 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
                     dtype=getattr(torch, str(self.config.train.param_dtype).lower()),
                 )
 
-        checkpoint_metadata: dict[str, Any] = {}
-        actor_provenance = _model_actor_provenance(self.model)
-        if actor_provenance is not None:
-            initialization, lineage = actor_provenance
-            checkpoint_metadata[_ACTOR_LINEAGE_CHECKPOINT_KEY] = (
-                _validated_actor_lineage(
-                    initialization,
-                    lineage,
-                    expected_step=current_step,
-                    expected_actor_state_sha256=_model_actor_state_identity(
-                        self.model,
-                        lineage,
-                    ),
-                    expected_model_weights_sha256=_model_weights_identity(self.model),
-                )
-            )
         logger.info("[Policy] Saving cosmos checkpoint at step %d", current_step)
         self.ckpt_manager.save_checkpoint(
             model=self.model,
@@ -926,58 +673,12 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
             total_steps=total_steps,
             remain_samples_num=remain_samples_num,
             is_final=is_last_step,
-            **checkpoint_metadata,
         )
         self.ckpt_manager.save_check(step=current_step)
 
     # ------------------------------------------------------------------
     # Reference model lifecycle
     # ------------------------------------------------------------------
-
-    def weight_resume(self) -> dict[str, Any]:
-        """Load weights and validate planner actor lineage on resume."""
-        resume_requested = bool(getattr(self.config.train, "resume", False))
-        checkpoint_info = super().weight_resume()
-        actor_provenance = _model_actor_provenance(self.model)
-        checkpoint_step = checkpoint_info.get("step")
-        if (
-            resume_requested
-            and checkpoint_step is None
-            and actor_provenance is not None
-        ):
-            raise RuntimeError(
-                "canonical planner resume was requested, but Cosmos "
-                "did not restore a checkpoint step; refusing its fallback to the "
-                "initial policy"
-            )
-        if actor_provenance is not None and checkpoint_step is not None:
-            if (
-                isinstance(checkpoint_step, bool)
-                or not isinstance(checkpoint_step, int)
-                or checkpoint_step < 1
-            ):
-                raise RuntimeError(
-                    f"resumed Cosmos checkpoint has invalid step {checkpoint_step!r}"
-                )
-            initialization, _ = actor_provenance
-            resumed_lineage = checkpoint_info.get(_ACTOR_LINEAGE_CHECKPOINT_KEY)
-            if not isinstance(resumed_lineage, Mapping):
-                raise RuntimeError(
-                    "provenance-aware policy resume checkpoint has no actor lineage"
-                )
-            restored_lineage = _validated_actor_lineage(
-                initialization,
-                resumed_lineage,
-                expected_step=checkpoint_step,
-                expected_actor_state_sha256=_model_actor_state_identity(
-                    self.model,
-                    resumed_lineage,
-                ),
-                expected_model_weights_sha256=_model_weights_identity(self.model),
-            )
-            self.model.config.actor_update_lineage = restored_lineage
-        self._reference_model = None
-        return checkpoint_info
 
     def _ensure_reference_model(self) -> None:
         """Create the frozen initial-policy reference on first use.
@@ -1017,6 +718,13 @@ def _require_ppo_signal(tensor: torch.Tensor | None, field_name: str) -> torch.T
     if tensor is None:
         raise ValueError(f"PPO trainer requires TrainingSignal.{field_name}")
     return tensor
+
+
+def _ppo_actor_valid_mask(signal: TrainingSignal) -> torch.Tensor:
+    """Return rows whose sampled policy action reached the controller."""
+    if signal.actor_valid is None:
+        return torch.ones_like(signal.is_padding, dtype=torch.bool)
+    return signal.actor_valid
 
 
 def _discounted_transition_reward(
@@ -1103,13 +811,21 @@ def _summarize_post_update_log_ratios(
     """Summarize one flat, already-masked post-update behavior-ratio pool."""
     flattened = log_ratios.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
     if flattened.numel() == 0:
-        raise ValueError("PPO post-update diagnostics found no valid replay actions")
+        return {
+            "train/post_update_valid_rows": 0,
+            "train/post_update_ratio_p01": 1.0,
+            "train/post_update_ratio_p50": 1.0,
+            "train/post_update_ratio_p99": 1.0,
+            "train/post_update_clip_fraction": 0.0,
+            "train/post_update_approx_kl": 0.0,
+        }
     if not torch.isfinite(flattened).all():
         raise FloatingPointError("PPO post-update log-ratios contain non-finite values")
 
-    # Match the numerically bounded ratio used by the PPO objective. The
-    # non-negative approximation below is (ratio - 1) - log(ratio), averaged
-    # over individual valid causal actions rather than over minibatches.
+    # Ratio diagnostics match the bounded exponent used by the PPO objective,
+    # but approximate KL intentionally retains the raw log-ratio so the clamp
+    # cannot hide policy divergence. Float64 keeps large finite joint Flow
+    # deltas observable without overflowing at float32's exponent boundary.
     bounded_log_ratios = flattened.clamp(min=-5.0, max=5.0)
     ratios = bounded_log_ratios.exp()
     quantiles = torch.quantile(
@@ -1117,9 +833,14 @@ def _summarize_post_update_log_ratios(
         torch.tensor([0.01, 0.5, 0.99], dtype=ratios.dtype),
     )
     clipped = (ratios < 1.0 - ratio_clip_low) | (ratios > 1.0 + ratio_clip_high)
-    approx_kl = torch.expm1(bounded_log_ratios) - bounded_log_ratios
+    raw_log_ratios = flattened.to(dtype=torch.float64)
+    approx_kl = torch.expm1(raw_log_ratios) - raw_log_ratios
+    if not torch.isfinite(approx_kl).all():
+        raise FloatingPointError(
+            "PPO post-update approximate KL is non-finite for raw log-ratios"
+        )
     return {
-        "train/post_update_valid_tokens": int(ratios.numel()),
+        "train/post_update_valid_rows": int(ratios.numel()),
         "train/post_update_ratio_p01": float(quantiles[0].item()),
         "train/post_update_ratio_p50": float(quantiles[1].item()),
         "train/post_update_ratio_p99": float(quantiles[2].item()),
@@ -1140,6 +861,10 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
     rewards, terminal flags, and rollout-time values, then trains a value head
     from model forward key ``values``.
     """
+
+    _flow_chunk_density = False
+    _dual_clip_ratio: float | None = None
+    _value_huber_delta: float | None = None
 
     def __init__(
         self,
@@ -1163,6 +888,18 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             raise ValueError(
                 f"PPO value_clip_range must be positive when set, got {self._value_clip_range}"
             )
+        dual_clip_ratio = ppo_config.get("dual_clip_ratio")
+        self._dual_clip_ratio = (
+            None if dual_clip_ratio is None else float(dual_clip_ratio)
+        )
+        if self._dual_clip_ratio is not None and self._dual_clip_ratio <= 1.0:
+            raise ValueError("PPO dual_clip_ratio must be greater than 1")
+        value_huber_delta = ppo_config.get("value_huber_delta")
+        self._value_huber_delta = (
+            None if value_huber_delta is None else float(value_huber_delta)
+        )
+        if self._value_huber_delta is not None and self._value_huber_delta <= 0.0:
+            raise ValueError("PPO value_huber_delta must be positive")
         self._normalize_advantages = bool(ppo_config.get("normalize_advantages", True))
         self._gamma = float(ppo_config.get("gamma", 0.99))
         self._gae_lambda = float(ppo_config.get("gae_lambda", 0.95))
@@ -1221,7 +958,7 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         """Flatten rollouts and compute PPO advantages/returns inside the trainer."""
         samples: list[Any] = []
         advantages: list[float] = []
-        padding: list[bool] = []
+        actor_valid_rows: list[bool] = []
         per_rollout_ranges: list[tuple[int, int]] = []
         for rollout in rollouts:
             start = len(samples)
@@ -1244,14 +981,25 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                 step_samples, rollout_advantages, rollout_returns
             ):
                 is_padding = bool(step.training_signal.is_padding.item())
-                samples.append(_with_ppo_targets(step, advantage=advantage, ret=ret))
-                advantages.append(0.0 if is_padding else advantage)
-                padding.append(is_padding)
+                actor_valid = (
+                    bool(_ppo_actor_valid_mask(step.training_signal).item())
+                    and not is_padding
+                )
+                actor_advantage = advantage if actor_valid else 0.0
+                samples.append(
+                    _with_ppo_targets(
+                        step,
+                        advantage=actor_advantage,
+                        ret=ret,
+                    )
+                )
+                advantages.append(actor_advantage)
+                actor_valid_rows.append(actor_valid)
             per_rollout_ranges.append((start, len(samples)))
 
         advantage_tensor = torch.tensor(advantages, dtype=torch.float32)
         if self._normalize_advantages and advantage_tensor.numel() > 0:
-            valid_mask = ~torch.tensor(padding, dtype=torch.bool)
+            valid_mask = torch.tensor(actor_valid_rows, dtype=torch.bool)
             if int(valid_mask.sum().item()) > 1:
                 valid_advantages = advantage_tensor[valid_mask]
                 std = valid_advantages.std(unbiased=False)
@@ -1270,9 +1018,8 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         """Re-score frozen behavior actions once under the final updated policy.
 
         This is a pure no-grad forward pass: it never calls backward, gradient
-        reduction, an optimizer, or the scheduler. Token policies contribute
-        one observation per valid causal token; row padding and non-causal
-        early-terminal shadow tails are excluded before all reductions.
+        reduction, an optimizer, or the scheduler. Each valid replay row
+        contributes one scalar policy-density ratio.
         """
         if not samples:
             raise ValueError("PPO post-update diagnostics require replay samples")
@@ -1292,14 +1039,14 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                     )
                     signal = minibatch.training_signal
                     is_padding = signal.is_padding.to(self.device)
+                    actor_valid = _ppo_actor_valid_mask(signal).to(self.device)
                     old_logprobs = signal.old_logprobs.to(self.device)
                     (
                         new_logprobs,
                         _kl_div,
                         _values,
-                        new_token_logprobs,
-                        old_token_logprobs,
-                        token_causality_mask,
+                        new_element_logprobs,
+                        old_element_logprobs,
                     ) = self._forward_with_reference_and_value(minibatch.model_inputs)
 
                     if tuple(new_logprobs.shape) != tuple(old_logprobs.shape):
@@ -1317,64 +1064,38 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                             "PPO post-update replay has non-finite old log-probabilities"
                         )
 
-                    if new_token_logprobs is None:
-                        if token_causality_mask is not None:
+                    if self._flow_chunk_density:
+                        if new_element_logprobs is None or old_element_logprobs is None:
                             raise ValueError(
-                                "scalar PPO replay unexpectedly carries a token "
-                                "causality mask"
-                            )
-                        log_ratios = new_logprobs - old_logprobs
-                        valid_mask = ~is_padding
-                    else:
-                        if old_token_logprobs is None or token_causality_mask is None:
-                            raise ValueError(
-                                "token-level PPO post-update diagnostics require old "
-                                "token log-probabilities and a causality mask"
-                            )
-                        if tuple(new_token_logprobs.shape) != tuple(
-                            old_token_logprobs.shape
-                        ):
-                            raise ValueError(
-                                "PPO post-update new/old token log-probability shapes "
-                                f"differ: {tuple(new_token_logprobs.shape)} != "
-                                f"{tuple(old_token_logprobs.shape)}"
-                            )
-                        if tuple(token_causality_mask.shape) != tuple(
-                            new_token_logprobs.shape
-                        ):
-                            raise ValueError(
-                                "PPO post-update token causality mask shape differs from "
-                                "token log-probabilities: "
-                                f"{tuple(token_causality_mask.shape)} != "
-                                f"{tuple(new_token_logprobs.shape)}"
-                            )
-                        if token_causality_mask.dtype is not torch.bool:
-                            raise TypeError(
-                                "PPO post-update token causality mask must have dtype bool"
+                                "Flow-PPO requires full selected-transition element "
+                                "log-probabilities"
                             )
                         if not torch.allclose(
-                            old_token_logprobs.sum(dim=-1),
+                            old_element_logprobs.sum(dim=-1),
                             old_logprobs,
                             rtol=1.0e-5,
                             atol=1.0e-5,
-                        ):
-                            raise ValueError(
-                                "sum(old_token_logprobs) does not match replay "
-                                "old_logprobs"
-                            )
-                        if not torch.allclose(
-                            new_token_logprobs.sum(dim=-1),
+                        ) or not torch.allclose(
+                            new_element_logprobs.sum(dim=-1),
                             new_logprobs,
                             rtol=1.0e-5,
                             atol=1.0e-5,
                         ):
                             raise ValueError(
-                                "sum(new token log-probabilities) does not match model "
-                                "log_probs"
+                                "Flow-PPO joint log-probability differs from its "
+                                "selected-transition elements"
                             )
-                        log_ratios = new_token_logprobs - old_token_logprobs
-                        valid_mask = (~is_padding).unsqueeze(-1).expand_as(log_ratios)
-                        valid_mask = valid_mask & token_causality_mask
+                    elif (
+                        new_element_logprobs is not None
+                        or old_element_logprobs is not None
+                    ):
+                        raise ValueError(
+                            "alpagym_ppo accepts only scalar policy densities; "
+                            "use alpagym_flow_ppo for Flow-SDE elements"
+                        )
+
+                    log_ratios = new_logprobs - old_logprobs
+                    valid_mask = (~is_padding) & actor_valid
 
                     selected = log_ratios[valid_mask]
                     if selected.numel() > 0:
@@ -1390,10 +1111,10 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             ratio_clip_high=self._grpo_ratio_clip_high,
         )
         logger.info(
-            "AlpaGym PPO post-update diagnostics valid_tokens=%d "
+            "AlpaGym PPO post-update diagnostics valid_rows=%d "
             "ratio_p01=%.6f ratio_p50=%.6f ratio_p99=%.6f "
             "clip_fraction=%.6f approx_kl=%.6f",
-            int(metrics["train/post_update_valid_tokens"]),
+            int(metrics["train/post_update_valid_rows"]),
             float(metrics["train/post_update_ratio_p01"]),
             float(metrics["train/post_update_ratio_p50"]),
             float(metrics["train/post_update_ratio_p99"]),
@@ -1477,6 +1198,8 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         minibatch = self.data_packer.policy_collate_fn(minibatch_samples)
         signal = minibatch.training_signal
         is_padding = signal.is_padding.to(self.device)
+        actor_valid = _ppo_actor_valid_mask(signal).to(self.device)
+        actor_is_padding = is_padding | ~actor_valid
         old_logprobs = signal.old_logprobs.to(self.device)
         advantages = minibatch_advantages.to(device=self.device, dtype=torch.float32)
         returns = _require_ppo_signal(signal.returns, "returns").to(self.device)
@@ -1491,9 +1214,8 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             new_logprobs,
             kl_div,
             values,
-            new_token_logprobs,
-            old_token_logprobs,
-            token_causality_mask,
+            new_element_logprobs,
+            old_element_logprobs,
         ) = self._forward_with_reference_and_value(minibatch.model_inputs)
         assert_replay_shapes(
             new_logprobs,
@@ -1504,51 +1226,41 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             returns=returns,
             old_values=old_values,
         )
-        if new_token_logprobs is None:
+        if self._flow_chunk_density:
+            if new_element_logprobs is None or old_element_logprobs is None:
+                raise ValueError(
+                    "Flow-PPO requires full selected-transition element "
+                    "log-probabilities"
+                )
+            policy_loss, ratio = compute_flow_ppo_surrogate(
+                new_element_logprobs,
+                old_element_logprobs,
+                new_logprobs,
+                old_logprobs,
+                advantages,
+                ratio_clip_low=self._grpo_ratio_clip_low,
+                ratio_clip_high=self._grpo_ratio_clip_high,
+                dual_clip_ratio=float(self._dual_clip_ratio),
+                is_padding=actor_is_padding,
+            )
+        else:
+            if new_element_logprobs is not None or old_element_logprobs is not None:
+                raise ValueError(
+                    "alpagym_ppo accepts only scalar policy densities; "
+                    "use alpagym_flow_ppo for Flow-SDE elements"
+                )
             policy_loss, ratio = compute_ppo_surrogate(
                 new_logprobs,
                 old_logprobs,
                 advantages,
                 ratio_clip_low=self._grpo_ratio_clip_low,
                 ratio_clip_high=self._grpo_ratio_clip_high,
-                is_padding=is_padding,
-            )
-        else:
-            assert old_token_logprobs is not None
-            if token_causality_mask is None:
-                raise ValueError(
-                    "token-level PPO replay is missing token_causality_mask"
-                )
-            if not torch.allclose(
-                old_token_logprobs.sum(dim=-1),
-                old_logprobs,
-                rtol=1.0e-5,
-                atol=1.0e-5,
-            ):
-                raise ValueError(
-                    "sum(old_token_logprobs) does not match replay old_logprobs"
-                )
-            if not torch.allclose(
-                new_token_logprobs.sum(dim=-1),
-                new_logprobs,
-                rtol=1.0e-5,
-                atol=1.0e-5,
-            ):
-                raise ValueError(
-                    "sum(new token log-probabilities) does not match model log_probs"
-                )
-            policy_loss, ratio = compute_token_ppo_surrogate(
-                new_token_logprobs,
-                old_token_logprobs,
-                advantages,
-                ratio_clip_low=self._grpo_ratio_clip_low,
-                ratio_clip_high=self._grpo_ratio_clip_high,
-                is_padding=is_padding,
-                token_causality_mask=token_causality_mask,
+                is_padding=actor_is_padding,
+                dual_clip_ratio=self._dual_clip_ratio,
             )
         kl_loss = compute_kl_penalty(
             kl_div,
-            is_padding,
+            actor_is_padding,
             kl_beta=self._kl_beta,
             device=self.device,
         )
@@ -1558,6 +1270,7 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             is_padding,
             old_values=old_values,
             value_clip_range=self._value_clip_range,
+            huber_delta=self._value_huber_delta,
         )
         loss = policy_loss + kl_loss + self._value_loss_coef * value_loss
 
@@ -1572,12 +1285,12 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             kl_loss=kl_loss,
             ratio=ratio,
             is_padding=is_padding,
+            actor_valid=actor_valid,
             advantages=advantages,
             returns=returns,
             values=values,
             old_logprobs=old_logprobs,
             new_logprobs=new_logprobs,
-            token_causality_mask=token_causality_mask,
             grad_norm=grad_norm,
         )
 
@@ -1590,28 +1303,25 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         torch.Tensor,
         torch.Tensor | None,
         torch.Tensor | None,
-        torch.Tensor | None,
     ]:
-        """Run actor-critic forward with optional reference model for KL."""
+        """Run actor-critic forward with optional Flow-density elements."""
         forward_kwargs = to_device_recursive(model_inputs, self.device)
-        old_token_logprobs = forward_kwargs.pop("old_token_logprobs", None)
-        token_causality_mask = forward_kwargs.pop("token_causality_mask", None)
+        old_element_logprobs = forward_kwargs.pop("old_element_logprobs", None)
         if self._reference_model is not None:
             forward_kwargs["teacher_model"] = self._reference_model
         result = self.model(**forward_kwargs)
-        new_token_logprobs = result.get("token_log_probs")
-        if (new_token_logprobs is None) != (old_token_logprobs is None):
+        new_element_logprobs = result.get("element_log_probs")
+        if (new_element_logprobs is None) != (old_element_logprobs is None):
             raise ValueError(
-                "token-level PPO requires both model token_log_probs and replay "
-                "old_token_logprobs"
+                "Flow-PPO requires both model element_log_probs and replay "
+                "old_element_logprobs"
             )
         return (
             result["log_probs"],
             result.get("kl_div"),
             result["values"].reshape(-1),
-            new_token_logprobs,
-            old_token_logprobs,
-            token_causality_mask,
+            new_element_logprobs,
+            old_element_logprobs,
         )
 
     def _ppo_minibatch_metrics(
@@ -1622,31 +1332,42 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         kl_loss: torch.Tensor,
         ratio: torch.Tensor,
         is_padding: torch.Tensor,
+        actor_valid: torch.Tensor,
         advantages: torch.Tensor,
         returns: torch.Tensor,
         values: torch.Tensor,
         old_logprobs: torch.Tensor,
         new_logprobs: torch.Tensor,
-        token_causality_mask: torch.Tensor | None,
         grad_norm: float,
     ) -> tuple[float, float, float, float, float, float]:
         """Compute PPO diagnostics over valid rows and return trainer-loop metrics."""
-        valid_mask = ~is_padding
+        actor_mask = (~is_padding) & actor_valid
+        value_mask = ~is_padding
         loss_value = float(loss.item())
         with torch.no_grad():
-            ratio_valid_mask = valid_mask
-            if ratio.ndim == 2:
-                ratio_valid_mask = valid_mask.unsqueeze(-1).expand_as(ratio)
-                if token_causality_mask is not None:
-                    ratio_valid_mask = ratio_valid_mask & token_causality_mask
-            valid_ratio = ratio[ratio_valid_mask]
+            if bool(value_mask.any()):
+                return_mean = float(returns[value_mask].mean().item())
+                value_mean = float(values[value_mask].mean().item())
+            else:
+                return_mean = 0.0
+                value_mean = 0.0
+            if bool(actor_mask.any()):
+                old_logprob_mean = float(old_logprobs[actor_mask].mean().item())
+                new_logprob_mean = float(new_logprobs[actor_mask].mean().item())
+            else:
+                old_logprob_mean = 0.0
+                new_logprob_mean = 0.0
+            if ratio.shape != actor_mask.shape:
+                raise ValueError(
+                    "PPO joint ratio shape must match replay rows: "
+                    f"{tuple(ratio.shape)} != {tuple(actor_mask.shape)}"
+                )
+            valid_ratio = ratio[actor_mask]
             if valid_ratio.numel() == 0:
                 clip_fraction = 0.0
                 batch_ratio_max = 1.0
                 batch_ratio_min = 1.0
                 advantage_mean = 0.0
-                return_mean = 0.0
-                value_mean = 0.0
             else:
                 clipped = (valid_ratio < 1.0 - self._grpo_ratio_clip_low) | (
                     valid_ratio > 1.0 + self._grpo_ratio_clip_high
@@ -1654,9 +1375,7 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                 clip_fraction = float(clipped.float().mean().item())
                 batch_ratio_max = float(valid_ratio.max().item())
                 batch_ratio_min = float(valid_ratio.min().item())
-                advantage_mean = float(advantages[valid_mask].mean().item())
-                return_mean = float(returns[valid_mask].mean().item())
-                value_mean = float(values[valid_mask].mean().item())
+                advantage_mean = float(advantages[actor_mask].mean().item())
         logger.info(
             "AlpaGym PPO minibatch rows=%d valid_rows=%d loss=%.6f "
             "policy_loss=%.6f value_loss=%.6f kl_loss=%.6f ratio_min=%.6f "
@@ -1664,7 +1383,7 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             "return_mean=%.6f value_mean=%.6f old_logprob_mean=%.6f "
             "new_logprob_mean=%.6f grad_norm=%.6f",
             int(old_logprobs.numel()),
-            int(valid_mask.sum().item()),
+            int(actor_mask.sum().item()),
             loss_value,
             float(policy_loss.item()),
             float(value_loss.item()),
@@ -1675,8 +1394,8 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             advantage_mean,
             return_mean,
             value_mean,
-            float(old_logprobs.mean().item()),
-            float(new_logprobs.mean().item()),
+            old_logprob_mean,
+            new_logprob_mean,
             grad_norm,
         )
         return (
@@ -1687,3 +1406,176 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             clip_fraction,
             grad_norm,
         )
+
+
+@_trainer_base.TrainerRegistry.register(trainer_type="alpagym_flow_ppo")
+class AlpagymFlowPPOTrainer(AlpagymPPOTrainer):
+    """RLinf Flow-PPO over one selected Flow-SDE transition per decision.
+
+    Policy packages retain the selected transition's elementwise Gaussian
+    log-probabilities. The trainer sums the complete transition density into
+    one joint chunk log-probability before applying the PPO ratio and clip.
+    """
+
+    _flow_chunk_density = True
+
+    def __init__(
+        self,
+        config: _cosmos_config.Config,
+        parallel_dims: _parallelism.ParallelDims,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize and verify the source-pinned Flow-PPO loss contract."""
+        super().__init__(config=config, parallel_dims=parallel_dims, **kwargs)
+        expected = {
+            "ratio_clip_low": (self._grpo_ratio_clip_low, 0.2),
+            "ratio_clip_high": (self._grpo_ratio_clip_high, 0.28),
+            "dual_clip_ratio": (self._dual_clip_ratio, 3.0),
+            "value_loss_coef": (self._value_loss_coef, 1.0),
+            "value_clip_range": (self._value_clip_range, 0.2),
+            "value_huber_delta": (self._value_huber_delta, 10.0),
+            "gamma": (self._gamma, 0.99),
+            "gae_lambda": (self._gae_lambda, 0.95),
+        }
+        mismatches = [
+            f"{name}={actual!r} (expected {required!r})"
+            for name, (actual, required) in expected.items()
+            if actual != required
+        ]
+        if mismatches:
+            raise ValueError(
+                "alpagym_flow_ppo differs from the pinned RLinf contract: "
+                + ", ".join(mismatches)
+            )
+        if not self._normalize_advantages:
+            raise ValueError("alpagym_flow_ppo requires normalized advantages")
+        if self._kl_beta != 0.0 or self._reference_model is not None:
+            raise ValueError("alpagym_flow_ppo does not use reference-model KL")
+
+    def _compute_gae(self, step_samples: list[Any]) -> tuple[list[float], list[float]]:
+        """Compute variable-duration GAE on Wenhao's nominal 0.5 s clock.
+
+        RLinf's configured ``gamma`` and ``lambda`` are per policy decision,
+        not per 50 Hz controller tick.  A nominal transition is 25 controller
+        ticks; delayed plan installation may make the realized interval longer.
+        We therefore time-scale gamma by ``duration / 25`` while applying
+        lambda once per sampled policy transition.
+        """
+        nominal_duration_ticks = 25.0
+        transitions: list[tuple[float, int, bool, bool, float, float | None]] = []
+        valid_indices: list[int] = []
+        for index, step in enumerate(step_samples):
+            signal = step.training_signal
+            if bool(signal.is_padding.item()):
+                continue
+            terminated = bool(
+                _require_ppo_signal(signal.terminateds, "terminateds").item()
+            )
+            truncated = (
+                False if signal.truncateds is None else bool(signal.truncateds.item())
+            )
+            if terminated and truncated:
+                raise ValueError(
+                    "Flow-PPO transition cannot be both terminated and truncated"
+                )
+            primitive_rewards = _require_ppo_signal(
+                signal.primitive_rewards, "primitive_rewards"
+            ).reshape(-1)
+            primitive_mask = _require_ppo_signal(
+                signal.primitive_reward_mask, "primitive_reward_mask"
+            ).reshape(-1)
+            duration = int(
+                _require_ppo_signal(signal.duration_ticks, "duration_ticks").item()
+            )
+            if not 1 <= duration <= primitive_rewards.numel():
+                raise ValueError(
+                    "Flow-PPO duration must select a non-empty realized reward prefix"
+                )
+            expected_mask = torch.arange(primitive_rewards.numel()) < duration
+            if not torch.equal(primitive_mask.cpu(), expected_mask):
+                raise ValueError(
+                    "Flow-PPO primitive reward mask must match duration_ticks"
+                )
+            selected_rewards = primitive_rewards[:duration]
+            if not torch.isfinite(selected_rewards).all():
+                raise ValueError("Flow-PPO primitive rewards must be finite")
+            transition_reward = selected_rewards.to(dtype=torch.float64).sum()
+            transported_reward = _require_ppo_signal(signal.rewards, "rewards").reshape(
+                -1
+            )
+            if (
+                transported_reward.numel() != 1
+                or not torch.isfinite(transported_reward).all()
+            ):
+                raise ValueError("Flow-PPO requires one finite transition reward")
+            if not torch.isclose(
+                transition_reward,
+                transported_reward[0].to(dtype=torch.float64),
+                rtol=1.0e-6,
+                atol=1.0e-6,
+            ):
+                raise ValueError(
+                    "Flow-PPO transition reward differs from its realized tick rewards"
+                )
+            value = float(_require_ppo_signal(signal.old_values, "old_values").item())
+            bootstrap = (
+                None
+                if signal.bootstrap_values is None
+                else float(signal.bootstrap_values.item())
+            )
+            transitions.append(
+                (
+                    float(transition_reward.item()),
+                    duration,
+                    terminated,
+                    truncated,
+                    value,
+                    bootstrap,
+                )
+            )
+            valid_indices.append(index)
+
+        advantages = [0.0 for _ in step_samples]
+        returns = [0.0 for _ in step_samples]
+        last_gae = 0.0
+        for valid_pos in reversed(range(len(valid_indices))):
+            reward, duration, terminated, truncated, value, bootstrap = transitions[
+                valid_pos
+            ]
+            if bootstrap is None:
+                bootstrap = (
+                    transitions[valid_pos + 1][4]
+                    if valid_pos + 1 < len(transitions)
+                    else 0.0
+                )
+            gamma_duration = self._gamma ** (duration / nominal_duration_ticks)
+            delta = reward + (0.0 if terminated else gamma_duration) * bootstrap - value
+            continues = (
+                not terminated and not truncated and valid_pos + 1 < len(transitions)
+            )
+            last_gae = delta + (
+                gamma_duration * self._gae_lambda * last_gae if continues else 0.0
+            )
+            sample_index = valid_indices[valid_pos]
+            advantages[sample_index] = float(last_gae)
+            returns[sample_index] = float(last_gae + value)
+        return advantages, returns
+
+    def _forward_with_reference_and_value(
+        self,
+        model_inputs: dict[str, Any],
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Replay Flow density under the same CUDA bf16 path as rollout."""
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.bfloat16,
+            enabled=self.device.type == "cuda",
+        ):
+            return super()._forward_with_reference_and_value(model_inputs)

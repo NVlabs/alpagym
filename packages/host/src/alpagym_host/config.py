@@ -151,6 +151,19 @@ class HumanoidExecutionProfile(StrEnum):
     motion_reference = "motion_reference"
 
 
+class HumanoidPolicyCameraProfile(StrEnum):
+    """Atomic AlpaSim camera profiles supported by humanoid policies."""
+
+    wenhao_d455 = "wenhao_d455"
+
+    @property
+    def wizard_config_group(self) -> str:
+        """Return the external AlpaSim Hydra cameras config-group name."""
+        match self:
+            case HumanoidPolicyCameraProfile.wenhao_d455:
+                return "humanoid_wenhao_d455"
+
+
 @dataclass
 class ModelConfig:
     """NN identity, device placement, and model I/O contract."""
@@ -186,9 +199,9 @@ class InferenceConfig:
 
 @dataclass
 class AlpamayoPolicyConfig:
-    """Authored policy settings consumed by the rollout backend."""
+    """Authored AV or humanoid policy settings consumed by the rollout backend."""
 
-    kind: str  # always "alpamayo"
+    kind: str  # top-level runtime family label (for example "alpamayo" or "humanoid")
     model: ModelConfig
     inference: InferenceConfig
     trajectory_selector: TrajectorySelectorKind
@@ -223,6 +236,8 @@ class CosmosRLTrainPolicyConfig:
     trainer_type: str = "alpagym_grpo"
     ppo_value_loss_coef: float = 0.5
     ppo_value_clip_range: float | None = None
+    ppo_dual_clip_ratio: float | None = None
+    ppo_value_huber_delta: float | None = None
     ppo_normalize_advantages: bool = True
     ppo_gamma: float = 0.99
     ppo_gae_lambda: float = 0.95
@@ -262,6 +277,11 @@ class CosmosRLTrainConfig:
     optm_lr: float
     optm_warmup_steps: int
     train_policy: CosmosRLTrainPolicyConfig
+    optm_part_lrs: list[float] = field(default_factory=list)
+    epsilon: float = 1.0e-6
+    optm_weight_decay: float = 0.01
+    optm_betas: list[float] = field(default_factory=lambda: [0.9, 0.999])
+    optm_grad_norm_clip: float = 1.0
     # LR schedule after warmup. decay_type in {sqrt, cosine, linear, none};
     # decay_ratio is the fraction of total steps spent decaying (1.0 = whole run);
     # lr decays to optm_min_lr_factor * optm_lr (0.0 = down to zero). The
@@ -415,17 +435,21 @@ class AlpaSimWizardArgs:
 
 @dataclass
 class HumanoidAlpaSimConfig:
-    """Scene-bound inputs and task parameters for managed MJLab rollouts."""
+    """Scene-bound inputs and task parameters for managed humanoid rollouts."""
 
     repo_path: str
     scene_store_path: str
     scenario_ids_by_scene: dict[str, str]
     execution_profile: HumanoidExecutionProfile = HumanoidExecutionProfile.direct_action
-    # Host-derived from the planner mode before the resolved run config is
-    # written. It selects the exact AlpaSim motion-reference wire profile.
-    reference_frame_count: int = 70
+    # Selects the exact AlpaSim motion-reference wire profile.
+    reference_frame_count: int = 50
     # Required by the fixed GRAIL/SONIC controller image in reference mode.
     grail_root_path: str | None = None
+    # Selects an atomic AlpaSim cameras config group.  A null value preserves
+    # motion-reference policies that do not consume rendered observations.
+    policy_camera_profile: HumanoidPolicyCameraProfile | None = None
+    # Writable host path mounted into the worker-local policy-camera renderer.
+    scene_cache_path: str | None = None
     # Host-frozen identity snapshot.  Authored configs leave this empty; run
     # preparation fills it from every selected SceneStore manifest before the
     # resolved config is written.
@@ -436,6 +460,9 @@ class HumanoidAlpaSimConfig:
     # stochastic training.
     rollout_seed_base: int | None = None
     num_envs: int = 1
+    # Dynamics image for ordinary humanoid runs.  With a worker-local policy
+    # camera this must be a dependency-complete combined runtime+dynamics
+    # image; AlpaSim's atomic camera profile routes it to both services.
     service_image: str = "alpasim-humanoid:local"
     reward_profile_id: str = "direct_v9_shaped.v1"
     route_center_soft_m: float = 0.10
@@ -460,6 +487,31 @@ class HumanoidAlpaSimConfig:
         ):
             raise ValueError(
                 "HumanoidAlpaSimConfig.grail_root_path is required for motion_reference"
+            )
+        if self.policy_camera_profile is not None:
+            if self.execution_profile is not HumanoidExecutionProfile.motion_reference:
+                raise ValueError(
+                    "HumanoidAlpaSimConfig.policy_camera_profile requires "
+                    "motion_reference"
+                )
+            if not self.scene_cache_path:
+                raise ValueError(
+                    "HumanoidAlpaSimConfig.scene_cache_path is required for "
+                    "policy_camera_profile"
+                )
+            if not Path(self.scene_cache_path).is_absolute():
+                raise ValueError(
+                    "HumanoidAlpaSimConfig.scene_cache_path must be absolute"
+                )
+            if self.service_image == "alpasim-humanoid:local":
+                raise ValueError(
+                    "Wenhao D455 policy_camera requires a combined image with "
+                    "Open3D, Embree, gsplat, and MuJoCo-Warp; "
+                    "alpasim-humanoid:local is dynamics-only"
+                )
+        elif self.scene_cache_path is not None:
+            raise ValueError(
+                "HumanoidAlpaSimConfig.scene_cache_path requires policy_camera_profile"
             )
         if self.execution_profile is HumanoidExecutionProfile.motion_reference:
             if self.reward_profile_id not in (

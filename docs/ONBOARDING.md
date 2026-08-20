@@ -194,8 +194,9 @@ GPU.
 
 Optionally, evaluate a post-trained checkpoint in AlpaSim.
 
-**1. Convert the export to inference format.** Each run writes a safetensors export
-at its final step under `tmp/alpagym-runs/<run>/cosmos/<timestamp>/safetensors/step_<N>/`.
+**1. Convert the export to inference format.** With checkpointing enabled and
+`export_safetensors: true`, a run writes a safetensors export at its final step
+under `tmp/alpagym-runs/<run>/cosmos/<timestamp>/safetensors/step_<N>/`.
 The AlpaSim driver can't load it directly, so convert it (the inverse of the
 model-conversion step above):
 

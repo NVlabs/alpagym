@@ -50,6 +50,7 @@ def build_simulation_request_proto(
     n_concurrent_per_humanoid_policy: int = 0,
     humanoid_scenario_ids: tuple[str, ...] | None = None,
     random_seed: int | None = None,
+    expected_behavior_policy_version: int | None = None,
 ) -> SimulationRequest:
     """Build one RuntimeService simulate request."""
     if not scene_ids:
@@ -73,6 +74,18 @@ def build_simulation_request_proto(
             or not 0 <= random_seed <= (1 << 64) - 1
         ):
             raise ValueError("random_seed must be a uint64 or null")
+    if expected_behavior_policy_version is not None:
+        if session_uuid is None:
+            raise ValueError("expected_behavior_policy_version requires a session_uuid")
+        if (
+            isinstance(expected_behavior_policy_version, bool)
+            or not isinstance(expected_behavior_policy_version, int)
+            or expected_behavior_policy_version < 0
+        ):
+            raise ValueError(
+                "expected_behavior_policy_version must be a non-negative integer "
+                "or null"
+            )
 
     uses_driver = (
         driver_host is not None
@@ -91,6 +104,11 @@ def build_simulation_request_proto(
         )
     if random_seed is not None and not uses_humanoid_policy:
         raise ValueError("random_seed is only supported for humanoid rollout requests")
+    if expected_behavior_policy_version is not None and not uses_humanoid_policy:
+        raise ValueError(
+            "expected_behavior_policy_version is only supported for humanoid "
+            "rollout requests"
+        )
 
     simulation_request = SimulationRequest()
     if uses_driver:
@@ -143,6 +161,10 @@ def build_simulation_request_proto(
                     rollout_spec.random_seed = int.from_bytes(digest[:8], "big") or 1
                 else:
                     rollout_spec.random_seed = random_seed
+                if expected_behavior_policy_version is not None:
+                    rollout_spec.expected_behavior_policy_version = str(
+                        expected_behavior_policy_version
+                    )
     return simulation_request
 
 

@@ -9,10 +9,7 @@ from typing import Any, Callable
 import torch
 from alpagym_host.config import CosmosRLMode, RunConfig
 
-from alpagym_runtime.alpasim.humanoid_policy_server import (
-    HumanoidPolicy,
-    ZeroHumanoidPolicy,
-)
+from alpagym_runtime.alpasim.humanoid_policy_server import HumanoidPolicy
 from alpagym_runtime.inference.inference_engine import InferenceEngine
 from alpagym_runtime.policies.alpamayo.determinism import set_deterministic
 from alpagym_runtime.policies.alpamayo.policy import AlpamayoPolicy
@@ -105,17 +102,12 @@ def build_humanoid_policy_factory(
 ) -> Callable[[str, Any], HumanoidPolicy]:
     """Build the per-session humanoid policy factory for AlpaSim callbacks.
 
-    ``policy.model.bundle_config.humanoid_policy_factory`` may name a callable as
+    ``policy.model.bundle_config.humanoid_policy_factory`` names a callable as
     ``"module:attribute"``. The callable receives ``(run_config,
     inference_engine)`` and returns the actual per-session factory consumed by
-    ``HumanoidPolicyServer``. The special value ``"zero"`` is a dependency-free
-    smoke-test policy.
+    ``HumanoidPolicyServer``.
     """
-    factory_spec = run_config.policy.model.bundle_config.get("humanoid_policy_factory")
-    if factory_spec in (None, "zero"):
-        return lambda session_uuid, request: ZeroHumanoidPolicy(  # noqa: ARG005
-            action_size=int(request.action_size)
-        )
+    factory_spec = run_config.policy.model.bundle_config["humanoid_policy_factory"]
     factory_builder = _load_callable(str(factory_spec))
     policy_factory = factory_builder(run_config, inference_engine)
     if not callable(policy_factory):
@@ -126,13 +118,29 @@ def build_humanoid_policy_factory(
     return policy_factory
 
 
+def humanoid_policy_camera_required(run_config: RunConfig) -> bool:
+    """Return the explicit fail-closed camera ABI requirement for this policy.
+
+    Visual humanoid/VLA bundles must set
+    ``policy.model.bundle_config.require_policy_camera: true``. Keeping this an
+    explicit boolean lets non-visual humanoid policies use the base camera wire,
+    while preventing a visual policy from silently running after an older
+    protobuf parser drops ``policy_camera_spec``.
+    """
+    value = run_config.policy.model.bundle_config.get("require_policy_camera", False)
+    if not isinstance(value, bool):
+        raise TypeError(
+            "policy.model.bundle_config.require_policy_camera must be a boolean"
+        )
+    return value
+
+
 def _load_callable(spec: str) -> Callable[..., Any]:
     """Resolve a ``module:attribute`` callable spec."""
     module_name, separator, attr_name = spec.partition(":")
     if not separator or not module_name or not attr_name:
         raise ValueError(
-            "humanoid_policy_factory must use 'module:attribute' syntax "
-            f"or the special value 'zero'; got {spec!r}"
+            f"humanoid_policy_factory must use 'module:attribute' syntax got {spec!r}"
         )
     target: Any = import_module(module_name)
     for part in attr_name.split("."):

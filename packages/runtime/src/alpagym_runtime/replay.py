@@ -75,6 +75,9 @@ class TrainingSignal:
         ``[BT, K]`` and an integer ``duration_ticks`` vector ``[BT]``.
         ``old_values`` and ``bootstrap_values`` are rollout-policy value
         estimates at macro decision boundaries.
+        ``actor_valid`` is ``[BT]`` and is false when a sampled action never
+        reached the controller; those rows still train the value function and
+        participate in GAE, but never enter actor-density losses or diagnostics.
         ``advantages`` and ``returns`` are trainer-derived and are never required
         in rollout replay payloads.
     """
@@ -91,6 +94,7 @@ class TrainingSignal:
     primitive_rewards: torch.Tensor | None = None
     primitive_reward_mask: torch.Tensor | None = None
     duration_ticks: torch.Tensor | None = None
+    actor_valid: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         """Require aligned flattened trainer rows."""
@@ -122,7 +126,7 @@ class TrainingSignal:
             _validate_optional_signal_tensor(
                 field_name, getattr(self, field_name), expected
             )
-        for field_name in ("terminateds", "truncateds"):
+        for field_name in ("terminateds", "truncateds", "actor_valid"):
             tensor = getattr(self, field_name)
             _validate_optional_signal_tensor(field_name, tensor, expected)
             if tensor is not None and tensor.dtype != torch.bool:
@@ -254,6 +258,7 @@ class TrainerReplayDataBatch:
                     samples, "primitive_reward_mask"
                 ),
                 duration_ticks=_cat_optional_signal(samples, "duration_ticks"),
+                actor_valid=_cat_optional_signal(samples, "actor_valid"),
             ),
             rollout_ids=tuple(sample.rollout_id for sample in samples),
             weight_versions=torch.stack(

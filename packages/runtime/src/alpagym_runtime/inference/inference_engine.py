@@ -128,7 +128,10 @@ class InferenceEngine:
         The disaggregated rollout backend calls this only after Cosmos has made
         ``current_weight_version`` live.  Later R2R writes target the live model,
         while policies holding this independent module keep scoring and sampling
-        from the exact weights that opened their episode.
+        from the exact weights that opened their episode.  Large multimodal models
+        may implement ``clone_for_inference_lease()`` to share immutable frozen
+        storage while cloning only their mutable actor overlay; models without that
+        hook retain the generic deep-copy behavior.
         """
 
         if (
@@ -138,7 +141,19 @@ class InferenceEngine:
         ):
             raise ValueError("model lease requires a non-negative behavior version")
         with self._model_lock:
-            snapshot = deepcopy(self._inference_model.get_model())
+            live_model = self._inference_model.get_model()
+            clone_for_lease = getattr(live_model, "clone_for_inference_lease", None)
+            snapshot = (
+                clone_for_lease() if callable(clone_for_lease) else deepcopy(live_model)
+            )
+        if not isinstance(snapshot, torch.nn.Module):
+            raise TypeError(
+                "model clone_for_inference_lease() must return a torch.nn.Module"
+            )
+        if snapshot is live_model:
+            raise ValueError(
+                "model clone_for_inference_lease() must return an independent module"
+            )
         snapshot.eval()
         snapshot.requires_grad_(False)
         return InferenceModelLease(

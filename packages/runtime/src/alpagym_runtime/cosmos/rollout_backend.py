@@ -40,6 +40,7 @@ from alpagym_runtime.policies.factory import (
     build_humanoid_policy_factory,
     build_inference_engine,
     build_policy_factory,
+    humanoid_policy_camera_required,
 )
 
 logger = logging.getLogger(__name__)
@@ -144,6 +145,7 @@ class AlpagymRollout(RolloutBase):
                     if self._humanoid_session_model_leases
                     else None
                 ),
+                require_policy_camera=humanoid_policy_camera_required(self._run_config),
             )
             self._humanoid_policy_server.start()
         elif simulation_domain == "av":

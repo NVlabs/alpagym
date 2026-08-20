@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alpagym-g1-wenhao-vla"
+version = "0.1.0"
+dependencies = [
+  "alpagym-runtime",
+  "diffusers",
+  "qwen-vl-utils",
+  "safetensors",
+  "transformers",
+  "tyro==0.9.32",
+]
+
+[project.entry-points."alpagym.policy_bundles"]
+g1_wenhao_vla = "alpagym_g1_wenhao_vla.bundle:get_bundle"
+
+[project.entry-points."alpagym.configs"]
+g1_wenhao_vla = "alpagym_g1_wenhao_vla.configs"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"alpagym_g1_wenhao_vla.configs" = ["**/*.yaml"]

@@ -3,6 +3,8 @@
 
 """Tests for strict lane-local humanoid transition joins."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -55,7 +57,7 @@ def _motion_output(
     active_digest: str | None = None,
     applied_digest: str | None = None,
     root_offset: float = 0.125,
-    frame_count: int = 70,
+    frame_count: int = 50,
     step: int = 0,
     reward_total: float = 1.0,
 ) -> PolicyOutput:
@@ -299,16 +301,15 @@ def test_motion_reference_receipt_emits_exact_smdp_prefix(duration: int) -> None
 
     transition = patched[0].replay_data.payload["transition"]
     assert transition["duration_ticks"] == duration
-    assert transition["primitive_reward_mask"] == [
-        index < duration for index in range(25)
-    ]
+    assert transition["primitive_reward_mask"] == [True] * duration
+    assert len(transition["primitive_rewards"]) == duration
     assert sum(transition["primitive_rewards"]) == pytest.approx(1.0)
     assert transition["terminated"] is True
     assert transition["bootstrap_value"] == 0.0
 
 
-def test_motion_reference_replay_rejects_non_k25_contract() -> None:
-    with pytest.raises(ValueError, match="must select K=25"):
+def test_motion_reference_replay_rejects_wrong_replan_period() -> None:
+    with pytest.raises(ValueError, match="25-tick native replan trigger"):
         attach_humanoid_transitions(
             (_motion_output(duration=1),),
             _motion_metrics(
@@ -370,7 +371,7 @@ def test_motion_reference_outer_horizon_truncates_after_full_controller_prefix()
     (
         (
             _motion_output(duration=1, active_digest="b" * 64),
-            "active reference digest",
+            "third or unknown active reference",
         ),
         (
             _motion_output(duration=1, root_offset=0.5),
@@ -399,24 +400,254 @@ def test_motion_reference_receipt_rejects_mixed_identity(
         )
 
 
-def test_h70_replay_rejects_rewritten_applied_reference_hash() -> None:
-    with pytest.raises(ValueError, match="H70 feedback applied reference digest"):
+def _async_motion_outputs() -> tuple[PolicyOutput, PolicyOutput]:
+    """Build a 25-tick sample followed by a 37-tick old-to-new interval."""
+    first = _motion_output(duration=25, terminated=False, step=0)
+    second = _motion_output(duration=37, terminated=True, step=1)
+    assert second.replay_data is not None
+    payload = dict(second.replay_data.payload)
+    payload.update(
+        reference_id=8,
+        reference_sha256="b" * 64,
+    )
+    ticks = []
+    for tick_index in range(37):
+        predecessor = tick_index < 12
+        ticks.append(
+            {
+                "control_tick_offset": tick_index + 1,
+                "reference_action_index": 25 + tick_index
+                if predecessor
+                else tick_index,
+                "timestamp_us": 520_000 + tick_index * 20_000,
+                "active_reference_id": 7 if predecessor else 8,
+                "active_reference_sha256": "a" * 64 if predecessor else "b" * 64,
+                "applied_reference_sha256": "c" * 64 if predecessor else "d" * 64,
+                "root_z_alignment_offset_m": 0.125,
+                "reward": 1.0 / 37.0,
+                "terminated": tick_index == 36,
+                "truncated": False,
+                "control_episode_step": 26 + tick_index,
+            }
+        )
+    payload["feedback_trace"] = {
+        "env_id": 0,
+        "source_decision_id": 1,
+        "ticks": ticks,
+    }
+    second = replace(
+        second,
+        replay_data=replace(second.replay_data, payload=payload),
+    )
+    return first, second
+
+
+def _async_motion_metrics() -> dict[str, dict[str, object]]:
+    """Return two row-level ScenarioEval metrics for the async fixture."""
+    timestamps = [500_000, 1_240_000]
+    return {
+        "humanoid_reward_env0": {
+            "timestamps_us": timestamps,
+            "values": [1.0, 1.0],
+            "valid": [True, True],
+        },
+        "humanoid_terminated_env0": {
+            "timestamps_us": timestamps,
+            "values": [0.0, 1.0],
+            "valid": [True, True],
+        },
+        "humanoid_truncated_env0": {
+            "timestamps_us": timestamps,
+            "values": [0.0, 0.0],
+            "valid": [True, True],
+        },
+    }
+
+
+def test_async_motion_receipt_attributes_predecessor_prefix_to_owning_sample() -> None:
+    outputs = _async_motion_outputs()
+    patched = attach_humanoid_transitions(
+        outputs,
+        _async_motion_metrics(),
+        {"humanoid_episode_length_env0": 2.0},
+        behavior_policy_version=9,
+        final_bootstrap_values={},
+        control_timestep_us=500_000,
+        expected_num_envs=1,
+        max_transition_rows=30,
+    )
+
+    transition = patched[1].replay_data.payload["transition"]
+    assert transition["duration_ticks"] == 37
+    assert transition["owning_reference_executed_ticks"] == 25
+    assert transition["actor_valid"] is True
+    assert len(transition["primitive_rewards"]) == 37
+    assert transition["primitive_reward_mask"] == [True] * 37
+    assert transition["applied_reference_sha256"] == ["c" * 64] * 12 + ["d" * 64] * 25
+
+
+@pytest.mark.parametrize("invalid_sequence", ("reversal", "third"))
+def test_async_motion_receipt_rejects_illegal_reference_sequence(
+    invalid_sequence: str,
+) -> None:
+    first, second = _async_motion_outputs()
+    assert second.replay_data is not None
+    payload = dict(second.replay_data.payload)
+    trace = dict(payload["feedback_trace"])
+    ticks = [dict(tick) for tick in trace["ticks"]]
+    if invalid_sequence == "reversal":
+        ticks[-1].update(
+            active_reference_id=7,
+            active_reference_sha256="a" * 64,
+            applied_reference_sha256="c" * 64,
+            reference_action_index=49,
+        )
+        match = "reversed"
+    else:
+        ticks[0].update(
+            active_reference_id=9,
+            active_reference_sha256="e" * 64,
+            applied_reference_sha256="f" * 64,
+        )
+        match = "third or unknown"
+    trace["ticks"] = ticks
+    payload["feedback_trace"] = trace
+    second = replace(
+        second,
+        replay_data=replace(second.replay_data, payload=payload),
+    )
+
+    with pytest.raises(ValueError, match=match):
         attach_humanoid_transitions(
-            (
-                _motion_output(
-                    duration=1,
-                    applied_digest="b" * 64,
-                ),
-            ),
-            _motion_metrics(
-                timestamp_us=20_000,
-                terminated=True,
-                truncated=False,
-            ),
-            {"humanoid_episode_length_env0": 1.0},
+            (first, second),
+            _async_motion_metrics(),
+            {"humanoid_episode_length_env0": 2.0},
             behavior_policy_version=9,
             final_bootstrap_values={},
             control_timestep_us=500_000,
             expected_num_envs=1,
             max_transition_rows=30,
         )
+
+
+@pytest.mark.parametrize("terminal", (True, False))
+def test_async_motion_receipt_allows_predecessor_only_only_at_terminal(
+    terminal: bool,
+) -> None:
+    first, second = _async_motion_outputs()
+    assert second.replay_data is not None
+    payload = dict(second.replay_data.payload)
+    trace = dict(payload["feedback_trace"])
+    ticks = [dict(tick) for tick in trace["ticks"]]
+    for tick_index, tick in enumerate(ticks):
+        tick.update(
+            active_reference_id=7,
+            active_reference_sha256="a" * 64,
+            applied_reference_sha256="c" * 64,
+            reference_action_index=min(25 + tick_index, 49),
+            terminated=terminal and tick_index == len(ticks) - 1,
+        )
+    trace["ticks"] = ticks
+    payload["feedback_trace"] = trace
+    second = replace(
+        second,
+        replay_data=replace(second.replay_data, payload=payload),
+    )
+
+    if not terminal:
+        with pytest.raises(ValueError, match="predecessor-only"):
+            attach_humanoid_transitions(
+                (first, second),
+                _async_motion_metrics(),
+                {"humanoid_episode_length_env0": 2.0},
+                behavior_policy_version=9,
+                final_bootstrap_values={},
+                control_timestep_us=500_000,
+                expected_num_envs=1,
+                max_transition_rows=30,
+            )
+        return
+
+    patched = attach_humanoid_transitions(
+        (first, second),
+        _async_motion_metrics(),
+        {"humanoid_episode_length_env0": 2.0},
+        behavior_policy_version=9,
+        final_bootstrap_values={},
+        control_timestep_us=500_000,
+        expected_num_envs=1,
+        max_transition_rows=30,
+    )
+    transition = patched[1].replay_data.payload["transition"]
+    assert transition["owning_reference_executed_ticks"] == 0
+    assert transition["actor_valid"] is False
+
+
+def test_async_motion_receipt_allows_predecessor_only_outer_truncation() -> None:
+    first, second = _async_motion_outputs()
+    assert second.replay_data is not None
+    payload = dict(second.replay_data.payload)
+    trace = dict(payload["feedback_trace"])
+    ticks = [dict(tick) for tick in trace["ticks"]]
+    for tick_index, tick in enumerate(ticks):
+        tick.update(
+            active_reference_id=7,
+            active_reference_sha256="a" * 64,
+            applied_reference_sha256="c" * 64,
+            reference_action_index=min(25 + tick_index, 49),
+            terminated=False,
+        )
+    trace["ticks"] = ticks
+    payload["feedback_trace"] = trace
+    payload["outer_truncated"] = True
+    second = replace(
+        second,
+        replay_data=replace(second.replay_data, payload=payload),
+    )
+    dense = _async_motion_metrics()
+    dense["humanoid_terminated_env0"]["values"] = [0.0, 0.0]
+    dense["humanoid_truncated_env0"]["values"] = [0.0, 1.0]
+    dense["humanoid_final_bootstrap_value_env0"] = {
+        "timestamps_us": [1_240_000],
+        "values": [2.0],
+        "valid": [True],
+    }
+
+    patched = attach_humanoid_transitions(
+        (first, second),
+        dense,
+        {
+            "humanoid_episode_length_env0": 2.0,
+            "humanoid_final_bootstrap_value_env0": 2.0,
+        },
+        behavior_policy_version=9,
+        final_bootstrap_values={0: 2.0},
+        control_timestep_us=500_000,
+        expected_num_envs=1,
+        max_transition_rows=30,
+    )
+    transition = patched[1].replay_data.payload["transition"]
+    assert transition["owning_reference_executed_ticks"] == 0
+    assert transition["actor_valid"] is False
+    assert transition["truncated"] is True
+    assert transition["bootstrap_value"] == pytest.approx(2.0)
+
+
+def test_h50_replay_retains_separate_applied_reference_hash() -> None:
+    patched = attach_humanoid_transitions(
+        (_motion_output(duration=1, applied_digest="b" * 64),),
+        _motion_metrics(
+            timestamp_us=20_000,
+            terminated=True,
+            truncated=False,
+        ),
+        {"humanoid_episode_length_env0": 1.0},
+        behavior_policy_version=9,
+        final_bootstrap_values={},
+        control_timestep_us=500_000,
+        expected_num_envs=1,
+        max_transition_rows=30,
+    )
+    assert patched[0].replay_data.payload["transition"]["applied_reference_sha256"] == [
+        "b" * 64
+    ]

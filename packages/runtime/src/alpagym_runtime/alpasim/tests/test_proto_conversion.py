@@ -20,6 +20,7 @@ def install_alpasim_grpc_stubs() -> None:
     runtime_pb2: Any = types.ModuleType("alpasim_grpc.v0.runtime_pb2")
     sensorsim_pb2: Any = types.ModuleType("alpasim_grpc.v0.sensorsim_pb2")
     humanoid_pb2: Any = types.ModuleType("alpasim_grpc.v0.humanoid_pb2")
+    humanoid_contracts: Any = types.ModuleType("alpasim_grpc.v0.humanoid_contracts")
     egodriver_pb2_grpc: Any = types.ModuleType("alpasim_grpc.v0.egodriver_pb2_grpc")
     humanoid_pb2_grpc: Any = types.ModuleType("alpasim_grpc.v0.humanoid_pb2_grpc")
     runtime_pb2_grpc: Any = types.ModuleType("alpasim_grpc.v0.runtime_pb2_grpc")
@@ -219,6 +220,25 @@ def install_alpasim_grpc_stubs() -> None:
     class HumanoidPolicySessionRequest:
         """Tiny stand-in for humanoid.HumanoidPolicySessionRequest."""
 
+    class HumanoidRenderState:
+        """Tiny stand-in whose receipt lets transport tests detect rewrites."""
+
+        def __init__(self, **kwargs: object) -> None:
+            """Retain the shared-contract constructor fields."""
+            self.__dict__.update(kwargs)
+
+        def canonical_sha256(self) -> str:
+            """Return the fixture receipt used by strict camera tests."""
+            return "e" * 64
+
+    def humanoid_image_sha256(image_bytes: bytes) -> str:
+        """Match the shared encoded-image receipt without state encoding."""
+        return hashlib.sha256(image_bytes).hexdigest()
+
+    def humanoid_render_receipt_sha256(**_: object) -> str:
+        """Return the fixture's shared combined receipt."""
+        return "f" * 64
+
     class HumanoidSessionCloseRequest:
         """Tiny stand-in for humanoid.HumanoidSessionCloseRequest."""
 
@@ -272,6 +292,7 @@ def install_alpasim_grpc_stubs() -> None:
             self.attempt_ids: list[str] = []
             self.scene_id = ""
             self.random_seed = 0
+            self.expected_behavior_policy_version = ""
 
     class SimulationRequest:
         """Tiny stand-in for runtime.SimulationRequest."""
@@ -339,6 +360,11 @@ def install_alpasim_grpc_stubs() -> None:
     humanoid_pb2.HUMANOID_POLICY_REQUEST_KIND_INITIAL_PLAN = 2
     humanoid_pb2.HUMANOID_POLICY_REQUEST_KIND_REPLAN_WITH_FEEDBACK = 3
     humanoid_pb2.HUMANOID_POLICY_REQUEST_KIND_FINALIZE_WITH_FEEDBACK = 4
+    humanoid_contracts.HUMANOID_RENDER_STATE_SCHEMA = "humanoid_render_state_qpos.v1"
+    humanoid_contracts.HUMANOID_RENDER_RECEIPT_SCHEMA = "humanoid_render_receipt.v1"
+    humanoid_contracts.HumanoidRenderState = HumanoidRenderState
+    humanoid_contracts.humanoid_image_sha256 = humanoid_image_sha256
+    humanoid_contracts.humanoid_render_receipt_sha256 = humanoid_render_receipt_sha256
     humanoid_pb2_grpc.HumanoidPolicyServiceServicer = HumanoidPolicyServiceServicer
     humanoid_pb2_grpc.add_HumanoidPolicyServiceServicer_to_server = (
         add_HumanoidPolicyServiceServicer_to_server
@@ -353,7 +379,9 @@ def install_alpasim_grpc_stubs() -> None:
 
     def _descriptor_message(*fields: str, nested=None):
         return SimpleNamespace(
-            fields_by_name={field: object() for field in fields},
+            fields_by_name={
+                field: SimpleNamespace(message_type=None) for field in fields
+            },
             nested_types_by_name=nested or {},
         )
 
@@ -370,6 +398,16 @@ def install_alpasim_grpc_stubs() -> None:
                 "random_seed",
                 "execution_mode",
                 "reference_spec",
+                "policy_camera_spec",
+            ),
+            "HumanoidPolicyCameraSpec": _descriptor_message(
+                "schema",
+                "logical_id",
+                "width",
+                "height",
+                "image_format",
+                "max_frame_age_us",
+                "contract_sha256",
             ),
             "HumanoidEnvState": _descriptor_message(
                 "timestamp_us",
@@ -381,10 +419,30 @@ def install_alpasim_grpc_stubs() -> None:
                 "bootstrap_only", "bootstrap_env_ids", "request_kind", "observation"
             ),
             "HumanoidObservation": _descriptor_message(
-                "decision_id", "feedback_traces"
+                "camera_images",
+                "decision_id",
+                "feedback_traces",
+                "timestamp_us",
+            ),
+            "HumanoidCameraImage": _descriptor_message(
+                "frame_start_us",
+                "frame_end_us",
+                "image_bytes",
+                "logical_id",
+                "env_id",
+                "camera_contract_sha256",
+                "observation_decision_id",
+                "render_qpos",
+                "render_state_sha256",
+                "render_timestamp_us",
+                "image_sha256",
+                "render_receipt_sha256",
             ),
             "HumanoidPolicyResponse": _descriptor_message(
-                "behavior_policy_version", "value_estimates", "plan_updates"
+                "actions",
+                "behavior_policy_version",
+                "value_estimates",
+                "plan_updates",
             ),
             "HumanoidPlanUpdate": _descriptor_message(
                 "reference_id",
@@ -440,6 +498,13 @@ def install_alpasim_grpc_stubs() -> None:
             ),
         },
     )
+    humanoid_messages = humanoid_pb2.DESCRIPTOR.message_types_by_name
+    humanoid_messages["HumanoidPolicySessionRequest"].fields_by_name[
+        "policy_camera_spec"
+    ].message_type = humanoid_messages["HumanoidPolicyCameraSpec"]
+    humanoid_messages["HumanoidObservation"].fields_by_name[
+        "camera_images"
+    ].message_type = humanoid_messages["HumanoidCameraImage"]
     runtime_pb2.DESCRIPTOR = SimpleNamespace(
         message_types_by_name={
             "RolloutSpec": _descriptor_message(
@@ -448,6 +513,7 @@ def install_alpasim_grpc_stubs() -> None:
                 "random_seed",
                 "attempt_ids",
                 "scene_id",
+                "expected_behavior_policy_version",
             ),
             "SimulationReturn": _descriptor_message(
                 nested={"RolloutReturn": _descriptor_message("behavior_policy_version")}
@@ -462,6 +528,7 @@ def install_alpasim_grpc_stubs() -> None:
     sys.modules["alpasim_grpc.v0.egodriver_pb2_grpc"] = egodriver_pb2_grpc
     sys.modules["alpasim_grpc.v0.humanoid_pb2"] = humanoid_pb2
     sys.modules["alpasim_grpc.v0.humanoid_pb2_grpc"] = humanoid_pb2_grpc
+    sys.modules["alpasim_grpc.v0.humanoid_contracts"] = humanoid_contracts
     sys.modules["alpasim_grpc.v0.runtime_pb2"] = runtime_pb2
     sys.modules["alpasim_grpc.v0.runtime_pb2_grpc"] = runtime_pb2_grpc
     sys.modules["alpasim_grpc.v0.sensorsim_pb2"] = sensorsim_pb2
@@ -510,6 +577,7 @@ def test_simulation_request_carries_humanoid_policy_endpoint() -> None:
         humanoid_policy_port=50057,
         n_concurrent_per_humanoid_policy=2,
         session_uuid="humanoid-session",
+        expected_behavior_policy_version=7,
         humanoid_scenario_ids=("ascend",),
     )
 
@@ -528,6 +596,27 @@ def test_simulation_request_carries_humanoid_policy_endpoint() -> None:
         or 1
     )
     assert request.rollout_specs[0].random_seed == legacy_seed
+    assert request.rollout_specs[0].expected_behavior_policy_version == "7"
+
+
+@pytest.mark.parametrize(
+    "behavior_version",
+    [-1, True, 1.5],
+)
+def test_simulation_request_rejects_invalid_behavior_version(
+    behavior_version: object,
+) -> None:
+    with pytest.raises(ValueError, match="expected_behavior_policy_version"):
+        build_simulation_request_proto(
+            scene_ids=("stairs_scene",),
+            n_generation=1,
+            humanoid_policy_host="localhost",
+            humanoid_policy_port=50057,
+            n_concurrent_per_humanoid_policy=1,
+            session_uuid="humanoid-session",
+            expected_behavior_policy_version=behavior_version,  # type: ignore[arg-type]
+            humanoid_scenario_ids=("ascend",),
+        )
 
 
 def test_simulation_request_threads_explicit_humanoid_random_seed() -> None:

@@ -1,17 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-import dataclasses
+import hashlib
 import json
 import os
 import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
-import numpy as np
 import redis
 import torch
 
 from alpagym_runtime.replay import parse_policy_replay_data
+from alpagym_runtime.transport.nccl.payload import (
+    TENSOR_KEY_MARKER,
+    WirePayload,
+    _pack,
+    unpack,
+)
 from alpagym_runtime.types import (
     EgoPose,
     EpisodeMetrics,
@@ -25,48 +30,170 @@ from alpagym_runtime.types import (
     Vec3,
 )
 
-
-def _tensor_to_list(tensor: torch.Tensor) -> list:
-    """Detach a tensor and return its contents as nested Python lists."""
-    return tensor.detach().cpu().tolist()
-
-
-def _artifact_default(value: Any) -> Any:
-    """`json.dumps` `default=` hook for tensor, ndarray, and dataclass leaves.
-
-    Tensor and ndarray leaves serialize to plain Python lists, so the disk transport
-    is lossy for dtype: leaves in schemaless ``dict[str, Any]`` slots (``model_extra``,
-    ``metrics.dense``, the replay ``payload``) read back as lists, not tensors. The NCCL
-    transport preserves torch-tensor dtype for the same slots. Trainer code that needs
-    a typed tensor (e.g. ``ModelInput.from_payload``) re-applies the dtype on read.
-    """
-    if isinstance(value, torch.Tensor):
-        return _tensor_to_list(value)
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {f.name: getattr(value, f.name) for f in dataclasses.fields(value)}
-    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+_DISK_ARTIFACT_SCHEMA = "alpagym.disk_episode.v2"
+_DISK_TENSOR_FORMAT = "torch.save.weights_only.v1"
+_DISK_ARTIFACT_KEYS = {
+    "artifact_schema",
+    "episode_manifest",
+    "manifest_sha256",
+    "tensor_sidecar",
+}
+_SIDECAR_KEYS = {"filename", "format", "sha256", "size_bytes"}
+_TENSOR_REF_KEYS = {TENSOR_KEY_MARKER, "shape", "dtype"}
+_SHA256_HEX_CHARS = frozenset("0123456789abcdef")
 
 
-def _ego_pose_to_dict(ego_pose: EgoPose) -> dict[str, Any]:
-    """Serialize one `EgoPose` into a JSON-friendly dictionary."""
-    return {
-        "timestamp_us": int(ego_pose.timestamp_us),
-        "pose": {
-            "vec": {
-                "x": float(ego_pose.pose.vec.x),
-                "y": float(ego_pose.pose.vec.y),
-                "z": float(ego_pose.pose.vec.z),
-            },
-            "quat": {
-                "w": float(ego_pose.pose.quat.w),
-                "x": float(ego_pose.pose.quat.x),
-                "y": float(ego_pose.pose.quat.y),
-                "z": float(ego_pose.pose.quat.z),
-            },
-        },
-    }
+def _manifest_sha256(manifest: Mapping[str, Any]) -> str:
+    """Return a stable SHA-256 digest of a JSON-compatible manifest."""
+    canonical = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _new_tensor_sidecar_path(path: Path) -> Path:
+    """Return a fresh sidecar path that can be atomically published before JSON."""
+    return path.with_name(f"{path.stem}.{uuid.uuid4().hex}.tensors.pt")
+
+
+def _is_valid_sha256(value: object) -> bool:
+    """Return whether ``value`` is one lowercase SHA-256 hex digest."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in _SHA256_HEX_CHARS for character in value)
+    )
+
+
+def _validate_sidecar_filename(path: Path, filename: object) -> str:
+    """Validate and return the artifact-owned sidecar basename."""
+    if not isinstance(filename, str) or Path(filename).name != filename:
+        raise ValueError("Disk tensor sidecar filename must be a basename")
+    prefix = f"{path.stem}."
+    suffix = ".tensors.pt"
+    if not filename.startswith(prefix) or not filename.endswith(suffix):
+        raise ValueError(
+            f"Disk tensor sidecar filename {filename!r} does not belong to {path.name!r}"
+        )
+    token = filename[len(prefix) : -len(suffix)]
+    if len(token) != 32 or any(
+        character not in _SHA256_HEX_CHARS for character in token
+    ):
+        raise ValueError("Disk tensor sidecar filename has an invalid UUID token")
+    return filename
+
+
+def _collect_tensor_specs(
+    value: Any,
+    specs: dict[str, tuple[tuple[int, ...], torch.dtype]],
+) -> None:
+    """Collect and strictly validate tensor references in ``value``."""
+    if isinstance(value, dict):
+        if TENSOR_KEY_MARKER in value:
+            if set(value) != _TENSOR_REF_KEYS:
+                raise ValueError("Disk manifest tensor reference has invalid fields")
+            key = value[TENSOR_KEY_MARKER]
+            shape = value["shape"]
+            dtype_name = value["dtype"]
+            if not isinstance(key, str) or not key:
+                raise ValueError("Disk manifest tensor reference has an invalid key")
+            if key in specs:
+                raise ValueError(f"Disk manifest tensor key {key!r} is duplicated")
+            if not isinstance(shape, list) or any(
+                type(dimension) is not int or dimension < 0 for dimension in shape
+            ):
+                raise ValueError(f"Disk manifest tensor {key!r} has an invalid shape")
+            if not isinstance(dtype_name, str) or not dtype_name.startswith("torch."):
+                raise ValueError(f"Disk manifest tensor {key!r} has an invalid dtype")
+            dtype = getattr(torch, dtype_name.removeprefix("torch."), None)
+            if not isinstance(dtype, torch.dtype):
+                raise ValueError(
+                    f"Disk manifest tensor {key!r} has an unsupported dtype"
+                )
+            specs[key] = (tuple(shape), dtype)
+            return
+        for child in value.values():
+            _collect_tensor_specs(child, specs)
+        return
+    if isinstance(value, list):
+        for child in value:
+            _collect_tensor_specs(child, specs)
+
+
+def _load_tensor_sidecar(
+    path: Path,
+    descriptor: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Load a sidecar only after validating its descriptor, digest, and tensor ABI."""
+    if set(descriptor) != _SIDECAR_KEYS:
+        raise ValueError("Disk tensor sidecar descriptor has invalid fields")
+    if descriptor["format"] != _DISK_TENSOR_FORMAT:
+        raise ValueError(
+            f"Unsupported disk tensor sidecar format: {descriptor['format']!r}"
+        )
+    filename = _validate_sidecar_filename(path, descriptor["filename"])
+    expected_sha256 = descriptor["sha256"]
+    if not _is_valid_sha256(expected_sha256):
+        raise ValueError("Disk tensor sidecar has an invalid SHA-256 digest")
+    expected_size = descriptor["size_bytes"]
+    if type(expected_size) is not int or expected_size < 0:
+        raise ValueError("Disk tensor sidecar has an invalid byte size")
+
+    sidecar_path = path.parent / filename
+    if sidecar_path.is_symlink():
+        raise ValueError("Disk tensor sidecar must not be a symbolic link")
+    if not sidecar_path.is_file():
+        raise FileNotFoundError(f"Disk tensor sidecar is missing: {sidecar_path}")
+
+    digest = hashlib.sha256()
+    actual_size = 0
+    with sidecar_path.open("rb") as sidecar_file:
+        while chunk := sidecar_file.read(1024 * 1024):
+            digest.update(chunk)
+            actual_size += len(chunk)
+        if actual_size != expected_size:
+            raise ValueError(
+                f"Disk tensor sidecar size mismatch: {actual_size} != {expected_size}"
+            )
+        actual_sha256 = digest.hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ValueError("Disk tensor sidecar SHA-256 mismatch")
+        sidecar_file.seek(0)
+        tensor_payload = torch.load(
+            sidecar_file,
+            map_location="cpu",
+            weights_only=True,
+        )
+
+    if type(tensor_payload) is not dict:
+        raise ValueError("Disk tensor sidecar payload must be a tensor dictionary")
+    if any(
+        not isinstance(key, str) or not isinstance(tensor, torch.Tensor)
+        for key, tensor in tensor_payload.items()
+    ):
+        raise ValueError("Disk tensor sidecar payload contains a non-tensor entry")
+
+    specs: dict[str, tuple[tuple[int, ...], torch.dtype]] = {}
+    _collect_tensor_specs(manifest, specs)
+    if set(tensor_payload) != set(specs):
+        raise ValueError("Disk tensor sidecar keys do not match the manifest")
+    for key, tensor in tensor_payload.items():
+        expected_shape, expected_dtype = specs[key]
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                f"Disk tensor {key!r} shape mismatch: "
+                f"{tuple(tensor.shape)} != {expected_shape}"
+            )
+        if tensor.dtype != expected_dtype:
+            raise ValueError(
+                f"Disk tensor {key!r} dtype mismatch: "
+                f"{tensor.dtype} != {expected_dtype}"
+            )
+    return tensor_payload
 
 
 def _ego_pose_from_dict(payload: Mapping[str, Any]) -> EgoPose:
@@ -90,36 +217,6 @@ def _ego_pose_from_dict(payload: Mapping[str, Any]) -> EgoPose:
             ),
         ),
     )
-
-
-def _policy_output_to_dict(output: PolicyOutput) -> dict[str, Any]:
-    """Serialize a `PolicyOutput` into a JSON-friendly dictionary."""
-    return {
-        "chosen_xyz": _tensor_to_list(output.chosen_xyz),
-        "chosen_quat": _tensor_to_list(output.chosen_quat),
-        "chosen_dt_us": _tensor_to_list(output.chosen_dt_us),
-        "chosen_logprob": (
-            _tensor_to_list(output.chosen_logprob)
-            if output.chosen_logprob is not None
-            else None
-        ),
-        "replay_data": output.replay_data.to_dict()
-        if output.replay_data is not None
-        else None,
-        "all_pred_xyz": (
-            _tensor_to_list(output.all_pred_xyz)
-            if output.all_pred_xyz is not None
-            else None
-        ),
-        "all_pred_quat": (
-            _tensor_to_list(output.all_pred_quat)
-            if output.all_pred_quat is not None
-            else None
-        ),
-        "model_extra": dict(output.model_extra)
-        if output.model_extra is not None
-        else None,
-    }
 
 
 def _policy_output_from_dict(payload: Mapping[str, Any]) -> PolicyOutput:
@@ -153,47 +250,6 @@ def _policy_output_from_dict(payload: Mapping[str, Any]) -> PolicyOutput:
         ),
         model_extra=dict(model_extra) if model_extra is not None else None,
     )
-
-
-def _episode_to_artifact_dict(episode: EpisodeOutput) -> dict[str, Any]:
-    """Return the JSON-serializable artifact payload for one episode."""
-    policy_outputs = [
-        _policy_output_to_dict(output) for output in episode.policy_outputs
-    ]
-    executed_ego_trajectory = [
-        _ego_pose_to_dict(pose) for pose in episode.executed_ego_trajectory.poses
-    ]
-    route_waypoints = [
-        {"x": waypoint.x, "y": waypoint.y, "z": waypoint.z}
-        for waypoint in episode.route_waypoints
-    ]
-
-    metrics = None
-    if episode.metrics is not None:
-        metrics = {
-            "aggregated": dict(episode.metrics.aggregated),
-            "dense": dict(episode.metrics.dense),
-        }
-
-    reward = None
-    if episode.reward is not None:
-        reward = {
-            "total": episode.reward.total,
-            "report_metrics": dict(episode.reward.report_metrics),
-        }
-
-    return {
-        "scene_id": episode.scene_id,
-        "session_uuid": episode.session_uuid,
-        "num_steps": episode.num_steps,
-        "rollout_seed": episode.rollout_seed,
-        "policy_outputs": policy_outputs,
-        "executed_ego_trajectory": executed_ego_trajectory,
-        "route_waypoints": route_waypoints,
-        "metrics": metrics,
-        "reward": reward,
-        "is_valid": episode.is_valid,
-    }
 
 
 def _episode_from_artifact_dict(artifact: Mapping[str, Any]) -> EpisodeOutput:
@@ -242,40 +298,149 @@ def _episode_from_artifact_dict(artifact: Mapping[str, Any]) -> EpisodeOutput:
     )
 
 
-def write_episode_json(path: Path, episode: EpisodeOutput) -> None:
-    """Write ``episode`` as a JSON artifact at ``path``, creating parent dirs.
+def _owned_sidecar_path(path: Path) -> Path | None:
+    """Return the sidecar owned by an existing valid v2 artifact, if any."""
+    if not path.is_file():
+        return None
+    try:
+        artifact = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(artifact, dict):
+            return None
+        if artifact.get("artifact_schema") != _DISK_ARTIFACT_SCHEMA:
+            return None
+        descriptor = artifact.get("tensor_sidecar")
+        if not isinstance(descriptor, dict):
+            return None
+        filename = _validate_sidecar_filename(path, descriptor.get("filename"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return None
+    return path.parent / filename
 
-    Uses an atomic tmp-then-rename write so a preemption mid-write never leaves
-    a partial file at the final path.
+
+def _file_sha256(path: Path) -> tuple[int, str]:
+    """Return ``(size_bytes, sha256)`` for one file."""
+    digest = hashlib.sha256()
+    size_bytes = 0
+    with path.open("rb") as artifact_file:
+        while chunk := artifact_file.read(1024 * 1024):
+            digest.update(chunk)
+            size_bytes += len(chunk)
+    return size_bytes, digest.hexdigest()
+
+
+def write_episode_json(path: Path, episode: EpisodeOutput) -> None:
+    """Atomically publish an episode manifest plus a lossless tensor sidecar.
+
+    The sidecar is published first under a fresh name and the JSON manifest is
+    renamed last. Readers therefore observe either the previous complete
+    artifact or the new complete artifact, never a partially written pair.
     """
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(".tmp")
-    tmp_path.write_text(
-        json.dumps(
-            _episode_to_artifact_dict(episode),
-            indent=2,
-            default=_artifact_default,
-        ),
-        encoding="utf-8",
+    previous_sidecar = _owned_sidecar_path(path)
+
+    tensors: dict[str, torch.Tensor] = {}
+    manifest = _pack(
+        episode,
+        tensors,
+        reject_empty_tensors=False,
+        encode_bool_as_uint8=False,
     )
-    os.replace(tmp_path, path)
+    if not isinstance(manifest, dict):
+        raise TypeError("Disk episode manifest must be a dictionary")
+    stored_tensors: dict[str, torch.Tensor] = {}
+    for key, tensor in tensors.items():
+        if tensor.layout != torch.strided:
+            raise ValueError(
+                f"Disk tensor sidecar only supports dense tensors; {key!r} "
+                f"uses {tensor.layout}"
+            )
+        # Clone after the device copy so a small contiguous view cannot make
+        # ``torch.save`` persist the unrelated remainder of its base storage.
+        stored_tensors[key] = (
+            tensor.detach().cpu().clone(memory_format=torch.contiguous_format)
+        )
+
+    sidecar_path = _new_tensor_sidecar_path(path)
+    tmp_token = uuid.uuid4().hex
+    sidecar_tmp = sidecar_path.with_name(f".{sidecar_path.name}.{tmp_token}.tmp")
+    manifest_tmp = path.with_name(f".{path.name}.{tmp_token}.tmp")
+    sidecar_published = False
+    try:
+        torch.save(stored_tensors, sidecar_tmp)
+        sidecar_size, sidecar_sha256 = _file_sha256(sidecar_tmp)
+        artifact = {
+            "artifact_schema": _DISK_ARTIFACT_SCHEMA,
+            "episode_manifest": manifest,
+            "manifest_sha256": _manifest_sha256(manifest),
+            "tensor_sidecar": {
+                "filename": sidecar_path.name,
+                "format": _DISK_TENSOR_FORMAT,
+                "sha256": sidecar_sha256,
+                "size_bytes": sidecar_size,
+            },
+        }
+        manifest_tmp.write_text(
+            json.dumps(artifact, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(sidecar_tmp, sidecar_path)
+        sidecar_published = True
+        os.replace(manifest_tmp, path)
+    except BaseException:
+        sidecar_tmp.unlink(missing_ok=True)
+        manifest_tmp.unlink(missing_ok=True)
+        if sidecar_published:
+            sidecar_path.unlink(missing_ok=True)
+        raise
+
+    if previous_sidecar is not None and previous_sidecar != sidecar_path:
+        previous_sidecar.unlink(missing_ok=True)
 
 
 def read_episode_json(handle: str | Path) -> EpisodeOutput:
-    """Read a rollout episode result from a disk artifact handle."""
-    artifact_data: dict[str, Any] = json.loads(Path(handle).read_text(encoding="utf-8"))
-    return _episode_from_artifact_dict(artifact_data)
+    """Read a v2 sidecar artifact or a backward-compatible legacy JSON artifact."""
+    path = Path(handle)
+    artifact_data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(artifact_data, dict):
+        raise ValueError("Disk episode artifact must be a JSON object")
+    if "artifact_schema" not in artifact_data:
+        return _episode_from_artifact_dict(artifact_data)
+    if artifact_data["artifact_schema"] != _DISK_ARTIFACT_SCHEMA:
+        raise ValueError(
+            f"Unsupported disk episode schema: {artifact_data['artifact_schema']!r}"
+        )
+    if set(artifact_data) != _DISK_ARTIFACT_KEYS:
+        raise ValueError("Disk episode artifact has invalid fields")
+
+    manifest = artifact_data["episode_manifest"]
+    if not isinstance(manifest, dict):
+        raise ValueError("Disk episode manifest must be a JSON object")
+    expected_manifest_sha256 = artifact_data["manifest_sha256"]
+    if not _is_valid_sha256(expected_manifest_sha256):
+        raise ValueError("Disk episode manifest has an invalid SHA-256 digest")
+    if _manifest_sha256(manifest) != expected_manifest_sha256:
+        raise ValueError("Disk episode manifest SHA-256 mismatch")
+
+    descriptor = artifact_data["tensor_sidecar"]
+    if not isinstance(descriptor, dict):
+        raise ValueError("Disk tensor sidecar descriptor must be a JSON object")
+    tensors = _load_tensor_sidecar(path, descriptor, manifest)
+    episode = unpack(WirePayload(tensors=tensors, manifest=manifest))
+    if not isinstance(episode, EpisodeOutput):
+        raise TypeError("Disk tensor manifest did not reconstruct EpisodeOutput")
+    return episode
 
 
 class DiskEpisodeWriter:
-    """Rollout-side disk egress: writes each episode as a JSON artifact."""
+    """Rollout-side disk egress: writes a JSON manifest plus tensor sidecar."""
 
     def __init__(self, artifacts_dir: Path):
         """Create a writer that writes artifacts under ``artifacts_dir``."""
         self._artifacts_dir = Path(artifacts_dir).resolve()
 
     def write(self, episode: EpisodeOutput) -> str:
-        """Persist ``episode`` as JSON and return its file path as the handle.
+        """Persist ``episode`` and return its JSON manifest path as the handle.
 
         The handle carries a fresh ``uuid4`` suffix so two episodes that share a
         ``(scene_id, session_uuid)`` cannot overwrite each other's artifact.
@@ -286,9 +451,13 @@ class DiskEpisodeWriter:
         return str(path)
 
     def release(self, handle: str, reason: str) -> None:
-        """Discard a JSON artifact that will not be read."""
+        """Discard an artifact manifest and its owned tensor sidecar."""
         del reason
-        Path(handle).unlink(missing_ok=True)
+        path = Path(handle)
+        sidecar_path = _owned_sidecar_path(path)
+        path.unlink(missing_ok=True)
+        if sidecar_path is not None:
+            sidecar_path.unlink(missing_ok=True)
 
     def start_cleanup(self, redis_client: redis.Redis) -> None:
         """No-op: the disk writer has no out-of-band discard channel."""

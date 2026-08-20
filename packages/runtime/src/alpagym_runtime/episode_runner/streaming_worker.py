@@ -398,6 +398,9 @@ class StreamingRolloutWorker:
                 n_concurrent_per_humanoid_policy=1,
                 session_uuid=rollout_job.session_uuid,
                 random_seed=rollout_job.random_seed,
+                expected_behavior_policy_version=(
+                    rollout_job.shared_payload_state.behavior_policy_version
+                ),
                 humanoid_scenario_ids=(
                     self._scenario_id_resolver(rollout_job.scene_id),
                 ),
