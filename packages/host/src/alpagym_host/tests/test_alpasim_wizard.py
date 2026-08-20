@@ -161,6 +161,48 @@ def test_wizard_command_selects_strict_motion_reference_profile(
     assert command.count("defines.humanoid_scene_cache=/workspace/cache/hq_stairs") == 1
 
 
+def test_wizard_command_sends_v9_reward_without_route_center_options(
+    tmp_path: Path,
+) -> None:
+    """The V9 scalar contract has no route-center threshold parameters."""
+    config = _alpasim_config(
+        AlpaSimWizardArgs(
+            deploy="local",
+            topology="1gpu",
+            driver_source="external_dynamic",
+            force_gt_duration_us=0,
+            control_timestep_us=500_000,
+            n_sim_steps=30,
+        )
+    )
+    config.simulation_domain = "humanoid"
+    config.humanoid = HumanoidAlpaSimConfig(
+        repo_path="/workspace/humanoid",
+        scene_store_path="/workspace/scenes",
+        scenario_ids_by_scene={"hq_stairs": "ascend"},
+        execution_profile=HumanoidExecutionProfile.motion_reference,
+        grail_root_path="/workspace/GRAIL",
+        reward_profile_id="direct_v9_shaped.v1",
+        expected_scene_fingerprints={"hq_stairs": "a" * 64},
+    )
+
+    command = _build_wizard_command(
+        config=config,
+        execution_backend=ExecutionBackend.local_process,
+        dataset=DatasetConfig(scene_ids=["hq_stairs"], test_suite_id=None),
+        alpasim_run_dir=tmp_path / "alpasim",
+        checkout_root=tmp_path,
+    )
+
+    assert (
+        '+runtime.humanoid.controller.options.reward_profile_id="direct_v9_shaped.v1"'
+    ) in command
+    assert not any("route_center_soft_m" in item for item in command)
+    assert not any("route_progress_credit_m" in item for item in command)
+    assert not any("route_corridor_half_width_m" in item for item in command)
+    assert 'runtime.humanoid.controller.options.max_control_ticks="750"' in command
+
+
 @pytest.mark.parametrize(
     "reserved_override",
     [

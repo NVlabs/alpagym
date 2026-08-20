@@ -160,18 +160,21 @@ def _build_wizard_command(
             if reference_mode
             else "runtime.humanoid.registration_options"
         )
-        argv.extend(
-            (
-                f"+{reward_options_path}.reward_profile_id="
-                f"{json.dumps(config.humanoid.reward_profile_id)}",
-                f"+{reward_options_path}.route_center_soft_m="
-                f"{json.dumps(str(config.humanoid.route_center_soft_m))}",
-                f"+{reward_options_path}.route_progress_credit_m="
-                f"{json.dumps(str(config.humanoid.route_progress_credit_m))}",
-                f"+{reward_options_path}.route_corridor_half_width_m="
-                f"{json.dumps(str(config.humanoid.route_corridor_half_width_m))}",
-            )
+        argv.append(
+            f"+{reward_options_path}.reward_profile_id="
+            f"{json.dumps(config.humanoid.reward_profile_id)}"
         )
+        if config.humanoid.reward_profile_id.startswith("reference_route_centered."):
+            argv.extend(
+                (
+                    f"+{reward_options_path}.route_center_soft_m="
+                    f"{json.dumps(str(config.humanoid.route_center_soft_m))}",
+                    f"+{reward_options_path}.route_progress_credit_m="
+                    f"{json.dumps(str(config.humanoid.route_progress_credit_m))}",
+                    f"+{reward_options_path}.route_corridor_half_width_m="
+                    f"{json.dumps(str(config.humanoid.route_corridor_half_width_m))}",
+                )
+            )
         if config.humanoid.expected_scene_fingerprints:
             fingerprint_json = json.dumps(
                 config.humanoid.expected_scene_fingerprints,

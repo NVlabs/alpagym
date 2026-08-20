@@ -32,10 +32,10 @@ alpasim:
     # The base humanoid image omits Open3D/Embree/gsplat/MuJoCo-Warp.  Use a
     # dependency-complete combined runtime+dynamics image for the local profile.
     service_image: alpasim-humanoid-nurec:local
-    reward_profile_id: reference_route_centered.v3
-    route_center_soft_m: 0.10
-    route_progress_credit_m: 0.30
-    route_corridor_half_width_m: 0.45
+    # Pinned local V9 MuJoCo formula snapshot. In motion-reference mode its
+    # action terms use the 23-D VideoMimic equivalent of GRAIL's executed 29-D
+    # position target; the checkpoint itself does not embed a reward hash.
+    reward_profile_id: direct_v9_shaped.v1
   wizard_args:
     force_gt_duration_us: 0
     # Native VLA starts the next inference after 0.5 s.  The active H50

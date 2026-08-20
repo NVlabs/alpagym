@@ -465,7 +465,9 @@ class HumanoidAlpaSimConfig:
     # camera this must be a dependency-complete combined runtime+dynamics
     # image; AlpaSim's atomic camera profile routes it to both services.
     service_image: str = "alpasim-humanoid:local"
-    reward_profile_id: str = "direct_v9_shaped.v1"
+    # Direct-action retains its historical default. Motion-reference experiments
+    # must select a profile explicitly because their action semantics differ.
+    reward_profile_id: str = ""
     route_center_soft_m: float = 0.10
     route_progress_credit_m: float = 0.30
     route_corridor_half_width_m: float = 0.45
@@ -515,20 +517,28 @@ class HumanoidAlpaSimConfig:
                 "HumanoidAlpaSimConfig.scene_cache_path requires policy_camera_profile"
             )
         if self.execution_profile is HumanoidExecutionProfile.motion_reference:
+            if not self.reward_profile_id:
+                raise ValueError(
+                    "motion_reference requires an explicit reward_profile_id"
+                )
             if self.reward_profile_id not in (
+                "direct_v9_shaped.v1",
                 "reference_route_centered.v1",
                 "reference_route_centered.v2",
                 "reference_route_centered.v3",
             ):
                 raise ValueError(
                     "motion_reference reward_profile_id must be one of "
-                    "reference_route_centered.v1, reference_route_centered.v2, "
-                    "or reference_route_centered.v3"
+                    "direct_v9_shaped.v1, reference_route_centered.v1, "
+                    "reference_route_centered.v2, or reference_route_centered.v3"
                 )
-        elif self.reward_profile_id != "direct_v9_shaped.v1":
-            raise ValueError(
-                "direct_action requires reward_profile_id='direct_v9_shaped.v1'"
-            )
+        else:
+            if not self.reward_profile_id:
+                self.reward_profile_id = "direct_v9_shaped.v1"
+            elif self.reward_profile_id != "direct_v9_shaped.v1":
+                raise ValueError(
+                    "direct_action requires reward_profile_id='direct_v9_shaped.v1'"
+                )
         if not self.scenario_ids_by_scene or any(
             not scene_id or not scenario_id
             for scene_id, scenario_id in self.scenario_ids_by_scene.items()

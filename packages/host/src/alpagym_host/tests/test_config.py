@@ -941,6 +941,50 @@ def test_humanoid_config_rejects_reward_profiles_outside_execution_abi(
         )
 
 
+def test_motion_reference_accepts_direct_v9_reward_profile() -> None:
+    """The V9 scalar contract is valid at the motion-reference boundary."""
+    config = HumanoidAlpaSimConfig(
+        repo_path="/tmp/alpasim-humanoid",
+        scene_store_path="/tmp/humanoid-scenes",
+        scenario_ids_by_scene={"stairs": "ascend"},
+        execution_profile=HumanoidExecutionProfile.motion_reference,
+        grail_root_path="/tmp/GRAIL",
+        reward_profile_id="direct_v9_shaped.v1",
+    )
+
+    assert config.reward_profile_id == "direct_v9_shaped.v1"
+
+
+def test_motion_reference_requires_explicit_reward_profile() -> None:
+    with pytest.raises(ValueError, match="explicit reward_profile_id"):
+        HumanoidAlpaSimConfig(
+            repo_path="/tmp/alpasim-humanoid",
+            scene_store_path="/tmp/humanoid-scenes",
+            scenario_ids_by_scene={"stairs": "ascend"},
+            execution_profile=HumanoidExecutionProfile.motion_reference,
+            grail_root_path="/tmp/GRAIL",
+        )
+
+
+def test_direct_action_resolves_its_historical_reward_default() -> None:
+    config = HumanoidAlpaSimConfig(
+        repo_path="/tmp/alpasim-humanoid",
+        scene_store_path="/tmp/humanoid-scenes",
+        scenario_ids_by_scene={"stairs": "ascend"},
+    )
+
+    assert config.reward_profile_id == "direct_v9_shaped.v1"
+
+
+def test_vla_direct_v9_reward_requires_source_horizon() -> None:
+    config = _make_valid_vla_validation_config()
+    config.alpasim.wizard_args.n_sim_steps = 29
+    config.expected_valid_steps = 29
+
+    with pytest.raises(ValueError, match="750-tick / 15-second horizon"):
+        _validate_humanoid_config(config)
+
+
 def test_motion_reference_freeze_injects_single_source_paths_and_fingerprint(
     tmp_path: Path,
 ) -> None:
@@ -1550,6 +1594,7 @@ def _make_valid_vla_validation_config() -> RunConfig:
                     scenario_ids_by_scene={"stairs": "ascend"},
                     expected_scene_fingerprints=fingerprints,
                     execution_profile=HumanoidExecutionProfile.motion_reference,
+                    reward_profile_id="direct_v9_shaped.v1",
                     reference_frame_count=50,
                     policy_camera_profile=HumanoidPolicyCameraProfile.vla_d455,
                 ),

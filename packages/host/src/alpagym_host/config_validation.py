@@ -230,6 +230,14 @@ def _validate_humanoid_config(config: RunConfig) -> None:
             raise ValueError(
                 "motion_reference n_sim_steps must equal expected_valid_steps"
             )
+        if (
+            humanoid.reward_profile_id == "direct_v9_shaped.v1"
+            and config.alpasim.wizard_args.n_sim_steps * outer_period_us != 15_000_000
+        ):
+            raise ValueError(
+                "motion_reference direct_v9_shaped.v1 requires the source "
+                "750-tick / 15-second horizon"
+            )
         if config.policy.model.kind == "g1_vla":
             if (
                 humanoid.policy_camera_profile
