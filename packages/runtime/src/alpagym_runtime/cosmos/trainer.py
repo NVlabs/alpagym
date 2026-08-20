@@ -1233,6 +1233,9 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                     "Flow-PPO requires full selected-transition element "
                     "log-probabilities"
                 )
+            dual_clip_ratio = self._dual_clip_ratio
+            if dual_clip_ratio is None:
+                raise ValueError("Flow-PPO requires a configured dual_clip_ratio")
             policy_loss, ratio = compute_flow_ppo_surrogate(
                 new_element_logprobs,
                 old_element_logprobs,
@@ -1241,7 +1244,7 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                 advantages,
                 ratio_clip_low=self._grpo_ratio_clip_low,
                 ratio_clip_high=self._grpo_ratio_clip_high,
-                dual_clip_ratio=float(self._dual_clip_ratio),
+                dual_clip_ratio=dual_clip_ratio,
                 is_padding=actor_is_padding,
             )
         else:
@@ -1569,7 +1572,6 @@ class AlpagymFlowPPOTrainer(AlpagymPPOTrainer):
         torch.Tensor,
         torch.Tensor | None,
         torch.Tensor,
-        torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
