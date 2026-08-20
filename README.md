@@ -1,10 +1,9 @@
 # AlpaGym
 
-AlpaGym is a reinforcement-learning framework for closed-loop embodied
-policies. It runs a policy inside a simulator, scores realized behavior, and
-trains on those consequences rather than logged ground truth alone. The main
-upstream use case is end-to-end autonomous driving; this branch also carries a
-standalone SceneStore-backed G1 humanoid integration.
+AlpaGym is a reinforcement-learning framework for end-to-end autonomous-driving
+policies. It runs a policy in closed loop inside a simulator, scores the
+resulting drives, and trains on them — so the policy learns from the
+consequences of its own steering rather than from logged ground truth alone.
 
 It stands on two systems: [AlpaSim](https://github.com/NVlabs/alpasim) provides
 the closed-loop simulator (the environment), and
@@ -13,12 +12,10 @@ rollout and training orchestration (the trainer). AlpaGym is the harness that
 wires them to a driving policy and keeps the interfaces small enough to swap any
 one piece.
 
-AlpaGym is in early but active development. It supports the
+AlpaGym is in early but active development. It currently supports the
 [Alpamayo 1.5](https://github.com/NVlabs/alpamayo1.5) model with 10b parameters.
-This branch also carries a SceneStore-backed G1 path: direct VideoMimic remains
-a baseline, while the active policy/controller-separated experiment trains the
-pinned Wenhao Qwen3-VL 2B VLA with Flow-PPO and executes its one-second H50
-motion reference through the existing SONIC/GRAIL controller in AlpaSim.
+Current work focuses on throughput and scaling, and on supporting more models and
+training algorithms.
 
 ## Table of Contents
 
@@ -85,8 +82,8 @@ workspace is designed to make adding new packages straightforward.
   gRPC egodriver (`alpasim/`), batched GPU inference (`inference/`), the
   policies and model adapters (`policies/`), the reward terms (`rewards/`), and
   the episode transport (`transport/`).
-- **`packages/policies`** — policy-owned bundles, replay parsers, configs, and
-  checkpoint tools for Alpamayo 1.5, the G1 direct baseline, and the Wenhao VLA.
+- **`packages/policies`** — the driving policies. Currently the Alpamayo 1.5
+  policy bundle, configs, tokenizer, and checkpoint conversion script.
 - **`packages/alpasim_configs`** — AlpaSim topology configs used by AlpaGym.
 - **`packages/plugins`** — utilities for discovering optioninal plugin packages.
 
@@ -104,14 +101,13 @@ On the host (control plane):
 
 In the runtime (GPU):
 
-5. The rollout backend pulls scenes and runs episodes against AlpaSim. Driving
-   policies receive camera, ego, and route observations through the egodriver
-   API. The humanoid Wenhao path instead receives a receipt-bound, same-shot
-   D455 image plus robot state and returns a versioned H50 motion-reference
-   buffer while AlpaSim advances SONIC/MuJoCo asynchronously.
+5. The rollout backend pulls scenes and runs episodes against AlpaSim. Each
+   tick, AlpaSim sends camera, ego, and route observations to the egodriver
+   gRPC server; the policy steps and returns a trajectory; AlpaSim advances the
+   ego car and asks again.
 6. Completed episodes are scored and written as artifacts.
-7. The trainer consumes the artifacts and applies the configured GRPO or PPO
-   update; updated weights sync back to the rollout workers.
+7. The trainer consumes the artifacts and takes a GRPO step; updated weights
+   sync back to the rollout workers.
 
 Local runs do all of this on one machine. Slurm runs prepare steps 1–4 on the
 login node, then re-load the frozen config and run the same lifecycle on the
@@ -120,7 +116,4 @@ cluster.
 ## Documentation
 
 - [Onboarding Guide](docs/ONBOARDING.md) — host setup, auth, getting a model, and running locally.
-- [G1 SceneStore RL handoff](docs/HUMANOID_ALPAGYM_ALPASIM_HANDOFF_YUXIAO.md) —
-  the current Wenhao VLA, asynchronous H50-to-SONIC execution, Flow-PPO replay,
-  immutable checkpoint/camera/scene lineage, and qualification boundaries.
 - [Contributing](CONTRIBUTING.md) — code style and review process.
