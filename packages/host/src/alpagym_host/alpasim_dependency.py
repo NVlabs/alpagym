@@ -17,10 +17,11 @@ from alpagym_host.config import AlpaSimConfig
 def resolve_alpasim_checkout(config: AlpaSimConfig) -> Path:
     """Resolve or prepare the AlpaSim checkout for Wizard startup.
 
-    For a local ``repo_path``, sync its environment in place. For a ``repo_url`` +
-    ``repo_ref``, return a content-addressed cached checkout built once: concurrent
-    runs that share the cache build into private temp dirs and publish the first one
-    with an atomic rename, so a concurrent sweep never corrupts a shared checkout.
+    An explicit ``repo_path`` is a prepared checkout and is never modified. For a
+    ``repo_url`` + ``repo_ref``, return a content-addressed cached checkout built
+    once: concurrent runs that share the cache build into private temp dirs and
+    publish the first one with an atomic rename, so a concurrent sweep never
+    corrupts a shared checkout.
     """
     if config.repo_path is not None:
         checkout_root = Path(config.repo_path).expanduser().resolve()
@@ -28,8 +29,8 @@ def resolve_alpasim_checkout(config: AlpaSimConfig) -> Path:
             raise NotADirectoryError(checkout_root)
         logging.info("Using local AlpaSim checkout %s", checkout_root)
         _validate_alpasim_layout(checkout_root)
-        _compile_protos(checkout_root)
-        _sync_alpasim_env(checkout_root, relocatable=False)
+        if not (checkout_root / ".venv" / "bin" / "python").is_file():
+            raise FileNotFoundError(checkout_root / ".venv" / "bin" / "python")
         return checkout_root
 
     if config.repo_url is None or config.repo_ref is None:

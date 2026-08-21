@@ -286,12 +286,14 @@ def test_cached_checkout_restores_plugin_configs_dropped_by_no_editable(
     )  # the Wizard can now resolve pkg://alpasim_example.configs deploy=cluster
 
 
-def test_local_checkout_compiles_protos_then_syncs_editable(
+def test_local_checkout_is_validated_without_mutation(
     tmp_path, monkeypatch
 ) -> None:
-    """Fresh local clones generate ignored stubs before Wizard/Cosmos can import them."""
+    """An explicit local checkout is treated as a prepared immutable input."""
     local_checkout = tmp_path / "alpasim"
     _write_alpasim_layout(local_checkout)
+    (local_checkout / ".venv" / "bin").mkdir(parents=True)
+    (local_checkout / ".venv" / "bin" / "python").write_text("", encoding="utf-8")
     commands: list[tuple[list[str], Path | None]] = []
 
     def run(command, cwd=None, **kwargs):
@@ -304,13 +306,7 @@ def test_local_checkout_compiles_protos_then_syncs_editable(
     checkout_root = resolve_alpasim_checkout(_local_config(local_checkout))
 
     assert checkout_root == local_checkout.resolve()
-    assert commands == [
-        (
-            ["uv", "run", "compile-protos"],
-            local_checkout.resolve() / "src" / "grpc",
-        ),
-        (["uv", "sync", "--all-extras"], local_checkout.resolve()),
-    ]
+    assert commands == []
 
 
 def test_cached_checkout_uses_configured_cache_dir(tmp_path, monkeypatch) -> None:
