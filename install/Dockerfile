@@ -47,18 +47,11 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /uvx /bin/
 
 WORKDIR /alpagym
 
-COPY pyproject.toml /alpagym/pyproject.toml
-COPY uv.lock /alpagym/uv.lock
-COPY packages/host/pyproject.toml /alpagym/packages/host/pyproject.toml
-COPY packages/runtime/pyproject.toml /alpagym/packages/runtime/pyproject.toml
+COPY . /alpagym
 
-# Pre-build the listed packages' third-party deps so they are cached on the
-# builder. Not every workspace member's source is present in this build context,
-# so `--all-packages` cannot resolve here; the remaining packages and their deps
-# install at test time from the full checkout.
-# BuildKit keeps this cache on the builder host; it is not committed into the image.
-RUN --mount=type=secret,id=netrc,target=/root/.netrc --mount=type=cache,target=/root/.cache/uv,id=alpagym-uv-cache,sharing=locked uv sync --project /alpagym --link-mode=copy --frozen --no-install-workspace \
-    --package alpagym-host --package alpagym-runtime --package alpagym-plugins --package alpagym-alpasim-configs --package alpagym-alpamayo-r1 \
+# Install the complete locked workspace into the image. Cluster launches use
+# this immutable environment and never resolve, copy, or compile packages.
+RUN --mount=type=secret,id=netrc,target=/root/.netrc --mount=type=cache,target=/root/.cache/uv,id=alpagym-uv-cache,sharing=locked uv sync --project /alpagym --link-mode=copy --frozen --all-packages --no-editable \
     && uv pip install --link-mode=copy coverage
 
 RUN test -n "$(find /usr -name cudnn.h -print -quit)" \

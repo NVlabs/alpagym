@@ -382,8 +382,10 @@ class VlaPsiPPOModel(BaseModel):
         """
         del cosmos_config
         if not self._critic_initialized:
-            self.actor_critic.critic.prefix_projection.reset_parameters()
-            self.actor_critic.critic.value_head._init_weights("relu")
+            with torch.random.fork_rng():
+                torch.manual_seed(0)
+                self.actor_critic.critic.prefix_projection.reset_parameters()
+                self.actor_critic.critic.value_head._init_weights("relu")
             self._critic_initialized = True
         self.actor_critic.critic.float()
         psi_runtime = cast(_PsiRuntimeProtocol, self.actor_critic.psi_model)

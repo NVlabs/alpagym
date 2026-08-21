@@ -18,7 +18,11 @@ import yaml
 from alpagym_runtime.alpasim.grpc_import import ensure_alpasim_grpc_source
 
 ensure_alpasim_grpc_source()
-from alpagym_host.config import ExecutionBackend, load_run_config
+from alpagym_host.config import (
+    ALPASIM_RUNTIME_ID_ENV,
+    ExecutionBackend,
+    load_run_config,
+)
 from alpagym_host.endpoint_registry import (
     FileTopologyRegistry,
     TopologyEndpoint,
@@ -121,7 +125,8 @@ class AlpagymRollout(RolloutBase):
             )
         alpasim_runtime_endpoint: TopologyEndpoint = (
             self._topology_registry.acquire_alpasim_runtime(
-                driver_id=policy_endpoint_id
+                driver_id=policy_endpoint_id,
+                preferred_runtime_id=os.environ.get(ALPASIM_RUNTIME_ID_ENV),
             )
         )
         max_concurrent_rollouts = rollout_worker_capacity(

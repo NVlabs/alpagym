@@ -293,6 +293,31 @@ def test_optimizer_parts_exactly_partition_trainable_parameters(
     )
 
 
+def test_critic_initialization_is_independent_of_process_rng(
+    tiny_source: tuple[Path, VlaSourceBundle, dict[str, torch.Tensor]],
+) -> None:
+    """Disaggregated policy and rollout processes start from identical critics."""
+    root, bundle, _expected = tiny_source
+    critics: list[dict[str, torch.Tensor]] = []
+    for seed in (11, 29):
+        torch.manual_seed(seed)
+        model = _build_materialized(root)
+        model.post_to_empty_hook(
+            SimpleNamespace(
+                policy=SimpleNamespace(model_name_or_path=str(bundle.model_root)),
+            )
+        )
+        critics.append(
+            {
+                name: tensor.detach().clone()
+                for name, tensor in model.actor_critic.critic.state_dict().items()
+            }
+        )
+
+    assert critics[0].keys() == critics[1].keys()
+    assert all(torch.equal(critics[0][name], critics[1][name]) for name in critics[0])
+
+
 def test_checkpoint_key_mismatch_fails_closed(
     tiny_source: tuple[Path, VlaSourceBundle, dict[str, torch.Tensor]],
 ) -> None:

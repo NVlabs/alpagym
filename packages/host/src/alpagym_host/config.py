@@ -12,6 +12,9 @@ from hydra.core.config_store import ConfigStore
 from omegaconf import MISSING, OmegaConf
 
 
+ALPASIM_RUNTIME_ID_ENV = "ALPAGYM_ALPASIM_RUNTIME_ID"
+
+
 @dataclass
 class ArtifactPaths:
     """Paths generated for one host-owned run directory."""
@@ -405,6 +408,7 @@ class AlpaSimWizardArgs:
     force_gt_duration_us: int
     control_timestep_us: int
     n_sim_steps: int
+    baseport: int = 6000
     driver: str | None = None
     # Name of an alpasim `renderer` Hydra config group to activate. Leave `None`
     # to use the alpasim default NRE renderer.
@@ -428,6 +432,8 @@ class AlpaSimWizardArgs:
             raise ValueError("AlpaSimWizardArgs.control_timestep_us must be positive")
         if self.n_sim_steps <= 0:
             raise ValueError("AlpaSimWizardArgs.n_sim_steps must be positive")
+        if not 1 <= self.baseport <= 65535:
+            raise ValueError("AlpaSimWizardArgs.baseport must be between 1 and 65535")
         if self.driver is not None and not self.driver:
             raise ValueError("AlpaSimWizardArgs.driver must be non-empty when set")
         if self.renderer is not None and not self.renderer:
@@ -619,6 +625,7 @@ class SlurmLayout(StrEnum):
 
     all_in_one = "all_in_one"
     separate_nodes = "separate_nodes"
+    trainer_and_rollout_cells = "trainer_and_rollout_cells"
 
 
 @dataclass
@@ -643,6 +650,13 @@ class SeparateNodesSlurmTopologyConfig(SlurmTopologyConfig):
     kind: SlurmLayout = SlurmLayout.separate_nodes
     cosmos_nodes: int = 1
     alpasim_nodes: int = 1
+
+
+@dataclass
+class TrainerAndRolloutCellsSlurmTopologyConfig(SlurmTopologyConfig):
+    """One-node topology with trainer GPUs and GPU-local rollout cells."""
+
+    kind: SlurmLayout = SlurmLayout.trainer_and_rollout_cells
 
 
 @dataclass
@@ -770,6 +784,12 @@ def register_config_schema() -> None:
         node=SeparateNodesSlurmTopologyConfig,
         package="execution.slurm.topology",
     )
+    config_store.store(
+        group="execution/slurm/topology",
+        name="trainer_and_rollout_cells",
+        node=TrainerAndRolloutCellsSlurmTopologyConfig,
+        package="execution.slurm.topology",
+    )
 
 
 def _resolve_alpasim_grpc_repo_ref() -> str:
@@ -821,3 +841,5 @@ def _structured_slurm_topology(raw_topology: object) -> object:
             return OmegaConf.structured(AllInOneSlurmTopologyConfig)
         case SlurmLayout.separate_nodes:
             return OmegaConf.structured(SeparateNodesSlurmTopologyConfig)
+        case SlurmLayout.trainer_and_rollout_cells:
+            return OmegaConf.structured(TrainerAndRolloutCellsSlurmTopologyConfig)

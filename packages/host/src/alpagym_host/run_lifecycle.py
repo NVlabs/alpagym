@@ -4,7 +4,6 @@
 
 import logging
 import os
-import shlex
 import shutil
 import subprocess
 from contextlib import nullcontext
@@ -126,6 +125,8 @@ def execute_run(config: RunConfig) -> None:
             hostnames=hostnames,
             gpus_per_node=config.execution.slurm.gpus_per_node,
             topology=config.execution.slurm.topology,
+            policy_replicas=config.cosmos.launch.policy_replicas,
+            rollout_replicas=config.cosmos.launch.rollout_replicas,
         )
         logging.info(
             "Preparing Slurm container image: image=%s cache_root=%s",
@@ -283,13 +284,27 @@ def _start_wizard_process(
             cwd=alpasim_checkout_root,
         )
 
+    wizard_baseport = config.alpasim.wizard_args.baseport + runtime_index * 100
+    if wizard_baseport > 65535:
+        raise ValueError(f"AlpaSim runtime {runtime_index} baseport exceeds 65535")
     wizard_command = _build_wizard_command(
         config=config.alpasim,
         execution_backend=execution_backend,
         dataset=config.dataset,
         alpasim_run_dir=wizard_log_dir,
         checkout_root=alpasim_checkout_root,
+        baseport=wizard_baseport,
     )
+    if len(host.alpasim_gpu_ids) == 1:
+        gpu_ids = f"[{host.alpasim_gpu_ids[0]}]"
+        wizard_command.extend(
+            [
+                f"services.renderer.gpus={gpu_ids}",
+                f"services.driver.gpus={gpu_ids}",
+                f"services.physics.gpus={gpu_ids}",
+                f"services.trafficsim.gpus={gpu_ids}",
+            ]
+        )
     command = build_wizard_srun_command(
         host=host,
         slurm=config.execution.slurm,
@@ -330,7 +345,7 @@ def _build_cosmos_command(
         return _build_cosmos_launcher_command(
             config,
             project_root=alpagym_project_root(),
-            no_sync=False,
+            use_baked_runtime=False,
             worker_count=1,
             worker_index=0,
             controller_port=config.cosmos.launch.controller_port,
@@ -338,43 +353,45 @@ def _build_cosmos_command(
 
     Path(config.execution.slurm.uv_cache_dir).mkdir(parents=True, exist_ok=True)
     cosmos_hosts = topology.cosmos_host_plans
-    controller_url = (
-        f"{cosmos_hosts[0].hostname}:{config.cosmos.launch.controller_port}"
-    )
-    worker_commands: list[list[str]] = []
-    for worker_index, _host in enumerate(cosmos_hosts):
-        worker_commands.append(
-            _build_cosmos_launcher_command(
-                config,
-                project_root=Path(config.execution.slurm.container_workdir),
-                no_sync=True,
-                controller_port=(
-                    config.cosmos.launch.controller_port if worker_index == 0 else None
-                ),
-                controller_url=controller_url if worker_index != 0 else None,
-                worker_count=len(cosmos_hosts),
-                worker_index=worker_index,
+    controller_host = cosmos_hosts[0].hostname
+    worker_count = sum(len(host.cosmos_workers) for host in cosmos_hosts)
+    worker_commands: list[tuple[list[str], ...]] = []
+    for host in cosmos_hosts:
+        host_commands: list[list[str]] = []
+        for worker in host.cosmos_workers:
+            worker_index = worker.global_worker_index
+            controller_url = None
+            if worker_index != 0:
+                controller_address = (
+                    "localhost" if host.hostname == controller_host else controller_host
+                )
+                controller_url = (
+                    f"{controller_address}:{config.cosmos.launch.controller_port}"
+                )
+            host_commands.append(
+                _build_cosmos_launcher_command(
+                    config,
+                    project_root=Path(config.execution.slurm.container_workdir),
+                    use_baked_runtime=True,
+                    controller_port=(
+                        config.cosmos.launch.controller_port
+                        if worker_index == 0
+                        else None
+                    ),
+                    controller_url=controller_url,
+                    worker_count=worker_count,
+                    worker_index=worker_index,
+                )
             )
-        )
-    workspace_setup_commands = [
-        [
-            "uv",
-            "sync",
-            "--frozen",
-            "--inexact",
-            "--all-packages",
-            "--project",
-            str(config.execution.slurm.container_workdir),
-        ]
-    ]
+        worker_commands.append(tuple(host_commands))
     return build_cosmos_srun_command(
         cosmos_hosts=cosmos_hosts,
         slurm=config.execution.slurm,
         container_image=cast(str, container_image),
-        workspace_sync_command=[
-            "bash",
-            "-lc",
-            " && ".join(shlex.join(command) for command in workspace_setup_commands),
+        runtime_check_command=[
+            "/opt/venv/bin/python",
+            "-c",
+            "import alpagym_host; import alpagym_runtime; import alpagym_g1_vla",
         ],
         worker_commands=tuple(worker_commands),
         log_dir=config.artifact_paths.log_dir,
@@ -405,7 +422,7 @@ def _log_topology(topology: RunTopologyPlan) -> None:
 def _build_cosmos_launcher_command(
     config: RunConfig,
     project_root: Path,
-    no_sync: bool,
+    use_baked_runtime: bool,
     worker_count: int,
     worker_index: int,
     controller_port: int | None = None,
@@ -415,16 +432,20 @@ def _build_cosmos_launcher_command(
     if controller_port is not None and controller_url is not None:
         raise ValueError("Cosmos launcher command cannot set both port and url")
 
-    command = ["uv", "run"]
-    if no_sync:
-        command.append("--no-sync")
+    if use_baked_runtime:
+        command = ["/opt/venv/bin/python", "-m"]
+    else:
+        command = [
+            "uv",
+            "run",
+            "--project",
+            str(project_root),
+            "--package",
+            "alpagym-runtime",
+            "python",
+            "-m",
+        ]
     launcher_args = [
-        "--project",
-        str(project_root),
-        "--package",
-        "alpagym-runtime",
-        "python",
-        "-m",
         "cosmos_rl.launcher.launch_all",
         "--config",
         str(config.artifact_paths.cosmos_config_path),

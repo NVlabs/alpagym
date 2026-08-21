@@ -39,8 +39,8 @@ execution:
     container_image: null
     container_cache_root: null
     # The host-side AlpaGym checkout path, mounted identically into the container
-    # (the deploy preset mounts the filesystem that holds it). Cosmos runs
-    # `uv sync --project` and launches from here.
+    # so generated configs and run artifacts resolve to the same paths. Python
+    # packages are installed in the container image at build time.
     container_workdir: ${current_alpagym_project_root:}
 
 # Per-episode step budget the trainer's packer pads every rollout to.
@@ -79,6 +79,8 @@ alpasim:
     driver_source: external_dynamic
     force_gt_duration_us: 1_700_000
     control_timestep_us: 100_000
+    # Each colocated runtime receives a disjoint 100-port range.
+    baseport: 6000
     # Derive n_sim_steps so each rollout yields expected_valid_steps closed-loop
     # policy steps: the policy runs only after the force-GT warmup, so
     # n_sim_steps = expected_valid_steps + warmup steps.
