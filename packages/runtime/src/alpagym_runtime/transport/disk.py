@@ -343,7 +343,7 @@ def write_episode_json(path: Path, episode: EpisodeOutput) -> None:
     manifest = _pack(
         episode,
         tensors,
-        reject_empty_tensors=False,
+        encode_empty_in_manifest=False,
         encode_bool_as_uint8=False,
     )
     if not isinstance(manifest, dict):

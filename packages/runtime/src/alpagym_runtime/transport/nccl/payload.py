@@ -17,10 +17,12 @@ from alpagym_runtime.types import EpisodeOutput
 TENSOR_KEY_MARKER = "__tensor_key__"
 _DATACLASS_TYPE_MARKER = "__dataclass_type__"
 _BOOL_TENSOR_MARKER = "__bool_tensor__"
+_EMPTY_TENSOR_MARKER = "__empty_tensor__"
 _RESERVED_DICT_MARKERS = {
     TENSOR_KEY_MARKER,
     _DATACLASS_TYPE_MARKER,
     _BOOL_TENSOR_MARKER,
+    _EMPTY_TENSOR_MARKER,
 }
 _ALLOWED_DATACLASS_TYPE_PREFIX = "alpagym_runtime."
 
@@ -55,7 +57,7 @@ def _pack(
     value: Any,
     tensors: dict[str, torch.Tensor],
     *,
-    reject_empty_tensors: bool = True,
+    encode_empty_in_manifest: bool = True,
     encode_bool_as_uint8: bool = True,
 ) -> Any:
     """Recursively pack a value; extract tensors to the flat ``tensors`` map.
@@ -66,17 +68,19 @@ def _pack(
     otherwise dispatch through :func:`_resolve_tensor_refs`.
 
     The defaults implement NCCL's wire constraints. The colocated disk
-    transport reuses the manifest ABI but disables the empty-tensor rejection
-    and bool-to-uint8 conversion because ``torch.save`` supports both natively.
+    transport reuses the manifest ABI but disables the empty-tensor manifest
+    encoding and bool-to-uint8 conversion because ``torch.save`` supports both
+    natively.
     """
     if isinstance(value, torch.Tensor):
-        if reject_empty_tensors and value.numel() == 0:
-            # pynccl rejects empty buffers; fail here at pack time rather than
-            # after the manifest is published and the rendezvous is open, which
-            # would raise mid-send and poison the communicator.
-            raise ValueError(
-                f"NCCL transport cannot ship a zero-element tensor (shape={tuple(value.shape)})"
-            )
+        if encode_empty_in_manifest and value.numel() == 0:
+            # Empty tensors have no bulk bytes to transfer, and pynccl rejects
+            # zero-byte buffers. Encode their complete value in the manifest.
+            return {
+                _EMPTY_TENSOR_MARKER: True,
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+            }
         key = f"tensor_{len(tensors)}"
         # pynccl cannot send torch.bool; ship bool tensors as uint8 and restore
         # the bool dtype on unpack (see _resolve_tensor_leaf).
@@ -99,7 +103,7 @@ def _pack(
             field.name: _pack(
                 getattr(value, field.name),
                 tensors,
-                reject_empty_tensors=reject_empty_tensors,
+                encode_empty_in_manifest=encode_empty_in_manifest,
                 encode_bool_as_uint8=encode_bool_as_uint8,
             )
             for field in dataclasses.fields(value)
@@ -114,7 +118,7 @@ def _pack(
             _pack(
                 item,
                 tensors,
-                reject_empty_tensors=reject_empty_tensors,
+                encode_empty_in_manifest=encode_empty_in_manifest,
                 encode_bool_as_uint8=encode_bool_as_uint8,
             )
             for item in value
@@ -129,7 +133,7 @@ def _pack(
             k: _pack(
                 v,
                 tensors,
-                reject_empty_tensors=reject_empty_tensors,
+                encode_empty_in_manifest=encode_empty_in_manifest,
                 encode_bool_as_uint8=encode_bool_as_uint8,
             )
             for k, v in value.items()
@@ -151,6 +155,18 @@ def _resolve_tensor_leaf(
     return tensor
 
 
+def _resolve_empty_tensor_leaf(leaf: dict[str, Any]) -> torch.Tensor:
+    """Rebuild a zero-element tensor encoded entirely in the manifest."""
+    shape = tuple(int(dim) for dim in leaf["shape"])
+    dtype_name = str(leaf["dtype"])
+    if not dtype_name.startswith("torch."):
+        raise ValueError(f"Invalid empty-tensor dtype: {dtype_name!r}")
+    dtype = getattr(torch, dtype_name.removeprefix("torch."), None)
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"Invalid empty-tensor dtype: {dtype_name!r}")
+    return torch.empty(shape, dtype=dtype)
+
+
 def _unpack(value: Any, type_hint: Any, tensors: dict[str, torch.Tensor]) -> Any:
     """Recursively rebuild a typed value from its manifest entry.
 
@@ -159,8 +175,11 @@ def _unpack(value: Any, type_hint: Any, tensors: dict[str, torch.Tensor]) -> Any
         - type_hint kind: ``Optional[T]``, ``tuple``, ``dict``/``Mapping``, dataclass,
           ``Any``, or leaf (primitive).
     """
-    if isinstance(value, dict) and TENSOR_KEY_MARKER in value:
-        return _resolve_tensor_leaf(value, tensors)
+    if isinstance(value, dict):
+        if TENSOR_KEY_MARKER in value:
+            return _resolve_tensor_leaf(value, tensors)
+        if _EMPTY_TENSOR_MARKER in value:
+            return _resolve_empty_tensor_leaf(value)
 
     origin = get_origin(type_hint)
     args = get_args(type_hint)
@@ -220,6 +239,8 @@ def _resolve_tensor_refs(value: Any, tensors: dict[str, torch.Tensor]) -> Any:
     if isinstance(value, dict):
         if TENSOR_KEY_MARKER in value:
             return _resolve_tensor_leaf(value, tensors)
+        if _EMPTY_TENSOR_MARKER in value:
+            return _resolve_empty_tensor_leaf(value)
         if _DATACLASS_TYPE_MARKER in value:
             return _reconstruct_dataclass(value, tensors)
         return {k: _resolve_tensor_refs(v, tensors) for k, v in value.items()}

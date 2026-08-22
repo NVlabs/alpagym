@@ -540,6 +540,7 @@ def test_cosmos_srun_command_disables_cpu_binding_for_nonexclusive_steps(
     )
 
     assert "--overlap" in command
+    assert "--mpi=none" in command
     assert "--cpu-bind=none" in command
     assert "--cpus-per-task=16" not in command
 

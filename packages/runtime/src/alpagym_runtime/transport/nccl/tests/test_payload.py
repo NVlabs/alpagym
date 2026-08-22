@@ -41,10 +41,18 @@ def test_bool_tensor_packs_as_uint8_and_restores() -> None:
 
 
 @pytest.mark.parametrize("shape", [(0,), (0, 3)])
-def test_zero_element_tensor_rejected_at_pack(shape: tuple[int, ...]) -> None:
-    """Pynccl rejects empty buffers, so _pack fails before a manifest/rendezvous exists."""
-    with pytest.raises(ValueError, match="zero-element tensor"):
-        _pack(torch.zeros(shape), {})
+def test_zero_element_tensor_round_trips_through_manifest(
+    shape: tuple[int, ...],
+) -> None:
+    """Empty tensors bypass pynccl and retain their shape and dtype in metadata."""
+    tensors: dict[str, torch.Tensor] = {}
+    leaf = _pack(torch.zeros(shape, dtype=torch.float16), tensors)
+
+    assert tensors == {}
+    restored = _unpack(leaf, torch.Tensor, tensors)
+    assert restored.shape == shape
+    assert restored.dtype == torch.float16
+    assert restored.numel() == 0
 
 
 def _minimal_policy_output() -> PolicyOutput:

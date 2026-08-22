@@ -31,6 +31,7 @@ def test_build_wizard_srun_command_uses_slurm_gpu_binding_without_cuda_mask() ->
     )
 
     assert "--nodelist=mixed-0" in command
+    assert "--mpi=none" in command
     assert "--gpus-per-task=8" in command
     assert "--gpu-bind=mask_gpu:0xff" in command
     assert "CUDA_VISIBLE_DEVICES" not in " ".join(command)

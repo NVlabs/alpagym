@@ -63,6 +63,7 @@ def build_wizard_srun_command(
     srun_command = [
         "srun",
         "--overlap",
+        "--mpi=none",
         "--nodes=1",
         "--ntasks=1",
         f"--nodelist={host.hostname}",
@@ -105,6 +106,7 @@ def build_cosmos_srun_command(
     srun_command = [
         "srun",
         "--overlap",
+        "--mpi=none",
         f"--nodes={len(cosmos_hosts)}",
         f"--ntasks={len(cosmos_hosts)}",
         "--ntasks-per-node=1",
