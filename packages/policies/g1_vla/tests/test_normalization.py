@@ -60,6 +60,24 @@ def test_wire_clips_after_preserving_density_latent() -> None:
     )
 
 
+def test_native_qualification_can_affine_denormalize_without_clipping() -> None:
+    normalizer = _normalizer()
+    latent = torch.zeros((1, VLA_ACTION_ROWS, VLA_ACTION_DIM))
+    latent[0, 0, :3] = torch.tensor([-1.5, 0.25, 2.0])
+
+    wire = normalizer.to_qualification_wire(
+        latent,
+        clip_normalized_actions=False,
+    )
+
+    torch.testing.assert_close(
+        wire.clipped_normalized[0, 0, :3], torch.tensor([-1.0, 0.25, 1.0])
+    )
+    torch.testing.assert_close(
+        wire.denormalized[0, 0, :3], torch.tensor([-3.0, 0.5, 4.0])
+    )
+
+
 def test_q99_normalizer_rejects_near_degenerate_stats() -> None:
     try:
         VlaQ99Normalizer(

@@ -166,8 +166,11 @@ cosmos:
       # Clamp learned Gaussian exploration after every optimizer step.
       ppo_min_action_std: 0.02
       ppo_max_action_std: 2.0
-      # Fixed flattened transition count, independent from rollout/shard
-      # mini_batch above.
+      # Optional pre/post-update KL guard against the replay behavior policy.
+      # This does not anchor training to the initial checkpoint.
+      ppo_target_behavior_kl: null
+      # Flattened transition rows per PPO forward/backward microbatch,
+      # independent from rollout/shard mini_batch above.
       step_mini_batch: null
   policy:
     parallelism:

@@ -12,6 +12,7 @@ through ``GrpoConfig``; the selected ``trainer_type`` determines the objective.
 
 import copy
 import logging
+import math
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -144,6 +145,7 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         self._mini_batch: int = int(grpo_config.mini_batch)
         self._kl_beta: float = float(grpo_config.kl_beta)
         self._allowed_outdated_steps: int = int(grpo_config.allowed_outdated_steps)
+        self._on_policy: bool = bool(grpo_config.on_policy)
         # Cosmos optionally allows reference_reset_interval=None to mean "never";
         # normalize that to the restart-stable fixed-anchor value.
         self._reference_reset_interval = _fixed_reference_reset_interval(
@@ -171,7 +173,8 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         inter_policy_nccl: dist_util.HighAvailabilitylNccl,
         is_master_replica: bool,
         do_save_checkpoint: bool = False,
-    ) -> dict[str, float | int]:
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         """Run one GRPO step over the rollouts Cosmos provides.
 
         Filters stale rollouts, builds per-step samples via the data packer,
@@ -194,6 +197,7 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         Returns:
             Dict of training metrics for Cosmos to log.
         """
+        del kwargs
         logger.info(
             "AlpaGym trainer step start current_step=%d total_steps=%d received_rollouts=%d "
             "group_size=%d mini_batch=%d grpo_optimization_iterations=%d "
@@ -220,6 +224,11 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
                 f"current_step={current_step}"
             )
 
+        pre_update_metrics = self._pre_update_diagnostics(samples)
+        self._validate_update_diagnostics(
+            pre_update_metrics,
+            phase="pre_update",
+        )
         (
             total_loss,
             total_kl,
@@ -234,7 +243,14 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         # before each individual optimizer step, so they cannot describe one
         # coherent final policy when a trainer step contains multiple updates.
         post_update_metrics = self._post_update_diagnostics(samples)
-        self.lr_schedulers.step()
+        self._validate_update_diagnostics(
+            post_update_metrics,
+            phase="post_update",
+        )
+        lr_scheduler = self.lr_schedulers
+        if lr_scheduler is None:
+            raise RuntimeError("Cosmos trainer did not initialize its LR scheduler")
+        lr_scheduler.step()
         checkpoint_config = getattr(self.config.train, "ckpt", None)
         checkpoint_enabled = bool(
             getattr(checkpoint_config, "enable_checkpoint", False)
@@ -276,8 +292,11 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
             "train/loss_avg": global_avg_loss,
             "train/loss_max": global_max_loss,
             "train/kl_avg": avg_kl,
-            "train/learning_rate": float(self.lr_schedulers.get_last_lr()[0]),
+            "train/learning_rate": float(lr_scheduler.get_last_lr()[0]),
             "train/num_batches": num_batches,
+            "train/num_micro_batches": int(
+                getattr(self, "_last_micro_batches", num_batches)
+            ),
             "train/ratio_max": ratio_max,
             "train/ratio_min": ratio_min,
             "train/clip_fraction": clip_fraction_sum / num_batches
@@ -285,6 +304,7 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
             else 0.0,
             "train/grad_norm": grad_norm_sum / num_batches if num_batches else 0.0,
             "train/iteration_time": 0.0,
+            **pre_update_metrics,
             **post_update_metrics,
         }
         logger.info(
@@ -304,6 +324,14 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         )
         return metrics
 
+    def _pre_update_diagnostics(
+        self,
+        samples: list[Any],
+    ) -> dict[str, float | int]:
+        """Return optional metrics before any optimizer update is applied."""
+        del samples
+        return {}
+
     def _post_update_diagnostics(
         self,
         samples: list[Any],
@@ -316,6 +344,15 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         """
         del samples
         return {}
+
+    def _validate_update_diagnostics(
+        self,
+        metrics: dict[str, float | int],
+        *,
+        phase: str,
+    ) -> None:
+        """Optionally reject an update from pre/post replay diagnostics."""
+        del metrics, phase
 
     # ------------------------------------------------------------------
     # GRPO orchestration
@@ -343,8 +380,11 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         """
         samples: list[Any] = []
         advantages: list[float] = []
+        data_packer = self.data_packer
+        if data_packer is None:
+            raise RuntimeError("Cosmos trainer did not initialize its data packer")
         for rollout in rollouts:
-            step_samples = self.data_packer.get_policy_input(
+            step_samples = data_packer.get_policy_input(
                 rollout.prompt,
                 rollout.completion,
                 n_ignore_prefix_tokens=rollout.n_ignore_prefix_tokens,
@@ -453,7 +493,10 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         Returns:
             Tuple ``(loss, kl_value, ratio_max, ratio_min, clip_fraction)``.
         """
-        minibatch = self.data_packer.policy_collate_fn(minibatch_samples)
+        data_packer = self.data_packer
+        if data_packer is None:
+            raise RuntimeError("Cosmos trainer did not initialize its data packer")
+        minibatch = data_packer.policy_collate_fn(minibatch_samples)
         is_padding = minibatch.training_signal.is_padding.to(self.device)
         old_logprobs = minibatch.training_signal.old_logprobs.to(self.device)
         advantages = minibatch_advantages.to(device=self.device, dtype=torch.float32)
@@ -579,9 +622,12 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
           one. Both checks run after the cross-replica reduce, so every DP
           worker reaches the same verdict in lockstep.
         """
+        train_stream = self.train_stream
+        if train_stream is None:
+            raise RuntimeError("Cosmos trainer did not initialize its CUDA stream")
         backward_stream = torch.cuda.current_stream()
-        with torch.cuda.stream(self.train_stream):
-            self.train_stream.wait_stream(backward_stream)
+        with torch.cuda.stream(train_stream):
+            train_stream.wait_stream(backward_stream)
             params = [param for param in self.model.parameters() if param.requires_grad]
             if params:
                 dist_util.gradient_reduce_across_dp_replicas_(params, inter_policy_nccl)
@@ -665,11 +711,14 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
                     dtype=getattr(torch, str(self.config.train.param_dtype).lower()),
                 )
 
+        scheduler = self.lr_schedulers
+        if scheduler is None:
+            raise RuntimeError("Cosmos trainer did not initialize its LR scheduler")
         logger.info("[Policy] Saving cosmos checkpoint at step %d", current_step)
         self.ckpt_manager.save_checkpoint(
             model=self.model,
             optimizer=self.optimizers,
-            scheduler=self.lr_schedulers,
+            scheduler=scheduler,
             step=current_step,
             total_steps=total_steps,
             remain_samples_num=remain_samples_num,
@@ -803,25 +852,31 @@ def _replace_advantages(
     ]
 
 
-def _summarize_post_update_log_ratios(
+def _summarize_behavior_log_ratios(
     log_ratios: torch.Tensor,
     *,
+    phase: str,
     ratio_clip_low: float,
     ratio_clip_high: float,
 ) -> dict[str, float | int]:
-    """Summarize one flat, already-masked post-update behavior-ratio pool."""
+    """Summarize one flat, already-masked behavior-ratio pool."""
+    if phase not in {"pre_update", "post_update"}:
+        raise ValueError(f"Unsupported PPO behavior-diagnostic phase: {phase!r}")
+    prefix = f"train/{phase}"
     flattened = log_ratios.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
     if flattened.numel() == 0:
         return {
-            "train/post_update_valid_rows": 0,
-            "train/post_update_ratio_p01": 1.0,
-            "train/post_update_ratio_p50": 1.0,
-            "train/post_update_ratio_p99": 1.0,
-            "train/post_update_clip_fraction": 0.0,
-            "train/post_update_approx_kl": 0.0,
+            f"{prefix}_valid_rows": 0,
+            f"{prefix}_ratio_p01": 1.0,
+            f"{prefix}_ratio_p50": 1.0,
+            f"{prefix}_ratio_p99": 1.0,
+            f"{prefix}_clip_fraction": 0.0,
+            f"{prefix}_approx_kl": 0.0,
         }
     if not torch.isfinite(flattened).all():
-        raise FloatingPointError("PPO post-update log-ratios contain non-finite values")
+        raise FloatingPointError(
+            f"PPO {phase.replace('_', '-')} log-ratios contain non-finite values"
+        )
 
     # Ratio diagnostics match the bounded exponent used by the PPO objective,
     # but approximate KL intentionally retains the raw log-ratio so the clamp
@@ -838,16 +893,32 @@ def _summarize_post_update_log_ratios(
     approx_kl = torch.expm1(raw_log_ratios) - raw_log_ratios
     if not torch.isfinite(approx_kl).all():
         raise FloatingPointError(
-            "PPO post-update approximate KL is non-finite for raw log-ratios"
+            f"PPO {phase.replace('_', '-')} approximate KL is non-finite "
+            "for raw log-ratios"
         )
     return {
-        "train/post_update_valid_rows": int(ratios.numel()),
-        "train/post_update_ratio_p01": float(quantiles[0].item()),
-        "train/post_update_ratio_p50": float(quantiles[1].item()),
-        "train/post_update_ratio_p99": float(quantiles[2].item()),
-        "train/post_update_clip_fraction": float(clipped.float().mean().item()),
-        "train/post_update_approx_kl": float(approx_kl.mean().item()),
+        f"{prefix}_valid_rows": int(ratios.numel()),
+        f"{prefix}_ratio_p01": float(quantiles[0].item()),
+        f"{prefix}_ratio_p50": float(quantiles[1].item()),
+        f"{prefix}_ratio_p99": float(quantiles[2].item()),
+        f"{prefix}_clip_fraction": float(clipped.float().mean().item()),
+        f"{prefix}_approx_kl": float(approx_kl.mean().item()),
     }
+
+
+def _summarize_post_update_log_ratios(
+    log_ratios: torch.Tensor,
+    *,
+    ratio_clip_low: float,
+    ratio_clip_high: float,
+) -> dict[str, float | int]:
+    """Backward-compatible post-update behavior-ratio summary helper."""
+    return _summarize_behavior_log_ratios(
+        log_ratios,
+        phase="post_update",
+        ratio_clip_low=ratio_clip_low,
+        ratio_clip_high=ratio_clip_high,
+    )
 
 
 @_trainer_base.TrainerRegistry.register(trainer_type="alpagym_ppo")
@@ -911,6 +982,18 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                 "PPO action std bounds must satisfy 0 < min_action_std <= "
                 f"max_action_std; got {self._min_action_std}, {self._max_action_std}"
             )
+        target_behavior_kl = ppo_config.get("target_behavior_kl")
+        self._target_behavior_kl = (
+            None if target_behavior_kl is None else float(target_behavior_kl)
+        )
+        if self._target_behavior_kl is not None and (
+            not math.isfinite(self._target_behavior_kl)
+            or self._target_behavior_kl <= 0.0
+        ):
+            raise ValueError(
+                "PPO target_behavior_kl must be finite and positive when set, "
+                f"got {target_behavior_kl!r}"
+            )
         step_mini_batch = ppo_config.get("step_mini_batch", self._mini_batch)
         if (
             isinstance(step_mini_batch, bool)
@@ -956,19 +1039,35 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         self,
         rollouts: list[_rollout_schema.Rollout],
     ) -> tuple[list[Any], torch.Tensor]:
-        """Flatten rollouts and compute PPO advantages/returns inside the trainer."""
+        """Compute full-episode GAE, then flatten only rows needed for training.
+
+        On one GPU, synthetic padding rows are removed after GAE so their cloned
+        camera tensors never enter the expensive visual model forward. Real
+        ``actor_valid=false`` rows remain because they still supervise the value
+        head. Multi-rank jobs retain padding until cross-rank microbatch
+        scheduling is made collective-safe.
+        """
         samples: list[Any] = []
         advantages: list[float] = []
         actor_valid_rows: list[bool] = []
         per_rollout_ranges: list[tuple[int, int]] = []
+        compact_padding = (
+            int(getattr(getattr(self, "parallel_dims", None), "world_size", 1)) == 1
+        )
+        padding_rows_dropped = 0
+        rollout_versions: set[int] = set()
+        data_packer = self.data_packer
+        if data_packer is None:
+            raise RuntimeError("Cosmos trainer did not initialize its data packer")
         for rollout in rollouts:
             start = len(samples)
-            step_samples = self.data_packer.get_policy_input(
+            step_samples = data_packer.get_policy_input(
                 rollout.prompt,
                 rollout.completion,
                 n_ignore_prefix_tokens=rollout.n_ignore_prefix_tokens,
             )
             rollout_weight_version = int(rollout.weight_version)
+            rollout_versions.add(rollout_weight_version)
             for step in step_samples:
                 replay_weight_version = int(step.weight_version.item())
                 if replay_weight_version != rollout_weight_version:
@@ -982,6 +1081,9 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                 step_samples, rollout_advantages, rollout_returns
             ):
                 is_padding = bool(step.training_signal.is_padding.item())
+                if is_padding and compact_padding:
+                    padding_rows_dropped += 1
+                    continue
                 actor_valid = (
                     bool(_ppo_actor_valid_mask(step.training_signal).item())
                     and not is_padding
@@ -998,6 +1100,19 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                 actor_valid_rows.append(actor_valid)
             per_rollout_ranges.append((start, len(samples)))
 
+        if getattr(self, "_on_policy", False) and len(rollout_versions) > 1:
+            raise ValueError(
+                "On-policy PPO requires one frozen behavior weight version per "
+                f"optimizer batch, got {sorted(rollout_versions)}"
+            )
+        if padding_rows_dropped:
+            logger.info(
+                "AlpaGym PPO removed %d synthetic padding rows before visual forward; "
+                "%d real rows remain",
+                padding_rows_dropped,
+                len(samples),
+            )
+
         advantage_tensor = torch.tensor(advantages, dtype=torch.float32)
         if self._normalize_advantages and advantage_tensor.numel() > 0:
             valid_mask = torch.tensor(actor_valid_rows, dtype=torch.bool)
@@ -1012,21 +1127,169 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             samples = _replace_advantages(samples, advantage_tensor, per_rollout_ranges)
         return samples, advantage_tensor
 
+    def _run_training_loop(
+        self,
+        samples: list[Any],
+        advantages: torch.Tensor,
+        inter_policy_nccl: dist_util.HighAvailabilitylNccl,
+    ) -> tuple[float, float, int, float, float, float, float]:
+        """Accumulate transition microbatches into one Adam step per PPO pass.
+
+        ``step_mini_batch`` limits one visual forward/backward. It does not
+        define the optimizer batch. Actor and value losses use separate exact
+        row-count weights, so splitting a batch does not change either masked
+        mean objective.
+        """
+        self._ensure_reference_model()
+        if not samples:
+            return (0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0)
+        if len(advantages) != len(samples):
+            raise ValueError(
+                "PPO advantages must align one-for-one with replay samples: "
+                f"{len(advantages)} != {len(samples)}"
+            )
+
+        def row_counts(rows: list[Any]) -> tuple[int, int]:
+            actor_rows = 0
+            value_rows = 0
+            for sample in rows:
+                signal = sample.training_signal
+                is_padding = bool(signal.is_padding.item())
+                if is_padding:
+                    continue
+                value_rows += 1
+                if bool(_ppo_actor_valid_mask(signal).item()):
+                    actor_rows += 1
+            return actor_rows, value_rows
+
+        total_actor_rows, total_value_rows = row_counts(samples)
+        if total_value_rows == 0:
+            raise ValueError("PPO optimizer batch has no non-padding value rows")
+
+        num_steps = len(samples)
+        micro_batch_size = min(self._mini_batch, num_steps)
+        num_micro_batches = (num_steps + micro_batch_size - 1) // micro_batch_size
+        self._last_micro_batches = 0
+
+        total_loss = 0.0
+        total_kl = 0.0
+        num_updates = 0
+        ratio_max = float("-inf")
+        ratio_min = float("inf")
+        clip_fraction_sum = 0.0
+        grad_norm_sum = 0.0
+
+        for _ in range(self._grpo_optimization_iterations):
+            indices = torch.randperm(num_steps)
+            self.optimizers.zero_grad()
+            update_loss = 0.0
+            update_kl = 0.0
+            update_clip_fraction = 0.0
+            update_ratio_max = float("-inf")
+            update_ratio_min = float("inf")
+
+            for microbatch_index in range(num_micro_batches):
+                start = microbatch_index * micro_batch_size
+                end = min(start + micro_batch_size, num_steps)
+                minibatch_indices = indices[start:end]
+                minibatch_samples = [samples[int(index)] for index in minibatch_indices]
+                minibatch_advantages = advantages[minibatch_indices]
+                actor_rows, value_rows = row_counts(minibatch_samples)
+                actor_loss_scale = (
+                    actor_rows / total_actor_rows if total_actor_rows else 0.0
+                )
+                value_loss_scale = value_rows / total_value_rows
+
+                (
+                    loss_value,
+                    kl_value,
+                    batch_ratio_max,
+                    batch_ratio_min,
+                    batch_clip_fraction,
+                    _batch_grad_norm,
+                ) = self._train_minibatch(
+                    minibatch_samples,
+                    minibatch_advantages,
+                    inter_policy_nccl,
+                    actor_loss_scale=actor_loss_scale,
+                    value_loss_scale=value_loss_scale,
+                    apply_optimizer=False,
+                )
+                update_loss += loss_value
+                update_kl += actor_loss_scale * kl_value
+                if actor_rows:
+                    update_ratio_max = max(update_ratio_max, batch_ratio_max)
+                    update_ratio_min = min(update_ratio_min, batch_ratio_min)
+                    update_clip_fraction += actor_loss_scale * batch_clip_fraction
+                self._last_micro_batches += 1
+
+            grad_norm = self.all_reduce_states(inter_policy_nccl)
+            if total_actor_rows:
+                ratio_max = max(ratio_max, update_ratio_max)
+                ratio_min = min(ratio_min, update_ratio_min)
+            total_loss += update_loss
+            total_kl += update_kl
+            clip_fraction_sum += update_clip_fraction
+            grad_norm_sum += grad_norm
+            num_updates += 1
+            logger.info(
+                "AlpaGym PPO effective optimizer update rows=%d actor_rows=%d "
+                "micro_batches=%d loss=%.6f kl=%.6f grad_norm=%.6f",
+                total_value_rows,
+                total_actor_rows,
+                num_micro_batches,
+                update_loss,
+                update_kl,
+                grad_norm,
+            )
+
+        if not total_actor_rows:
+            ratio_max = 1.0
+            ratio_min = 1.0
+
+        return (
+            total_loss,
+            total_kl,
+            num_updates,
+            ratio_max,
+            ratio_min,
+            clip_fraction_sum,
+            grad_norm_sum,
+        )
+
+    def _pre_update_diagnostics(
+        self,
+        samples: list[Any],
+    ) -> dict[str, float | int]:
+        """Measure behavior/replay alignment before any optimizer mutation."""
+        return self._behavior_diagnostics(samples, phase="pre_update")
+
     def _post_update_diagnostics(
         self,
         samples: list[Any],
     ) -> dict[str, float | int]:
-        """Re-score frozen behavior actions once under the final updated policy.
+        """Measure behavior-policy drift after the effective optimizer step."""
+        return self._behavior_diagnostics(samples, phase="post_update")
+
+    def _behavior_diagnostics(
+        self,
+        samples: list[Any],
+        *,
+        phase: str,
+    ) -> dict[str, float | int]:
+        """Re-score frozen behavior actions under one coherent policy state.
 
         This is a pure no-grad forward pass: it never calls backward, gradient
-        reduction, an optimizer, or the scheduler. Each valid replay row
+        reduction, an optimizer, or the scheduler. Each actor-valid replay row
         contributes one scalar policy-density ratio.
         """
+        if phase not in {"pre_update", "post_update"}:
+            raise ValueError(f"Unsupported PPO behavior-diagnostic phase: {phase!r}")
         if not samples:
-            raise ValueError("PPO post-update diagnostics require replay samples")
+            raise ValueError(f"PPO {phase} diagnostics require replay samples")
         data_packer = self.data_packer
         if data_packer is None:
-            raise RuntimeError("PPO post-update diagnostics require a data packer")
+            raise RuntimeError(f"PPO {phase} diagnostics require a data packer")
 
         valid_log_ratios: list[torch.Tensor] = []
         diagnostic_batch_size = min(self._mini_batch, len(samples))
@@ -1052,17 +1315,17 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
 
                     if tuple(new_logprobs.shape) != tuple(old_logprobs.shape):
                         raise ValueError(
-                            "PPO post-update new/old scalar log-probability shapes differ: "
+                            f"PPO {phase} new/old scalar log-probability shapes differ: "
                             f"{tuple(new_logprobs.shape)} != "
                             f"{tuple(old_logprobs.shape)}"
                         )
                     if not torch.isfinite(new_logprobs).all():
                         raise FloatingPointError(
-                            "PPO post-update model returned non-finite log-probabilities"
+                            f"PPO {phase} model returned non-finite log-probabilities"
                         )
                     if not torch.isfinite(old_logprobs).all():
                         raise FloatingPointError(
-                            "PPO post-update replay has non-finite old log-probabilities"
+                            f"PPO {phase} replay has non-finite old log-probabilities"
                         )
 
                     if self._flow_chunk_density:
@@ -1106,23 +1369,57 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         finally:
             self.model.train(was_training)
 
-        metrics = _summarize_post_update_log_ratios(
+        metrics = _summarize_behavior_log_ratios(
             torch.cat(valid_log_ratios) if valid_log_ratios else torch.empty(0),
+            phase=phase,
             ratio_clip_low=self._grpo_ratio_clip_low,
             ratio_clip_high=self._grpo_ratio_clip_high,
         )
+        prefix = f"train/{phase}"
         logger.info(
-            "AlpaGym PPO post-update diagnostics valid_rows=%d "
+            "AlpaGym PPO %s diagnostics valid_rows=%d "
             "ratio_p01=%.6f ratio_p50=%.6f ratio_p99=%.6f "
             "clip_fraction=%.6f approx_kl=%.6f",
-            int(metrics["train/post_update_valid_rows"]),
-            float(metrics["train/post_update_ratio_p01"]),
-            float(metrics["train/post_update_ratio_p50"]),
-            float(metrics["train/post_update_ratio_p99"]),
-            float(metrics["train/post_update_clip_fraction"]),
-            float(metrics["train/post_update_approx_kl"]),
+            phase,
+            int(metrics[f"{prefix}_valid_rows"]),
+            float(metrics[f"{prefix}_ratio_p01"]),
+            float(metrics[f"{prefix}_ratio_p50"]),
+            float(metrics[f"{prefix}_ratio_p99"]),
+            float(metrics[f"{prefix}_clip_fraction"]),
+            float(metrics[f"{prefix}_approx_kl"]),
         )
         return metrics
+
+    def _validate_update_diagnostics(
+        self,
+        metrics: dict[str, float | int],
+        *,
+        phase: str,
+    ) -> None:
+        """Fail closed when calibrated behavior-policy KL exceeds its guard."""
+        target = getattr(self, "_target_behavior_kl", None)
+        if target is None:
+            return
+        if phase not in {"pre_update", "post_update"}:
+            raise ValueError(f"Unsupported PPO behavior-KL phase: {phase!r}")
+        phase_label = phase.replace("_", "-")
+        prefix = f"train/{phase}"
+        valid_rows = int(metrics[f"{prefix}_valid_rows"])
+        approx_kl = float(metrics[f"{prefix}_approx_kl"])
+        if valid_rows <= 0:
+            raise FloatingPointError(
+                f"PPO {phase_label} behavior-KL guard has no actor-valid replay rows"
+            )
+        if not math.isfinite(approx_kl):
+            raise FloatingPointError(
+                f"PPO {phase_label} behavior KL is non-finite: {approx_kl}"
+            )
+        if approx_kl > target:
+            raise FloatingPointError(
+                f"PPO {phase_label} behavior KL {approx_kl:.6g} exceeds calibrated "
+                f"target {target:.6g}; refusing to advance scheduler, checkpoint, "
+                "or weight sync"
+            )
 
     def _compute_gae(self, step_samples: list[Any]) -> tuple[list[float], list[float]]:
         """Compute direct or semi-Markov GAE targets for one rollout."""
@@ -1194,9 +1491,23 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         minibatch_samples: list[Any],
         minibatch_advantages: torch.Tensor,
         inter_policy_nccl: dist_util.HighAvailabilitylNccl,
+        *,
+        actor_loss_scale: float = 1.0,
+        value_loss_scale: float = 1.0,
+        apply_optimizer: bool = True,
     ) -> tuple[float, float, float, float, float, float]:
-        """Train actor and value head on one step-level PPO minibatch."""
-        minibatch = self.data_packer.policy_collate_fn(minibatch_samples)
+        """Backprop one PPO transition microbatch.
+
+        Direct callers retain the historical one-minibatch/one-step behavior.
+        The PPO loop passes exact actor/value row fractions and defers the Adam
+        step so several visual microbatches form one effective optimizer batch.
+        """
+        if actor_loss_scale < 0.0 or value_loss_scale < 0.0:
+            raise ValueError("PPO microbatch loss scales must be non-negative")
+        data_packer = self.data_packer
+        if data_packer is None:
+            raise RuntimeError("Cosmos trainer did not initialize its data packer")
+        minibatch = data_packer.policy_collate_fn(minibatch_samples)
         signal = minibatch.training_signal
         is_padding = signal.is_padding.to(self.device)
         actor_valid = _ppo_actor_valid_mask(signal).to(self.device)
@@ -1276,11 +1587,16 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             value_clip_range=self._value_clip_range,
             huber_delta=self._value_huber_delta,
         )
-        loss = policy_loss + kl_loss + self._value_loss_coef * value_loss
+        loss = actor_loss_scale * (policy_loss + kl_loss) + (
+            self._value_loss_coef * value_loss_scale * value_loss
+        )
 
-        self.optimizers.zero_grad()
+        if apply_optimizer:
+            self.optimizers.zero_grad()
         loss.backward()
-        grad_norm = self.all_reduce_states(inter_policy_nccl)
+        grad_norm = (
+            self.all_reduce_states(inter_policy_nccl) if apply_optimizer else 0.0
+        )
 
         return self._ppo_minibatch_metrics(
             loss=loss,

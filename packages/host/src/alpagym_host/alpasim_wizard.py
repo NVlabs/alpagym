@@ -18,6 +18,7 @@ from alpagym_host.config import (
     DatasetConfig,
     ExecutionBackend,
     HumanoidExecutionProfile,
+    HumanoidReferenceControllerProfile,
     alpagym_project_root,
 )
 
@@ -37,6 +38,8 @@ _MOTION_REFERENCE_RESERVED_OVERRIDE_PREFIXES = (
     "defines.humanoid_policy_camera_profile",
     "defines.humanoid_scene_fingerprints_json",
     "defines.humanoid_grail_root",
+    "defines.humanoid_visual_controller_release",
+    "defines.humanoid_robot_physics_profile",
     "defines.humanoid_image",
     "defines.humanoid_dynamics_gpus",
     "services.runtime.volumes",
@@ -50,7 +53,9 @@ def _reject_motion_reference_reserved_overrides(overrides: list[str]) -> None:
     for override in overrides:
         key = override.split("=", 1)[0].lstrip("+~").split("@", 1)[0]
         if any(
-            key == prefix or key.startswith(f"{prefix}.")
+            key == prefix
+            or key.startswith(f"{prefix}.")
+            or prefix.startswith(f"{key}.")
             for prefix in _MOTION_REFERENCE_RESERVED_OVERRIDE_PREFIXES
         ):
             raise ValueError(
@@ -131,7 +136,9 @@ def _build_wizard_command(
         if reference_mode:
             if config.humanoid.reference_frame_count != 50:
                 raise ValueError("motion_reference frame count must be H50")
-            runtime_domain = "humanoid_reference"
+            runtime_domain = (
+                config.humanoid.reference_controller_profile.wizard_runtime_domain
+            )
         argv.extend(
             (
                 f"runtime_domain={runtime_domain}",
@@ -175,6 +182,30 @@ def _build_wizard_command(
                     f"{json.dumps(str(config.humanoid.route_corridor_half_width_m))}",
                 )
             )
+        runtime_spawn = (
+            config.humanoid.runtime_spawn_root_x_m,
+            config.humanoid.runtime_spawn_root_y_m,
+            config.humanoid.runtime_spawn_root_yaw_rad,
+        )
+        if runtime_spawn[0] is not None:
+            if not reference_mode:
+                raise AssertionError("runtime spawn override escaped config validation")
+            if len(dataset.scene_ids) != 1:
+                raise ValueError(
+                    "runtime spawn override requires exactly one selected scene"
+                )
+            assert all(value is not None for value in runtime_spawn)
+            spawn_option_path = "runtime.humanoid.controller.options"
+            argv.extend(
+                (
+                    f"+{spawn_option_path}.runtime_spawn_override_schema="
+                    '"reference_tracking.runtime_spawn_xy_yaw.v1"',
+                    f'+{spawn_option_path}.runtime_spawn_root_x_m="{runtime_spawn[0]}"',
+                    f'+{spawn_option_path}.runtime_spawn_root_y_m="{runtime_spawn[1]}"',
+                    f"+{spawn_option_path}.runtime_spawn_root_yaw_rad="
+                    f'"{runtime_spawn[2]}"',
+                )
+            )
         if config.humanoid.expected_scene_fingerprints:
             fingerprint_json = json.dumps(
                 config.humanoid.expected_scene_fingerprints,
@@ -190,6 +221,26 @@ def _build_wizard_command(
             argv.append(
                 f"defines.humanoid_grail_root={config.humanoid.grail_root_path}"
             )
+            if (
+                config.humanoid.reference_controller_profile
+                is HumanoidReferenceControllerProfile.sonic_visual
+            ):
+                assert config.humanoid.visual_controller_release_path is not None
+                assert config.humanoid.robot_physics_profile is not None
+                assert config.humanoid.scene_cache_path is not None
+                argv.append(
+                    "defines.humanoid_visual_controller_release="
+                    + config.humanoid.visual_controller_release_path
+                )
+                argv.append(
+                    "defines.humanoid_robot_physics_profile="
+                    + json.dumps(config.humanoid.robot_physics_profile)
+                )
+                if config.humanoid.policy_camera_profile is None:
+                    argv.append(
+                        "defines.humanoid_scene_cache="
+                        + config.humanoid.scene_cache_path
+                    )
     extra_overrides = shlex.split(wizard_args.extra_overrides)
     if reference_mode:
         _reject_motion_reference_reserved_overrides(extra_overrides)
@@ -233,9 +284,10 @@ def start_wizard(
 ) -> subprocess.Popen[str]:
     """Start Wizard as a subprocess."""
     alpasim_run_dir = alpasim_run_dir.resolve()
-    if (
-        config.humanoid is not None
-        and config.humanoid.policy_camera_profile is not None
+    if config.humanoid is not None and (
+        config.humanoid.policy_camera_profile is not None
+        or config.humanoid.reference_controller_profile
+        is HumanoidReferenceControllerProfile.sonic_visual
     ):
         assert config.humanoid.scene_cache_path is not None
         Path(config.humanoid.scene_cache_path).mkdir(parents=True, exist_ok=True)

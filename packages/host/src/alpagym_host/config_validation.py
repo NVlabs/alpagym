@@ -17,6 +17,7 @@ from alpagym_host.config import (
     ExecutionBackend,
     HumanoidExecutionProfile,
     HumanoidPolicyCameraProfile,
+    HumanoidReferenceControllerProfile,
     RunConfig,
     SeparateNodesSlurmTopologyConfig,
     SlurmConfig,
@@ -45,11 +46,16 @@ def validate_run_config(
         config=config.alpasim,
         dataset=config.dataset,
     )
+    if requested_command == "rollout":
+        _validate_rollout_qualification_config(config)
+        _validate_humanoid_config(config, training=False)
+        _validate_policy_model_path(config)
+        return
     # Run the VLA Slurm visibility audit before the currently intentional
     # humanoid colocated-only rejection, so an eventual qualification cannot
     # inherit latent host/container path drift.
     _validate_vla_slurm_worker_mounts(config)
-    _validate_humanoid_config(config)
+    _validate_humanoid_config(config, training=True)
     _validate_training_policy_config(config)
     _validate_cosmos_grpo_batch_geometry(config.cosmos)
     _validate_transport_config(config)
@@ -134,7 +140,7 @@ def _validate_wizard_startup_config(
         raise ValueError("dataset.test_suite_id must be non-empty when set")
 
 
-def _validate_humanoid_config(config: RunConfig) -> None:
+def _validate_humanoid_config(config: RunConfig, *, training: bool = True) -> None:
     """Fail closed on humanoid routing and version-unsafe prefetch."""
     if config.policy.model.kind == "g1_vla":
         if config.policy.kind != "humanoid":
@@ -240,71 +246,110 @@ def _validate_humanoid_config(config: RunConfig) -> None:
             )
         if config.policy.model.kind == "g1_vla":
             if (
-                humanoid.policy_camera_profile
-                is not HumanoidPolicyCameraProfile.vla_d455
+                humanoid.reference_controller_profile
+                is not HumanoidReferenceControllerProfile.sonic_visual
             ):
-                raise ValueError("g1_vla requires policy_camera_profile=vla_d455")
-            if config.policy.model.use_cameras != ["vla_d455_policy_rgb"]:
-                raise ValueError("g1_vla requires only vla_d455_policy_rgb")
-            train_policy = config.cosmos.train.train_policy
-            required_flow_values = {
-                "grpo_ratio_clip_low": 0.2,
-                "grpo_ratio_clip_high": 0.28,
-                "ppo_value_loss_coef": 1.0,
-                "ppo_value_clip_range": 0.2,
-                "ppo_gamma": 0.99,
-                "ppo_gae_lambda": 0.95,
-                "ppo_dual_clip_ratio": 3.0,
-                "ppo_value_huber_delta": 10.0,
-                "kl_beta": 0.0,
-            }
-            actual_flow_values = {
-                "grpo_ratio_clip_low": train_policy.grpo_ratio_clip_low,
-                "grpo_ratio_clip_high": train_policy.grpo_ratio_clip_high,
-                "ppo_value_loss_coef": train_policy.ppo_value_loss_coef,
-                "ppo_value_clip_range": train_policy.ppo_value_clip_range,
-                "ppo_gamma": train_policy.ppo_gamma,
-                "ppo_gae_lambda": train_policy.ppo_gae_lambda,
-                "ppo_dual_clip_ratio": train_policy.ppo_dual_clip_ratio,
-                "ppo_value_huber_delta": train_policy.ppo_value_huber_delta,
-                "kl_beta": train_policy.kl_beta,
-            }
-            if train_policy.trainer_type != "alpagym_flow_ppo":
-                raise ValueError("g1_vla motion_reference requires alpagym_flow_ppo")
-            for name, expected in required_flow_values.items():
-                if actual_flow_values[name] != expected:
-                    raise ValueError(f"g1_vla requires {name}={expected}")
-            if train_policy.ppo_normalize_advantages is not True:
-                raise ValueError("g1_vla requires ppo_normalize_advantages=true")
-            required_optimizer_values = {
-                "optm_part_lrs": [5.0e-6, 1.0e-4],
-                "epsilon": 1.0e-8,
-                "optm_weight_decay": 0.01,
-                "optm_betas": [0.9, 0.999],
-                "optm_grad_norm_clip": 1.0,
-                "optm_warmup_steps": 0,
-            }
-            actual_optimizer_values = {
-                "optm_part_lrs": config.cosmos.train.optm_part_lrs,
-                "epsilon": config.cosmos.train.epsilon,
-                "optm_weight_decay": config.cosmos.train.optm_weight_decay,
-                "optm_betas": config.cosmos.train.optm_betas,
-                "optm_grad_norm_clip": config.cosmos.train.optm_grad_norm_clip,
-                "optm_warmup_steps": config.cosmos.train.optm_warmup_steps,
-            }
-            for name, expected in required_optimizer_values.items():
-                if actual_optimizer_values[name] != expected:
-                    raise ValueError(f"g1_vla requires {name}={expected}")
-    if config.cosmos.rollout.prefetch_rollout:
+                raise ValueError(
+                    "g1_vla requires reference_controller_profile=sonic_visual"
+                )
+            if (
+                humanoid.policy_camera_profile
+                is not HumanoidPolicyCameraProfile.vla_d435_native
+            ):
+                raise ValueError(
+                    "g1_vla requires policy_camera_profile=vla_d435_native"
+                )
+            if config.policy.model.use_cameras != ["vla_d435_policy_rgb"]:
+                raise ValueError("g1_vla requires only vla_d435_policy_rgb")
+            if training:
+                train_policy = config.cosmos.train.train_policy
+                required_flow_values = {
+                    "grpo_ratio_clip_low": 0.2,
+                    "grpo_ratio_clip_high": 0.28,
+                    "ppo_value_loss_coef": 1.0,
+                    "ppo_value_clip_range": 0.2,
+                    "ppo_gamma": 0.99,
+                    "ppo_gae_lambda": 0.95,
+                    "ppo_dual_clip_ratio": 3.0,
+                    "ppo_value_huber_delta": 10.0,
+                    "kl_beta": 0.0,
+                }
+                actual_flow_values = {
+                    "grpo_ratio_clip_low": train_policy.grpo_ratio_clip_low,
+                    "grpo_ratio_clip_high": train_policy.grpo_ratio_clip_high,
+                    "ppo_value_loss_coef": train_policy.ppo_value_loss_coef,
+                    "ppo_value_clip_range": train_policy.ppo_value_clip_range,
+                    "ppo_gamma": train_policy.ppo_gamma,
+                    "ppo_gae_lambda": train_policy.ppo_gae_lambda,
+                    "ppo_dual_clip_ratio": train_policy.ppo_dual_clip_ratio,
+                    "ppo_value_huber_delta": train_policy.ppo_value_huber_delta,
+                    "kl_beta": train_policy.kl_beta,
+                }
+                if train_policy.trainer_type != "alpagym_flow_ppo":
+                    raise ValueError(
+                        "g1_vla motion_reference requires alpagym_flow_ppo"
+                    )
+                for name, expected in required_flow_values.items():
+                    if actual_flow_values[name] != expected:
+                        raise ValueError(f"g1_vla requires {name}={expected}")
+                if train_policy.ppo_normalize_advantages is not True:
+                    raise ValueError("g1_vla requires ppo_normalize_advantages=true")
+                required_optimizer_values = {
+                    "optm_part_lrs": [1.0e-6, 1.0e-4],
+                    "epsilon": 1.0e-8,
+                    "optm_weight_decay": 0.01,
+                    "optm_betas": [0.9, 0.999],
+                    "optm_grad_norm_clip": 1.0,
+                    "optm_warmup_steps": 0,
+                }
+                actual_optimizer_values = {
+                    "optm_part_lrs": config.cosmos.train.optm_part_lrs,
+                    "epsilon": config.cosmos.train.epsilon,
+                    "optm_weight_decay": config.cosmos.train.optm_weight_decay,
+                    "optm_betas": config.cosmos.train.optm_betas,
+                    "optm_grad_norm_clip": config.cosmos.train.optm_grad_norm_clip,
+                    "optm_warmup_steps": config.cosmos.train.optm_warmup_steps,
+                }
+                for name, expected in required_optimizer_values.items():
+                    if actual_optimizer_values[name] != expected:
+                        raise ValueError(f"g1_vla requires {name}={expected}")
+    if training and config.cosmos.rollout.prefetch_rollout:
         raise ValueError(
             "humanoid rollouts require prefetch_rollout=false until Cosmos passes "
             "current_weight_version to its prefetch hook"
         )
-    if config.cosmos.mode is not CosmosRLMode.colocated:
+    if training and config.cosmos.mode is not CosmosRLMode.colocated:
         raise ValueError(
             "standalone humanoid rollouts currently support cosmos.mode=colocated only; "
             "distributed async requires start-version reporting and session-boundary "
             "weight synchronization"
+        )
+
+
+def _validate_rollout_qualification_config(config: RunConfig) -> None:
+    """Validate the intentionally narrow, trainer-free qualification command."""
+    if ExecutionBackend(config.execution.backend) is not ExecutionBackend.local_process:
+        raise ValueError(
+            "command=rollout supports execution.backend=local_process only"
+        )
+    if config.alpasim.simulation_domain != "humanoid":
+        raise ValueError("command=rollout supports the humanoid domain only")
+    if config.policy.kind != "humanoid" or config.policy.model.kind != "g1_vla":
+        raise ValueError("command=rollout supports the g1_vla humanoid policy only")
+    if config.cosmos.mode is not CosmosRLMode.colocated:
+        raise ValueError("command=rollout requires cosmos.mode=colocated")
+    scene_ids = config.dataset.scene_ids
+    if scene_ids is None or len(scene_ids) != 1:
+        raise ValueError("command=rollout requires exactly one dataset.scene_id")
+    sampling_mode = config.policy.model.bundle_config.get("sampling_mode")
+    if sampling_mode != "native_ode_qualification":
+        raise ValueError(
+            "command=rollout requires "
+            "policy.model.bundle_config.sampling_mode=native_ode_qualification"
+        )
+    if config.policy.inference.return_trace_for_rl:
+        raise ValueError(
+            "command=rollout requires policy.inference.return_trace_for_rl=false"
         )
 
 
@@ -573,6 +618,13 @@ def _validate_training_policy_config(config: RunConfig) -> None:
             "PPO action std bounds must satisfy 0 < ppo_min_action_std <= "
             "ppo_max_action_std"
         )
+    if train_policy.ppo_target_behavior_kl is not None and (
+        not math.isfinite(train_policy.ppo_target_behavior_kl)
+        or train_policy.ppo_target_behavior_kl <= 0.0
+    ):
+        raise ValueError(
+            "PPO ppo_target_behavior_kl must be finite and positive when set"
+        )
 
 
 def _validate_cosmos_grpo_batch_geometry(cosmos: CosmosRLConfig) -> None:
@@ -782,6 +834,24 @@ def _validate_vla_slurm_worker_mounts(config: RunConfig) -> None:
     required_paths.append(
         ("alpasim.humanoid.scene_cache_path", Path(humanoid.scene_cache_path))
     )
+    if (
+        getattr(
+            humanoid,
+            "reference_controller_profile",
+            HumanoidReferenceControllerProfile.grail_heightmap,
+        )
+        is HumanoidReferenceControllerProfile.sonic_visual
+    ):
+        if humanoid.visual_controller_release_path is None:
+            raise ValueError(
+                "visual reference controller requires visual_controller_release_path"
+            )
+        required_paths.append(
+            (
+                "alpasim.humanoid.visual_controller_release_path",
+                Path(humanoid.visual_controller_release_path),
+            )
+        )
     if config.alpasim.repo_path is not None:
         required_paths.append(("alpasim.repo_path", Path(config.alpasim.repo_path)))
     elif config.alpasim.checkout_cache_dir is not None:

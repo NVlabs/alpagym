@@ -22,6 +22,7 @@ from alpagym_host.config import (
     HumanoidAlpaSimConfig,
     HumanoidExecutionProfile,
     HumanoidPolicyCameraProfile,
+    HumanoidReferenceControllerProfile,
     RunConfig,
     SeparateNodesSlurmTopologyConfig,
     TransportKind,
@@ -208,6 +209,7 @@ def test_host_writes_vla_flow_ppo_config(tmp_path: Path) -> None:
                 "cosmos.train.train_policy.ppo_normalize_advantages=true",
                 "cosmos.train.train_policy.ppo_gamma=0.99",
                 "cosmos.train.train_policy.ppo_gae_lambda=0.95",
+                "cosmos.train.train_policy.ppo_target_behavior_kl=0.05",
                 "cosmos.train.train_policy.kl_beta=0.0",
             ],
         )
@@ -238,7 +240,28 @@ def test_host_writes_vla_flow_ppo_config(tmp_path: Path) -> None:
         "gae_lambda": 0.95,
         "min_action_std": 0.02,
         "max_action_std": 2.0,
+        "target_behavior_kl": 0.05,
     }
+
+
+@pytest.mark.parametrize(
+    "target_behavior_kl",
+    (0.0, -0.1, float("nan"), float("inf")),
+)
+def test_training_policy_config_rejects_invalid_target_behavior_kl(
+    tmp_path: Path,
+    target_behavior_kl: float,
+) -> None:
+    """Behavior-policy KL guards must use a finite positive threshold."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        f"policy.model.path={model_path.as_posix()}",
+    )
+    run_config.cosmos.train.train_policy.ppo_target_behavior_kl = target_behavior_kl
+
+    with pytest.raises(ValueError, match="ppo_target_behavior_kl"):
+        validate_run_config(run_config, "run")
 
 
 def test_model_config_accepts_arbitrary_kind_and_round_trips_bundle_config(
@@ -729,6 +752,47 @@ def test_humanoid_config_rejects_vector_env_until_lane_local_gae_exists() -> Non
         )
 
 
+@pytest.mark.parametrize(
+    ("x", "y", "yaw", "match"),
+    (
+        (1.0, None, 0.0, "requires root x, y, and yaw"),
+        (True, 2.0, 0.0, "must be finite"),
+        (10_001.0, 2.0, 0.0, "within 10 km"),
+        (1.0, 2.0, 3.2, "yaw must be"),
+    ),
+)
+def test_humanoid_runtime_spawn_override_is_atomic_and_bounded(
+    x: object,
+    y: object,
+    yaw: object,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        HumanoidAlpaSimConfig(
+            repo_path="/tmp/alpasim-humanoid",
+            scene_store_path="/tmp/humanoid-scenes",
+            scenario_ids_by_scene={"stairs": "ascend"},
+            execution_profile=HumanoidExecutionProfile.motion_reference,
+            grail_root_path="/tmp/GRAIL",
+            reward_profile_id="direct_v9_shaped.v1",
+            runtime_spawn_root_x_m=x,  # type: ignore[arg-type]
+            runtime_spawn_root_y_m=y,  # type: ignore[arg-type]
+            runtime_spawn_root_yaw_rad=yaw,  # type: ignore[arg-type]
+        )
+
+
+def test_humanoid_runtime_spawn_override_rejects_direct_action() -> None:
+    with pytest.raises(ValueError, match="requires motion_reference"):
+        HumanoidAlpaSimConfig(
+            repo_path="/tmp/alpasim-humanoid",
+            scene_store_path="/tmp/humanoid-scenes",
+            scenario_ids_by_scene={"stairs": "ascend"},
+            runtime_spawn_root_x_m=1.0,
+            runtime_spawn_root_y_m=2.0,
+            runtime_spawn_root_yaw_rad=0.0,
+        )
+
+
 def test_humanoid_policy_camera_requires_typed_writable_cache() -> None:
     with pytest.raises(ValueError, match="scene_cache_path is required"):
         HumanoidAlpaSimConfig(
@@ -740,6 +804,65 @@ def test_humanoid_policy_camera_requires_typed_writable_cache() -> None:
             policy_camera_profile=HumanoidPolicyCameraProfile.vla_d455,
             service_image="alpasim-humanoid-nurec:local",
             reward_profile_id="reference_route_centered.v3",
+        )
+
+
+def _visual_sonic_humanoid_config(**overrides: object) -> HumanoidAlpaSimConfig:
+    values: dict[str, object] = {
+        "repo_path": "/tmp/alpasim-humanoid",
+        "scene_store_path": "/tmp/humanoid-scenes",
+        "scene_cache_path": "/tmp/humanoid-cache",
+        "scenario_ids_by_scene": {"stairs": "ascend"},
+        "execution_profile": HumanoidExecutionProfile.motion_reference,
+        "grail_root_path": "/tmp/GRAIL",
+        "reference_controller_profile": (
+            HumanoidReferenceControllerProfile.sonic_visual
+        ),
+        "visual_controller_release_path": "/tmp/visual-sonic-release",
+        "robot_physics_profile": (
+            "sonic.isaac_training.g1_cylinder_model_12.mujoco_port.v1"
+        ),
+        "service_image": "alpasim-humanoid-nurec:local",
+        "reward_profile_id": "direct_v9_shaped.v1",
+    }
+    values.update(overrides)
+    return HumanoidAlpaSimConfig(**values)  # type: ignore[arg-type]
+
+
+def test_visual_sonic_requires_explicit_robot_physics_profile() -> None:
+    with pytest.raises(ValueError, match="requires an explicit robot_physics_profile"):
+        _visual_sonic_humanoid_config(robot_physics_profile=None)
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        "g1_cylinder_model_12",
+        "sonic_visual.mujoco_release.unknown.v1",
+    ],
+)
+def test_visual_sonic_rejects_unqualified_robot_physics_profile(
+    profile: str,
+) -> None:
+    with pytest.raises(ValueError, match="robot_physics_profile must be one of"):
+        _visual_sonic_humanoid_config(robot_physics_profile=profile)
+
+
+def test_nonvisual_controller_rejects_unused_robot_physics_profile() -> None:
+    with pytest.raises(
+        ValueError,
+        match="robot_physics_profile requires reference_controller_profile=sonic_visual",
+    ):
+        HumanoidAlpaSimConfig(
+            repo_path="/tmp/alpasim-humanoid",
+            scene_store_path="/tmp/humanoid-scenes",
+            scenario_ids_by_scene={"stairs": "ascend"},
+            execution_profile=HumanoidExecutionProfile.motion_reference,
+            grail_root_path="/tmp/GRAIL",
+            robot_physics_profile=(
+                "sonic.isaac_training.g1_cylinder_model_12.mujoco_port.v1"
+            ),
+            reward_profile_id="direct_v9_shaped.v1",
         )
 
 
@@ -755,7 +878,7 @@ def test_humanoid_policy_camera_profile_round_trips_resolved_config(
         scenario_ids_by_scene={"stairs": "ascend"},
         execution_profile=HumanoidExecutionProfile.motion_reference,
         grail_root_path="/tmp/GRAIL",
-        policy_camera_profile=HumanoidPolicyCameraProfile.vla_d455,
+        policy_camera_profile=HumanoidPolicyCameraProfile.vla_d435_native,
         service_image="alpasim-humanoid-nurec:local",
         reward_profile_id="reference_route_centered.v3",
     )
@@ -774,15 +897,18 @@ def test_humanoid_policy_camera_profile_round_trips_resolved_config(
         run_config.artifact_paths.resolved_config_path.read_text(encoding="utf-8")
     )
     loaded_config = load_run_config(run_config.artifact_paths.resolved_config_path)
-    assert raw_config["alpasim"]["humanoid"]["policy_camera_profile"] == "vla_d455"
-    assert HumanoidPolicyCameraProfile.vla_d455.value == "vla_d455"
     assert (
-        HumanoidPolicyCameraProfile.vla_d455.wizard_config_group == "humanoid_vla_d455"
+        raw_config["alpasim"]["humanoid"]["policy_camera_profile"] == "vla_d435_native"
+    )
+    assert HumanoidPolicyCameraProfile.vla_d435_native.value == "vla_d435_native"
+    assert (
+        HumanoidPolicyCameraProfile.vla_d435_native.wizard_config_group
+        == "humanoid_vla_d435_native"
     )
     assert loaded_config.alpasim.humanoid is not None
     assert (
         loaded_config.alpasim.humanoid.policy_camera_profile
-        is HumanoidPolicyCameraProfile.vla_d455
+        is HumanoidPolicyCameraProfile.vla_d435_native
     )
 
 
@@ -1306,7 +1432,7 @@ def test_vla_mount_preflight_precedes_unqualified_slurm_mode_rejection(
         scenario_ids_by_scene={"stairs": "ascend"},
         execution_profile=HumanoidExecutionProfile.motion_reference,
         grail_root_path=str(humanoid_paths["grail"]),
-        policy_camera_profile=HumanoidPolicyCameraProfile.vla_d455,
+        policy_camera_profile=HumanoidPolicyCameraProfile.vla_d435_native,
         scene_cache_path=str(humanoid_paths["scene_cache"]),
         service_image="combined-humanoid:latest",
         reward_profile_id="reference_route_centered.v3",
@@ -1569,7 +1695,7 @@ def _make_valid_vla_validation_config() -> RunConfig:
                 model=SimpleNamespace(
                     kind="g1_vla",
                     step_dt_us=500_000,
-                    use_cameras=["vla_d455_policy_rgb"],
+                    use_cameras=["vla_d435_policy_rgb"],
                     bundle_config={
                         "humanoid_policy_factory": (
                             "alpagym_g1_vla.humanoid_policy:"
@@ -1596,7 +1722,7 @@ def _make_valid_vla_validation_config() -> RunConfig:
                     execution_profile=HumanoidExecutionProfile.motion_reference,
                     reward_profile_id="direct_v9_shaped.v1",
                     reference_frame_count=50,
-                    policy_camera_profile=HumanoidPolicyCameraProfile.vla_d455,
+                    policy_camera_profile=HumanoidPolicyCameraProfile.vla_d435_native,
                 ),
                 wizard_args=SimpleNamespace(
                     control_timestep_us=500_000,
@@ -1622,7 +1748,7 @@ def _make_valid_vla_validation_config() -> RunConfig:
                         ppo_normalize_advantages=True,
                         kl_beta=0.0,
                     ),
-                    optm_part_lrs=[5.0e-6, 1.0e-4],
+                    optm_part_lrs=[1.0e-6, 1.0e-4],
                     epsilon=1.0e-8,
                     optm_weight_decay=0.01,
                     optm_betas=[0.9, 0.999],

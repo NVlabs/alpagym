@@ -20,14 +20,19 @@ from typing import Any
 
 import numpy as np
 from numpy.typing import DTypeLike
+from alpasim_grpc.v0.humanoid_contracts import (
+    HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA,
+)
 
 
 H50_FRAME_COUNT = 50
 REFERENCE_PERIOD_US = 20_000
-# The current VLA starts the next inference after 15 source rows.  In the
-# asynchronous AlpaGym rollout this is exactly 25 controller ticks; it is a
-# replan trigger, not a truncation of the one-second reference buffer.
-REPLAN_CONTROLLER_TICKS = 25
+# Native evaluation executes 15 rows on the 30 Hz action clock before a new
+# inference.  That is 0.5 s, or 25 ticks on the 50 Hz controller clock.  Visual
+# Sonic's future window is maintained by the controller-owned rolling queue;
+# it is not a second VLA inference cadence.
+NATIVE_REPLAN_CONTROLLER_TICKS = 25
+SUPPORTED_REPLAN_CONTROLLER_TICKS = frozenset({NATIVE_REPLAN_CONTROLLER_TICKS})
 REPLAN_SOURCE_ROWS = 15
 _VLA_ACTION_ROWS = 30
 _VLA_ACTION_WIDTH = 38
@@ -39,6 +44,51 @@ _G1_QVEL = 35
 class _HumanoidModules:
     reference_adapter: ModuleType
     motion: ModuleType
+
+
+@dataclass(frozen=True)
+class VlaReferenceDecodeContext:
+    """Full-rotation local-XY information retained for physics completion."""
+
+    schema: str
+    chunk_base_quaternion_wxyz: np.ndarray
+    local_xy_from_frame_zero: np.ndarray
+
+    def __post_init__(self) -> None:
+        """Own finite immutable copies of the pinned adapter output."""
+        if self.schema != HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA:
+            raise ValueError("VLA reference adapter returned an unsupported schema")
+        quaternion = _finite_array(
+            self.chunk_base_quaternion_wxyz,
+            name="VLA decode-context chunk-base quaternion",
+            shape=(4,),
+            dtype=np.float32,
+        )
+        norm = float(np.linalg.norm(quaternion))
+        if not np.isclose(norm, 1.0, rtol=0.0, atol=1.0e-5):
+            raise ValueError(
+                "VLA decode-context chunk-base quaternion must be normalized"
+            )
+        local_xy = _finite_array(
+            self.local_xy_from_frame_zero,
+            name="VLA decode-context local XY",
+            shape=(H50_FRAME_COUNT, 2),
+            dtype=np.float32,
+        )
+        if not np.array_equal(local_xy[0], np.zeros(2, dtype=np.float32)):
+            raise ValueError("VLA decode-context local XY row zero must be exact zero")
+        quaternion.setflags(write=False)
+        local_xy.setflags(write=False)
+        object.__setattr__(self, "chunk_base_quaternion_wxyz", quaternion)
+        object.__setattr__(self, "local_xy_from_frame_zero", local_xy)
+
+
+@dataclass(frozen=True)
+class VlaReferenceBuild:
+    """One H50 reference and the context required to finish its root path."""
+
+    reference: Any
+    decode_context: VlaReferenceDecodeContext
 
 
 class VlaMotionReferenceAdapter:
@@ -85,8 +135,8 @@ class VlaMotionReferenceAdapter:
         qvel: object,
         timestamp_us: int,
         velocity_seed_joint_position: object | None = None,
-    ) -> Any:
-        """Return the 50 targets produced by the pinned 30-to-50 Hz map.
+    ) -> VlaReferenceBuild:
+        """Return the H50 reference plus its physics decode context.
 
         Target zero is a policy target, not the measured robot pose.  On the
         first dispatch its velocity predecessor is the reset/hold pose.  A
@@ -144,22 +194,39 @@ class VlaMotionReferenceAdapter:
             source_row_cursor=0,
             velocity_seed=velocity_seed,
         )
+        native_decode_context = (
+            adapter.convert_vla_chunk_to_full_rotation_local_xy_context(
+                chunk,
+                source_row_cursor=0,
+            )
+        )
         if len(targets) != 50:
             raise AssertionError("VLA reference adapter did not return 50 targets")
 
         motion = self._support.motion
         start_s = timestamp / 1_000_000.0
-        root_position = live_qpos[:3]
+        # The VLA does not predict pelvis Z, but it does predict a root-XY path.
+        # Preserve and rebase that path so frame zero is exactly the live root
+        # XY.  The Z value below is explicitly only a placeholder: the current
+        # Visual SONIC qualification lane replaces reference[580:590] per
+        # controller tick with measured live pelvis Z.  A production lane must
+        # extend the policy/root-trajectory contract with true future Z.
+        target_zero_xy = np.asarray(targets[0].root_xy, dtype=np.float64)
+        root_xy_translation = live_qpos[:2] - target_zero_xy
         frames = []
         for frame_index, target in enumerate(targets):
+            root_position = live_qpos[:3].copy()
+            root_position[:2] = (
+                np.asarray(target.root_xy, dtype=np.float64) + root_xy_translation
+            )
             frames.append(
                 motion.MotionFrame(
                     time_s=start_s + frame_index * REFERENCE_PERIOD_US / 1_000_000.0,
                     joint_position=target.joint_position,
                     joint_velocity=target.joint_velocity,
-                    # The current VLA has no root-Z action and GRAIL's streamed-motion
-                    # observation does not consume root XYZ.  Preserve the
-                    # realized root position instead of inventing a trajectory.
+                    # Root Z remains an explicit placeholder because it is
+                    # absent from the 38-D action.  It must not be described as
+                    # a completed source-motion reference.
                     root_position=root_position,
                     root_quaternion_wxyz=target.root_quaternion_wxyz,
                 )
@@ -174,7 +241,20 @@ class VlaMotionReferenceAdapter:
         if period_s is None or not np.isclose(period_s, 0.02, rtol=0.0, atol=1.0e-9):
             raise AssertionError("VLA reference is not on the 50 Hz grid")
 
-        return reference
+        return VlaReferenceBuild(
+            reference=reference,
+            decode_context=VlaReferenceDecodeContext(
+                schema=str(native_decode_context.schema),
+                chunk_base_quaternion_wxyz=np.asarray(
+                    native_decode_context.chunk_base_quat_wxyz,
+                    dtype=np.float32,
+                ),
+                local_xy_from_frame_zero=np.asarray(
+                    native_decode_context.local_xy_from_frame_zero,
+                    dtype=np.float32,
+                ),
+            ),
+        )
 
 
 def _load_humanoid_modules(
@@ -270,7 +350,8 @@ def _finite_array(
 __all__ = (
     "H50_FRAME_COUNT",
     "REFERENCE_PERIOD_US",
-    "REPLAN_CONTROLLER_TICKS",
+    "NATIVE_REPLAN_CONTROLLER_TICKS",
+    "SUPPORTED_REPLAN_CONTROLLER_TICKS",
     "REPLAN_SOURCE_ROWS",
     "VlaMotionReferenceAdapter",
 )

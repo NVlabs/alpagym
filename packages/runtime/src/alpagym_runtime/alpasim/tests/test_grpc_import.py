@@ -10,9 +10,11 @@ import pytest
 
 from alpagym_runtime.alpasim.grpc_import import (
     _validate_humanoid_policy_camera_abi,
+    _validate_humanoid_reference_decode_context_abi,
     _validate_descriptor_fields,
     ensure_alpasim_grpc_source,
     ensure_humanoid_policy_camera_abi,
+    ensure_humanoid_reference_decode_context_abi,
 )
 
 
@@ -65,6 +67,33 @@ def _strict_camera_abi() -> tuple[object, object]:
         HumanoidRenderState=lambda **kwargs: kwargs,
         humanoid_image_sha256=lambda image_bytes: image_bytes,
         humanoid_render_receipt_sha256=lambda **kwargs: kwargs,
+    )
+    return descriptor, contracts
+
+
+def _strict_reference_decode_context_abi() -> tuple[object, object]:
+    """Return a descriptor/shared-contract pair for the plan wire gate."""
+    context = _message(
+        "schema",
+        "chunk_base_quaternion_wxyz",
+        "local_xy_from_frame_zero",
+    )
+    update = _message("decode_context")
+    update.fields_by_name["decode_context"].message_type = context
+    descriptor = SimpleNamespace(
+        message_types_by_name={
+            "HumanoidMotionReferenceSpec": _message("decode_context_schema"),
+            "HumanoidPlanUpdate": update,
+            "HumanoidReferenceDecodeContext": context,
+        }
+    )
+    contracts = SimpleNamespace(
+        HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA=(
+            "full_pelvis_rotation_local_xy_completed_z/v1"
+        ),
+        HUMANOID_REFERENCE_HASH_DOMAIN_V1=b"motion-reference.v1\0",
+        HUMANOID_REFERENCE_HASH_DOMAIN_V2=(b"motion-reference+decode-context.v2\0"),
+        humanoid_reference_sha256=lambda spec, update: (spec, update),
     )
     return descriptor, contracts
 
@@ -154,3 +183,41 @@ def test_strict_policy_camera_gate_explains_matching_package_requirement(
     )
     with pytest.raises(RuntimeError, match="ALPASIM_GRPC_ROOT"):
         ensure_humanoid_policy_camera_abi()
+
+
+def test_reference_decode_context_abi_accepts_matching_wire_and_hash_contract() -> None:
+    descriptor, contracts = _strict_reference_decode_context_abi()
+
+    _validate_humanoid_reference_decode_context_abi(descriptor, contracts)
+
+
+def test_reference_decode_context_abi_rejects_mismatched_message_link() -> None:
+    descriptor, contracts = _strict_reference_decode_context_abi()
+    descriptor.message_types_by_name["HumanoidPlanUpdate"].fields_by_name[
+        "decode_context"
+    ].message_type = descriptor.message_types_by_name["HumanoidMotionReferenceSpec"]
+
+    with pytest.raises(RuntimeError, match="matching message type"):
+        _validate_humanoid_reference_decode_context_abi(descriptor, contracts)
+
+
+def test_reference_decode_context_gate_requires_shared_hash_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor, contracts = _strict_reference_decode_context_abi()
+    del contracts.humanoid_reference_sha256
+    humanoid_pb2 = SimpleNamespace(DESCRIPTOR=descriptor)
+
+    def import_module(name: str) -> object:
+        if name.endswith("humanoid_pb2"):
+            return humanoid_pb2
+        if name.endswith("humanoid_contracts"):
+            return contracts
+        raise AssertionError(name)
+
+    monkeypatch.setattr(
+        "alpagym_runtime.alpasim.grpc_import.importlib.import_module",
+        import_module,
+    )
+    with pytest.raises(RuntimeError, match="ALPASIM_GRPC_ROOT"):
+        ensure_humanoid_reference_decode_context_abi()

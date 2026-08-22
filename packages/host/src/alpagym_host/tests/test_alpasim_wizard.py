@@ -24,6 +24,7 @@ from alpagym_host.config import (
     HumanoidAlpaSimConfig,
     HumanoidExecutionProfile,
     HumanoidPolicyCameraProfile,
+    HumanoidReferenceControllerProfile,
 )
 
 
@@ -161,6 +162,62 @@ def test_wizard_command_selects_strict_motion_reference_profile(
     assert command.count("defines.humanoid_scene_cache=/workspace/cache/hq_stairs") == 1
 
 
+def test_wizard_command_selects_visual_sonic_as_atomic_tracker_profile(
+    tmp_path: Path,
+) -> None:
+    config = _alpasim_config(
+        AlpaSimWizardArgs(
+            deploy="local",
+            topology="1gpu",
+            driver_source="external_dynamic",
+            force_gt_duration_us=0,
+            control_timestep_us=100_000,
+            n_sim_steps=150,
+        )
+    )
+    config.simulation_domain = "humanoid"
+    config.humanoid = HumanoidAlpaSimConfig(
+        repo_path="/workspace/humanoid",
+        scene_store_path="/workspace/scenes",
+        scenario_ids_by_scene={"hq_stairs": "ascend"},
+        execution_profile=HumanoidExecutionProfile.motion_reference,
+        grail_root_path="/workspace/GRAIL",
+        reference_controller_profile=(HumanoidReferenceControllerProfile.sonic_visual),
+        visual_controller_release_path="/workspace/visual-sonic-release",
+        robot_physics_profile=(
+            "sonic.isaac_training.g1_cylinder_model_12.mujoco_port.v1"
+        ),
+        policy_camera_profile=HumanoidPolicyCameraProfile.vla_d435_native,
+        scene_cache_path="/workspace/cache/hq_stairs",
+        service_image="alpasim-humanoid-nurec:local",
+        reward_profile_id="direct_v9_shaped.v1",
+        expected_scene_fingerprints={"hq_stairs": "a" * 64},
+    )
+
+    command = _build_wizard_command(
+        config=config,
+        execution_backend=ExecutionBackend.local_process,
+        dataset=DatasetConfig(scene_ids=["hq_stairs"], test_suite_id=None),
+        alpasim_run_dir=tmp_path / "alpasim",
+        checkout_root=tmp_path,
+    )
+
+    assert "runtime_domain=humanoid_reference_visual" in command
+    assert (
+        "defines.humanoid_visual_controller_release=/workspace/visual-sonic-release"
+    ) in command
+    assert (
+        "defines.humanoid_robot_physics_profile="
+        '"sonic.isaac_training.g1_cylinder_model_12.mujoco_port.v1"'
+    ) in command
+    assert command.count("defines.humanoid_scene_cache=/workspace/cache/hq_stairs") == 1
+    assert 'runtime.humanoid.controller.options.max_control_ticks="750"' in command
+    assert "runtime.simulation_config.control_timestep_us=100000" in command
+    assert "runtime.simulation_config.n_sim_steps=150" in command
+    assert "runtime.humanoid.reference.control_ticks_per_policy_step=5" in command
+    assert command.count("cameras=humanoid_vla_d435_native") == 1
+
+
 def test_wizard_command_sends_v9_reward_without_route_center_options(
     tmp_path: Path,
 ) -> None:
@@ -184,6 +241,9 @@ def test_wizard_command_sends_v9_reward_without_route_center_options(
         grail_root_path="/workspace/GRAIL",
         reward_profile_id="direct_v9_shaped.v1",
         expected_scene_fingerprints={"hq_stairs": "a" * 64},
+        runtime_spawn_root_x_m=0.9954772324738195,
+        runtime_spawn_root_y_m=2.8733132015389695,
+        runtime_spawn_root_yaw_rad=-0.7295696089600734,
     )
 
     command = _build_wizard_command(
@@ -200,7 +260,49 @@ def test_wizard_command_sends_v9_reward_without_route_center_options(
     assert not any("route_center_soft_m" in item for item in command)
     assert not any("route_progress_credit_m" in item for item in command)
     assert not any("route_corridor_half_width_m" in item for item in command)
+    assert (
+        "+runtime.humanoid.controller.options.runtime_spawn_override_schema="
+        '"reference_tracking.runtime_spawn_xy_yaw.v1"'
+    ) in command
+    assert (
+        '+runtime.humanoid.controller.options.runtime_spawn_root_x_m="0.9954772324738195"'
+        in command
+    )
+    assert (
+        '+runtime.humanoid.controller.options.runtime_spawn_root_y_m="2.8733132015389695"'
+        in command
+    )
+    assert (
+        '+runtime.humanoid.controller.options.runtime_spawn_root_yaw_rad="-0.7295696089600734"'
+        in command
+    )
     assert 'runtime.humanoid.controller.options.max_control_ticks="750"' in command
+
+
+def test_wizard_command_rejects_one_pose_for_multiple_scenes(tmp_path: Path) -> None:
+    """A scalar runtime reset override cannot ambiguously target many scenes."""
+    config = _alpasim_config()
+    config.simulation_domain = "humanoid"
+    config.humanoid = HumanoidAlpaSimConfig(
+        repo_path="/workspace/humanoid",
+        scene_store_path="/workspace/scenes",
+        scenario_ids_by_scene={"scene_a": "ascend", "scene_b": "ascend"},
+        execution_profile=HumanoidExecutionProfile.motion_reference,
+        grail_root_path="/workspace/GRAIL",
+        reward_profile_id="direct_v9_shaped.v1",
+        runtime_spawn_root_x_m=1.0,
+        runtime_spawn_root_y_m=2.0,
+        runtime_spawn_root_yaw_rad=0.0,
+    )
+
+    with pytest.raises(ValueError, match="exactly one selected scene"):
+        _build_wizard_command(
+            config=config,
+            execution_backend=ExecutionBackend.local_process,
+            dataset=DatasetConfig(scene_ids=["scene_a", "scene_b"], test_suite_id=None),
+            alpasim_run_dir=tmp_path / "alpasim",
+            checkout_root=tmp_path,
+        )
 
 
 @pytest.mark.parametrize(
@@ -217,6 +319,8 @@ def test_wizard_command_sends_v9_reward_without_route_center_options(
         "runtime.simulation_config.image_format=jpeg",
         "runtime.humanoid.policy_camera.schema=untrusted.v0",
         "defines.humanoid_scene_cache=/tmp/untrusted",
+        "defines={humanoid_robot_physics_profile:untrusted}",
+        "runtime.humanoid={num_envs:99}",
         "services.runtime.volumes=[]",
         "runtime_domain=humanoid",
     ],

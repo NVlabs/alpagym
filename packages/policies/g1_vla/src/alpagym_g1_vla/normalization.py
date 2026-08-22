@@ -134,16 +134,39 @@ class VlaQ99Normalizer(nn.Module):
 
     def to_wire(self, density_latent: torch.Tensor) -> VlaWireActions:
         """Clamp only after density evaluation, then denormalize for dispatch."""
+        return self.to_qualification_wire(
+            density_latent,
+            clip_normalized_actions=True,
+        )
+
+    def to_qualification_wire(
+        self,
+        density_latent: torch.Tensor,
+        *,
+        clip_normalized_actions: bool,
+    ) -> VlaWireActions:
+        """Materialize a profile-owned native serving wire contract.
+
+        Flow-PPO always calls :meth:`to_wire` and therefore retains its
+        clipped behavior distribution.  Native qualification may instead
+        reproduce an original deployment that applied the q01/q99 affine map
+        directly to an unbounded flow output.  ``clipped_normalized`` remains
+        available as an audit view in either case; it is not necessarily the
+        tensor used for physical dispatch.
+        """
+        if not isinstance(clip_normalized_actions, bool):
+            raise TypeError("VLA qualification clip flag must be boolean")
         density_latent = _finite_last_dim(
             density_latent, width=VLA_ACTION_DIM, label="density latent"
         )
         if density_latent.ndim != 3 or density_latent.shape[-2] != VLA_ACTION_ROWS:
             raise ValueError("VLA density latent must have shape [B, 30, 38]")
         clipped = density_latent.clamp(-1.0, 1.0)
+        dispatch_normalized = clipped if clip_normalized_actions else density_latent
         return VlaWireActions(
             density_latent=density_latent,
             clipped_normalized=clipped,
-            denormalized=self.denormalize_action(clipped),
+            denormalized=self.denormalize_action(dispatch_normalized),
         )
 
 

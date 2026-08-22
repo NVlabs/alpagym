@@ -1,50 +1,114 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Training-compatible D455 image geometry and BATS history selection."""
+"""Training-compatible native-D435 decoding and BATS history selection."""
 
 from __future__ import annotations
 
 import hashlib
 import io
 import math
+from functools import lru_cache
 from dataclasses import dataclass, field
+from typing import cast
 
 import numpy as np
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, JpegImagePlugin, UnidentifiedImageError
 
 
-def width_fit_letterbox_d455(image_bytes: bytes, *, image_format: str) -> Image.Image:
-    """Decode a 224x140 RGB D455 frame and letterbox it to 224x224.
+def _jpeg_quantization_signature(
+    image: Image.Image,
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    tables = getattr(image, "quantization", None)
+    if not isinstance(tables, dict):
+        raise ValueError("VLA D435 JPEG is missing quantization tables")
+    typed_tables = cast(dict[int, list[int]], tables)
+    return tuple(
+        (int(table_id), tuple(int(value) for value in table))
+        for table_id, table in sorted(typed_tables.items())
+    )
 
-    The training parquet used a width-fit resize followed by symmetric black
-    padding.  A native 224x140 frame is therefore preserved pixel-for-pixel and
-    pasted at vertical offset 42; it is never stretched to a square.
+
+@lru_cache(maxsize=1)
+def _pil_jpeg95_contract_signature() -> tuple[
+    int, tuple[tuple[int, tuple[int, ...]], ...]
+]:
+    """Return Pillow's declared quality=95/default-subsampling JPEG signature."""
+    stream = io.BytesIO()
+    reference = Image.new("RGB", (16, 16), color=(127, 91, 43))
+    try:
+        reference.save(stream, format="JPEG", quality=95)
+    finally:
+        reference.close()
+    with Image.open(io.BytesIO(stream.getvalue())) as decoded:
+        decoded.load()
+        return (
+            int(JpegImagePlugin.get_sampling(decoded)),
+            _jpeg_quantization_signature(decoded),
+        )
+
+
+def decode_native_d435(image_bytes: bytes, *, image_format: str) -> Image.Image:
+    """Decode one native 640x480 RGB D435 JPEG policy observation.
+
+    The stairs-blocks checkpoint was trained from the republished native D435
+    dataset, not the older 224x140 D455 policy raster.  This boundary therefore
+    owns decoding only.  The checkpoint's ``ResizeImage((224, 224))`` and
+    ``CenterCrop((224, 224))`` transforms are applied later, immediately before
+    the Psi VLM builder; letterboxing here would silently change the model ABI.
 
     Args:
         image_bytes: One complete PNG or JPEG frame.
-        image_format: Session-declared encoding, either ``"png"`` or ``"jpeg"``.
+        image_format: Session-declared encoding; ckpt_1500 requires ``"jpeg"``.
 
     Returns:
-        An owned 224x224 uint8 RGB PIL image.
+        An owned 640x480 uint8 RGB PIL image.
     """
-    expected_format = {"png": "PNG", "jpeg": "JPEG"}[image_format]
+    if image_format != "jpeg":
+        raise ValueError("VLA D435 frame encoding must be JPEG")
+    expected_format = "JPEG"
     try:
         with Image.open(io.BytesIO(image_bytes)) as decoded:
             decoded.load()
             if decoded.format != expected_format or decoded.mode != "RGB":
-                raise ValueError("VLA D455 frame encoding or RGB mode changed")
-            if decoded.size != (224, 140):
-                raise ValueError("VLA D455 frame must be exactly 224x140")
+                raise ValueError("VLA D435 frame encoding or RGB mode changed")
+            if decoded.size != (640, 480):
+                raise ValueError("VLA D435 frame must be exactly 640x480")
+            signature = (
+                int(JpegImagePlugin.get_sampling(decoded)),
+                _jpeg_quantization_signature(decoded),
+            )
+            if signature != _pil_jpeg95_contract_signature():
+                raise ValueError(
+                    "VLA D435 frame must use Pillow JPEG quality=95 default 4:2:0"
+                )
             frame = decoded.copy()
     except (OSError, SyntaxError, UnidentifiedImageError) as exc:
-        raise ValueError("VLA D455 frame cannot be decoded") from exc
+        raise ValueError("VLA D435 frame cannot be decoded") from exc
+    return frame
 
-    scaled_height = round(frame.height * 224 / frame.width)
-    if scaled_height != 140:
-        raise ValueError("VLA D455 width-fit geometry changed")
+
+def decode_legacy_d455_letterbox(
+    image_bytes: bytes,
+    *,
+    image_format: str,
+) -> Image.Image:
+    """Decode the separately attested legacy 224x140 D455 PNG profile."""
+    if image_format != "png":
+        raise ValueError("legacy VLA D455 frame encoding must be PNG")
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as decoded:
+            decoded.load()
+            if decoded.format != "PNG" or decoded.mode != "RGB":
+                raise ValueError("legacy VLA D455 encoding or RGB mode changed")
+            if decoded.size != (224, 140):
+                raise ValueError("legacy VLA D455 frame must be exactly 224x140")
+            frame = decoded.copy()
+    except (OSError, SyntaxError, UnidentifiedImageError) as exc:
+        raise ValueError("legacy VLA D455 frame cannot be decoded") from exc
     canvas = Image.new("RGB", (224, 224), color=(0, 0, 0))
-    canvas.paste(frame, (0, (224 - scaled_height) // 2))
+    canvas.paste(frame, (0, 42))
+    frame.close()
     return canvas
 
 
@@ -223,6 +287,8 @@ class VlaImageHistory:
 def image_array(image: Image.Image) -> np.ndarray:
     """Return an owned HWC uint8 RGB array for diagnostics and tests."""
     array = np.asarray(image, dtype=np.uint8)
-    if array.shape != (224, 224, 3) or not math.isfinite(float(array.mean())):
-        raise ValueError("VLA letterboxed image has an invalid raster")
+    if array.shape not in {(480, 640, 3), (224, 224, 3)} or not math.isfinite(
+        float(array.mean())
+    ):
+        raise ValueError("VLA image has an invalid native or transformed raster")
     return array.copy()

@@ -13,35 +13,54 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol, TypedDict, cast
 
 import torch
+from alpasim_grpc.v0.humanoid_contracts import (
+    HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA,
+)
 from alpagym_runtime.alpasim.humanoid_policy_server import (
     HUMANOID_EXECUTION_MODE_MOTION_REFERENCE,
     MOTION_REFERENCE_JOINT_NAMES,
     HumanoidCameraFrame,
     HumanoidMotionReference,
     HumanoidMotionReferenceFrame,
+    HumanoidReferenceDecodeContext,
     HumanoidPolicyInput,
     HumanoidPolicyStepOutput,
     HumanoidRealizedFeedbackTrace,
 )
 from alpagym_runtime.replay import ActionSelection, PolicyReplayData
 
-from alpagym_g1_vla.bundle import MODEL_FAMILY, REPLAY_SCHEMA
+from alpagym_g1_vla.bundle import (
+    FLOW_SDE_TRAINING,
+    MODEL_FAMILY,
+    NATIVE_ODE_QUALIFICATION,
+    QUALIFICATION_REPLAY_SCHEMA,
+    REPLAY_SCHEMA,
+    vla_sampling_mode,
+)
 from alpagym_g1_vla.history import (
     VlaImageHistory,
+    decode_legacy_d455_letterbox,
+    decode_native_d435,
     stable_episode_int,
-    width_fit_letterbox_d455,
 )
 from alpagym_g1_vla.flow import (
     VLA_FLOW_IGNORE_LAST,
     VLA_FLOW_NOISE_LEVEL,
 )
 from alpagym_g1_vla.inference_model import unwrap_actor_critic
-from alpagym_g1_vla.model import VlaPolicySample, VlaPsiActorCritic
-from alpagym_g1_vla.provenance import RUN_CONFIG_SHA256
+from alpagym_g1_vla.model import (
+    VlaPolicySample,
+    VlaPsiActorCritic,
+    VlaQualificationSample,
+)
+from alpagym_g1_vla.provenance import (
+    VlaBundleProfile,
+    vla_bundle_profile_for_model_root,
+)
 from alpagym_g1_vla.reference_adapter import (
     H50_FRAME_COUNT,
     REFERENCE_PERIOD_US,
-    REPLAN_CONTROLLER_TICKS,
+    SUPPORTED_REPLAN_CONTROLLER_TICKS,
     VlaMotionReferenceAdapter,
 )
 
@@ -49,8 +68,14 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _H50_SCHEMA = "g1_motion_reference_29d_50hz_h50.v1"
 _VLA_ACTION_ROWS = 30
 _VLA_ACTION_WIDTH = 38
-_RTC_INITIAL_DELAY_ROWS = 6
+# Async training starts with the native RealTimeChunkController's conservative
+# latency prior.  Synchronous qualification freezes the simulator during model
+# inference, so it must start from measured zero delay instead.
+_RTC_ASYNC_INITIAL_DELAY_ROWS = 6
+_RTC_SYNC_INITIAL_DELAY_ROWS = 0
 _RTC_DELAY_WINDOW_SIZE = 6
+_RTC_PREFIX_MODE_LATENCY_PREDICTOR = "latency_predictor/v1"
+_RTC_PREFIX_MODE_FIXED_CONTINUITY = "fixed_continuity/v1"
 _VLA_CONTROL_HZ = 30
 _REFERENCE_CONTROL_HZ = 50
 
@@ -61,7 +86,7 @@ class _PreviousRtcChunk:
 
     reference_id: int
     source_timestamp_us: int
-    clipped_normalized_actions: torch.Tensor
+    normalized_actions: torch.Tensor
     denormalized_joint_positions: torch.Tensor
     base_quaternion_wxyz: torch.Tensor
     base_xy: torch.Tensor
@@ -85,6 +110,9 @@ class _RtcInputs:
     source_start_row_h30: int
     velocity_seed_joint_position: torch.Tensor | None
     next_delay_rows: tuple[int, ...]
+    observed_delay_rows: int
+    configured_continuity_prefix_rows: int
+    prefix_mode: str
 
 
 @dataclass
@@ -94,14 +122,16 @@ class _Lane:
     generator: torch.Generator
     history: VlaImageHistory
     reset_episode_id: int
+    initial_rtc_delay_rows: int
+    qualification_continuity_prefix_rows: int
     next_reference_sequence: int = 1
     rtc_state: _RtcLaneState | None = None
 
     def __post_init__(self) -> None:
-        """Seed the native conservative delay predictor exactly once."""
+        """Seed RTC with the execution mode's explicit latency prior."""
         if self.rtc_state is None:
             self.rtc_state = _RtcLaneState(
-                delay_rows=(_RTC_INITIAL_DELAY_ROWS,), previous_chunk=None
+                delay_rows=(self.initial_rtc_delay_rows,), previous_chunk=None
             )
 
 
@@ -146,6 +176,10 @@ class G1VlaHumanoidPolicy:
         humanoid_vla_reference_adapter_sha256: str,
         humanoid_motion_reference_sha256: str,
         language_instruction: str,
+        run_config_sha256: str,
+        bundle_profile: VlaBundleProfile,
+        sampling_mode: str,
+        replan_controller_ticks: int,
     ) -> None:
         """Bind the exact request identity and create lane state lazily."""
         if not session_uuid:
@@ -159,6 +193,28 @@ class G1VlaHumanoidPolicy:
         self._instruction_sha256 = hashlib.sha256(
             language_instruction.encode("utf-8")
         ).hexdigest()
+        if _SHA256.fullmatch(run_config_sha256) is None:
+            raise ValueError("VLA run_config_sha256 must be a lowercase SHA-256")
+        self._run_config_sha256 = run_config_sha256
+        if not isinstance(bundle_profile, VlaBundleProfile):
+            raise TypeError("VLA policy requires an attested bundle profile")
+        self._bundle_profile = bundle_profile
+        if sampling_mode not in {FLOW_SDE_TRAINING, NATIVE_ODE_QUALIFICATION}:
+            raise ValueError("VLA policy requires an explicit supported sampling mode")
+        self._sampling_mode = sampling_mode
+        self._initial_rtc_delay_rows = (
+            _RTC_SYNC_INITIAL_DELAY_ROWS
+            if sampling_mode == NATIVE_ODE_QUALIFICATION
+            else _RTC_ASYNC_INITIAL_DELAY_ROWS
+        )
+        self._qualification_continuity_prefix_rows = (
+            bundle_profile.native_qualification_continuity_prefix_rows
+            if sampling_mode == NATIVE_ODE_QUALIFICATION
+            else 0
+        )
+        if replan_controller_ticks not in SUPPORTED_REPLAN_CONTROLLER_TICKS:
+            raise ValueError("VLA policy received an unsupported replan cadence")
+        self._replan_controller_ticks = int(replan_controller_ticks)
         self._reference_adapter = VlaMotionReferenceAdapter(
             humanoid_repo_path,
             reference_adapter_sha256=humanoid_vla_reference_adapter_sha256,
@@ -192,12 +248,34 @@ class G1VlaHumanoidPolicy:
                 "attested VLA checkpoint and native reference adapter disagree "
                 "on RTC max_delay"
             )
-        if _RTC_INITIAL_DELAY_ROWS >= actor_critic.rtc_max_delay_exclusive:
+        if self._initial_rtc_delay_rows >= actor_critic.rtc_max_delay_exclusive:
             raise ValueError(
                 "VLA initial RTC delay is outside the attested checkpoint contract"
             )
+        if (
+            self._qualification_continuity_prefix_rows
+            >= actor_critic.rtc_max_delay_exclusive
+        ):
+            raise ValueError(
+                "VLA qualification continuity prefix is outside the attested "
+                "checkpoint contract"
+            )
         if actor_critic.schedule.sha256 != self._expected_schedule_sha256:
             raise ValueError("VLA leased model flow schedule identity changed")
+        if (
+            actor_critic.qualification_schedule.sha256
+            != self._bundle_profile.native_qualification_schedule_sha256
+        ):
+            raise ValueError(
+                "VLA leased model native qualification schedule identity changed"
+            )
+        if (
+            actor_critic.qualification_clip_normalized_actions
+            is not self._bundle_profile.native_qualification_clip_normalized_actions
+        ):
+            raise ValueError(
+                "VLA leased model native qualification wire contract changed"
+            )
         if actor_critic.noise_level != VLA_FLOW_NOISE_LEVEL:
             raise ValueError(
                 f"VLA profile requires Flow-SDE noise_level={VLA_FLOW_NOISE_LEVEL}"
@@ -234,12 +312,22 @@ class G1VlaHumanoidPolicy:
                 continue
 
             with self._autocast(actor_critic):
-                sample = actor_critic.sample_actions(
-                    **visual_inputs,
-                    rtc_prefix_normalized_actions=rtc.normalized_actions,
-                    rtc_prefix_mask=rtc.mask,
-                    generator=lane.generator,
-                )
+                if self._sampling_mode == FLOW_SDE_TRAINING:
+                    sample = actor_critic.sample_actions(
+                        **visual_inputs,
+                        rtc_prefix_normalized_actions=rtc.normalized_actions,
+                        rtc_prefix_mask=rtc.mask,
+                        generator=lane.generator,
+                    )
+                elif self._sampling_mode == NATIVE_ODE_QUALIFICATION:
+                    sample = actor_critic.sample_actions_native_ode(
+                        **visual_inputs,
+                        rtc_prefix_normalized_actions=rtc.normalized_actions,
+                        rtc_prefix_mask=rtc.mask,
+                        generator=lane.generator,
+                    )
+                else:
+                    raise AssertionError("VLA sampling mode changed after construction")
             output = self._sample_output(
                 lane=lane,
                 policy_input=policy_input,
@@ -275,6 +363,10 @@ class G1VlaHumanoidPolicy:
             generator=generator,
             history=VlaImageHistory(episode_index=self._bats_episode_index),
             reset_episode_id=int(policy_input.episode_id),
+            initial_rtc_delay_rows=self._initial_rtc_delay_rows,
+            qualification_continuity_prefix_rows=(
+                self._qualification_continuity_prefix_rows
+            ),
         )
         self._lanes[policy_input.env_id] = lane
         return lane
@@ -331,9 +423,18 @@ class G1VlaHumanoidPolicy:
                 source_start_row_h30=0,
                 velocity_seed_joint_position=None,
                 next_delay_rows=rtc_state.delay_rows,
+                observed_delay_rows=rtc_state.delay_rows[-1],
+                configured_continuity_prefix_rows=(
+                    lane.qualification_continuity_prefix_rows
+                ),
+                prefix_mode=(
+                    _RTC_PREFIX_MODE_FIXED_CONTINUITY
+                    if lane.qualification_continuity_prefix_rows > 0
+                    else _RTC_PREFIX_MODE_LATENCY_PREDICTOR
+                ),
             )
 
-        previous_chunk = previous.clipped_normalized_actions
+        previous_chunk = previous.normalized_actions
         if (
             tuple(previous_chunk.shape)
             != (
@@ -379,8 +480,15 @@ class G1VlaHumanoidPolicy:
         )[-_RTC_DELAY_WINDOW_SIZE:]
 
         source_suffix = previous_chunk[source_start_row_h30:]
+        configured_continuity_prefix_rows = lane.qualification_continuity_prefix_rows
+        if configured_continuity_prefix_rows > 0:
+            requested_prefix_rows = configured_continuity_prefix_rows
+            prefix_mode = _RTC_PREFIX_MODE_FIXED_CONTINUITY
+        else:
+            requested_prefix_rows = max(next_delay_rows)
+            prefix_mode = _RTC_PREFIX_MODE_LATENCY_PREDICTOR
         prefix_rows = min(
-            max(next_delay_rows),
+            requested_prefix_rows,
             int(source_suffix.shape[0]),
             actor_critic.rtc_max_delay_exclusive - 1,
         )
@@ -412,6 +520,9 @@ class G1VlaHumanoidPolicy:
             source_start_row_h30=source_start_row_h30,
             velocity_seed_joint_position=velocity_seed,
             next_delay_rows=next_delay_rows,
+            observed_delay_rows=observed_delay_rows,
+            configured_continuity_prefix_rows=configured_continuity_prefix_rows,
+            prefix_mode=prefix_mode,
         )
 
     def _observation_inputs(
@@ -423,27 +534,52 @@ class G1VlaHumanoidPolicy:
     ) -> tuple[_VisualInputs, dict[str, torch.Tensor]]:
         """Build and freeze the exact native Psi visual/proprio condition."""
         if len(policy_input.camera_frames) != 1:
-            raise ValueError("VLA policy requires exactly one current D455 frame")
+            raise ValueError("VLA policy requires exactly one current D435 frame")
         frame = policy_input.camera_frames[0]
         self._validate_same_shot_state(policy_input, frame)
-        current = width_fit_letterbox_d455(
-            frame.image_bytes, image_format=self._image_format
-        )
+        preprocess_profile = self._bundle_profile.camera_preprocess_profile
+        if preprocess_profile == (
+            "psi_resize_nearest_224x224_center_crop_224x224_no_letterbox.v1"
+        ):
+            current = decode_native_d435(
+                frame.image_bytes, image_format=self._image_format
+            )
+        elif preprocess_profile == "legacy_d455_letterbox_224x140_to_224x224.v1":
+            current = decode_legacy_d455_letterbox(
+                frame.image_bytes, image_format=self._image_format
+            )
+        else:
+            raise ValueError("VLA bundle uses an unsupported camera preprocess ABI")
         selected = lane.history.select_with_current(
             current,
             timestamp_us=frame.render_timestamp_us,
             capture_receipt_sha256=frame.render_receipt_sha256,
         )
+        prepared: tuple[Any, ...] = ()
         try:
             psi = cast(Any, actor_critic.psi_model)
-            built = psi._build_vlm_batch(
-                [list(selected)],
+            if preprocess_profile.startswith("psi_resize_nearest_"):
+                prepared = self._apply_checkpoint_eval_image_transform(
+                    psi,
+                    selected,
+                )
+            else:
+                prepared = selected
+            built = self._build_training_compatible_vlm_batch(
+                psi,
+                [list(prepared)],
                 [self._language_instruction],
             )
         finally:
-            current.close()
-            for image in selected:
+            # Torchvision currently allocates transformed PIL images, but close
+            # by object identity so a future identity transform remains safe.
+            closed: set[int] = set()
+            for image in (current, *selected, *prepared):
+                identity = id(image)
+                if identity in closed:
+                    continue
                 image.close()
+                closed.add(identity)
         if not isinstance(built, tuple) or len(built) != 6:
             raise TypeError("Psi _build_vlm_batch returned an unexpected contract")
         input_ids, attention_mask, pixel_values, grid, effective_grid, pool_factors = (
@@ -528,13 +664,165 @@ class G1VlaHumanoidPolicy:
         return model_inputs, replay_visual
 
     @staticmethod
+    def _apply_checkpoint_eval_image_transform(
+        psi: Any,
+        observations: tuple[Any, ...],
+    ) -> tuple[Any, ...]:
+        """Apply ckpt_1500's exact eval geometry before the serving builder.
+
+        Psi's serving ``_build_vlm_batch`` calls ``build_qwenvl_inputs``
+        directly and therefore skips ``Psi0ModelTransform.__call__``.  Training
+        first applied ``ResizeImage((224, 224), NEAREST)`` and then
+        ``CenterCrop((224, 224))`` to each native 640x480 D435 frame.  Reusing
+        the checkpoint-owned transform objects keeps that ABI exact while
+        intentionally omitting training-only color jitter at evaluation time.
+        """
+        model_transform = getattr(psi, "model_transform", None)
+        if model_transform is None:
+            raise TypeError("Psi checkpoint is missing its model transform")
+        if bool(getattr(model_transform, "adaptive_resize", False)):
+            raise ValueError("VLA checkpoint must disable adaptive image resize")
+        resize_spec = getattr(model_transform, "resize", None)
+        crop_spec = getattr(model_transform, "center_crop", None)
+        if resize_spec is None or crop_spec is None:
+            raise TypeError("Psi checkpoint is missing resize or center-crop config")
+
+        def _size(value: Any, *, label: str) -> tuple[int, int]:
+            raw = getattr(value, "size", None)
+            if isinstance(raw, int):
+                result = (raw, raw)
+            elif isinstance(raw, (list, tuple)) and len(raw) == 2:
+                result = (int(raw[0]), int(raw[1]))
+            else:
+                raise TypeError(f"Psi {label} size has an unexpected contract")
+            if result != (224, 224):
+                raise ValueError(f"Psi {label} must be exactly 224x224")
+            return result
+
+        _size(resize_spec, label="resize")
+        _size(crop_spec, label="center crop")
+        if not callable(resize_spec) or not callable(crop_spec):
+            raise TypeError("Psi resize and center-crop configs must be callable")
+        resizer = resize_spec()
+        center_crop = crop_spec()
+        if not callable(resizer) or not callable(center_crop):
+            raise TypeError("Psi resize and center-crop transforms must be callable")
+        interpolation = getattr(resizer, "interpolation", None)
+        if str(getattr(interpolation, "name", "")).upper() != "NEAREST":
+            raise ValueError("Psi resize interpolation must be NEAREST")
+
+        transformed: list[Any] = []
+        try:
+            for image in observations:
+                if (
+                    getattr(image, "size", None) != (640, 480)
+                    or getattr(image, "mode", None) != "RGB"
+                ):
+                    raise ValueError("Psi source image must be native 640x480 RGB")
+                result = center_crop(resizer(image))
+                if (
+                    getattr(result, "size", None) != (224, 224)
+                    or getattr(result, "mode", None) != "RGB"
+                ):
+                    raise ValueError(
+                        "Psi checkpoint image transform did not produce 224x224 RGB"
+                    )
+                transformed.append(result)
+        except BaseException:
+            for image in transformed:
+                image.close()
+            raise
+        return tuple(transformed)
+
+    @staticmethod
+    def _build_training_compatible_vlm_batch(
+        psi: Any,
+        observations: list[list[Any]],
+        instructions: list[str],
+    ) -> tuple[Any, ...]:
+        """Bridge both attested Psi serving contracts without changing training semantics.
+
+        The legacy Psi snapshot returns the six tensors needed for pooled BATS
+        history.  The stairs-blocks snapshot predates that serving fix and
+        returns only four tensors even though its training transform enables
+        ``compress_history_visual_tokens``.  In that case, rebuilding through
+        the checkpoint's own model transform is required: merely appending
+        identity pooling metadata would retain unpooled history tokens that the
+        checkpoint did not see during training.
+        """
+        built = psi._build_vlm_batch(observations, instructions)
+        if not isinstance(built, tuple):
+            raise TypeError("Psi _build_vlm_batch returned an unexpected contract")
+        if len(built) == 6:
+            return built
+        if len(built) != 4:
+            raise TypeError("Psi _build_vlm_batch returned an unexpected contract")
+
+        model_transform = getattr(psi, "model_transform", None)
+        compress_history = bool(
+            getattr(model_transform, "compress_history_visual_tokens", False)
+        )
+        if not compress_history:
+            return (*built, None, None)
+        if len(observations) != 1 or len(instructions) != 1:
+            raise ValueError(
+                "pooled Psi serving compatibility requires one policy sample"
+            )
+        if model_transform is None or not hasattr(
+            model_transform, "build_qwenvl_inputs"
+        ):
+            raise TypeError(
+                "Psi checkpoint requests visual-history compression but its "
+                "training transform is unavailable"
+            )
+        images = observations[0]
+        if not images:
+            raise ValueError("Psi visual condition must contain a current image")
+        pool_factor = int(
+            getattr(model_transform, "history_visual_pool_factor", 1) or 1
+        )
+        if pool_factor < 1:
+            raise ValueError("Psi history_visual_pool_factor must be positive")
+        image_pool_factors = [pool_factor for _ in images[:-1]] + [1]
+        rebuilt = model_transform.build_qwenvl_inputs(
+            psi.vlm_processor,
+            images,
+            instructions[0],
+            image_pool_factors=image_pool_factors,
+        )
+        device = getattr(psi, "device", None)
+        if hasattr(rebuilt, "to"):
+            rebuilt = rebuilt.to(device)
+        elif isinstance(rebuilt, Mapping):
+            rebuilt = {
+                key: value.to(device) if torch.is_tensor(value) else value
+                for key, value in rebuilt.items()
+            }
+        else:
+            raise TypeError("Psi training transform returned an unexpected contract")
+        required = (
+            "input_ids",
+            "attention_mask",
+            "pixel_values",
+            "image_grid_thw",
+            "effective_image_grid_thw",
+            "visual_pool_factors",
+        )
+        missing = [key for key in required if key not in rebuilt]
+        if missing:
+            raise TypeError(
+                f"Psi pooled training transform omitted required tensors {missing}"
+            )
+        return tuple(rebuilt[key] for key in required)
+
+    @staticmethod
     def _validate_same_shot_state(
         policy_input: HumanoidPolicyInput,
         frame: HumanoidCameraFrame,
     ) -> None:
         """Require VLA proprio to come from the image's render snapshot."""
         if frame.env_id != policy_input.env_id:
-            raise ValueError("VLA D455 frame targets a different env lane")
+            raise ValueError("VLA D435 frame targets a different env lane")
         qpos = torch.as_tensor(policy_input.qpos, dtype=torch.float32)
         render_qpos = torch.tensor(frame.render_qpos, dtype=torch.float32)
         if tuple(qpos.shape) != (36,) or tuple(render_qpos.shape) != (36,):
@@ -549,7 +837,7 @@ class G1VlaHumanoidPolicy:
         *,
         lane: _Lane,
         policy_input: HumanoidPolicyInput,
-        sample: VlaPolicySample | Any,
+        sample: VlaPolicySample | VlaQualificationSample | Any,
         replay_visual: dict[str, torch.Tensor],
         rtc: _RtcInputs,
         actor_critic: VlaPsiActorCritic,
@@ -559,7 +847,7 @@ class G1VlaHumanoidPolicy:
         if tuple(denormalized_wire.shape) != (1, 30, 38):
             raise ValueError("VLA sampled wire chunk must have shape [1,30,38]")
         rows = _cpu_clone(denormalized_wire[0]).to(dtype=torch.float32)
-        canonical_reference = self._reference_adapter.build(
+        built_reference = self._reference_adapter.build(
             rows.numpy(),
             qpos=_cpu_clone(policy_input.qpos).numpy(),
             qvel=_cpu_clone(policy_input.qvel).numpy(),
@@ -574,7 +862,8 @@ class G1VlaHumanoidPolicy:
             (int(policy_input.env_id) + 1) << 32
         ) | lane.next_reference_sequence
         reference = _wire_reference(
-            canonical_reference,
+            built_reference.reference,
+            decode_context=built_reference.decode_context,
             reference_id=reference_id,
             source_decision_id=policy_input.decision_id,
         )
@@ -598,8 +887,44 @@ class G1VlaHumanoidPolicy:
             )
         if torch.any((sampled_clipped < -1.0) | (sampled_clipped > 1.0)):
             raise ValueError("VLA sampled clipped-normalized chunk left [-1,1]")
+        sampled_density = getattr(sample, "density_latent", None)
+        if sampled_density is not None:
+            sampled_density = torch.as_tensor(sampled_density)
+            if (
+                tuple(sampled_density.shape) != (1, _VLA_ACTION_ROWS, _VLA_ACTION_WIDTH)
+                or not torch.isfinite(sampled_density).all()
+            ):
+                raise ValueError("VLA sampled density latent must have shape [1,30,38]")
+        qualification_schedule_sha256: str | None = None
+        qualification_clip_normalized_actions: bool | None = None
+        if self._sampling_mode == NATIVE_ODE_QUALIFICATION:
+            if sampled_density is None:
+                raise ValueError(
+                    "VLA native qualification sample is missing its raw ODE latent"
+                )
+            qualification_schedule_sha256 = str(getattr(sample, "schedule_sha256", ""))
+            if (
+                qualification_schedule_sha256
+                != actor_critic.qualification_schedule.sha256
+            ):
+                raise ValueError(
+                    "VLA native qualification sample changed its serving schedule"
+                )
+            sample_clip = getattr(sample, "clip_normalized_actions", None)
+            if sample_clip is not actor_critic.qualification_clip_normalized_actions:
+                raise ValueError(
+                    "VLA native qualification sample changed its wire clip contract"
+                )
+            qualification_clip_normalized_actions = bool(sample_clip)
+            rtc_normalized = (
+                sampled_clipped
+                if actor_critic.qualification_clip_normalized_actions
+                else sampled_density
+            )
+        else:
+            rtc_normalized = sampled_clipped
         if bool(rtc.mask.any()) and not torch.equal(
-            sampled_clipped.to(
+            rtc_normalized.to(
                 device=rtc.normalized_actions.device,
                 dtype=rtc.normalized_actions.dtype,
             )[rtc.mask[..., None].expand_as(rtc.normalized_actions)],
@@ -607,18 +932,24 @@ class G1VlaHumanoidPolicy:
                 rtc.mask[..., None].expand_as(rtc.normalized_actions)
             ],
         ):
-            raise AssertionError("VLA Flow sampler changed the fixed RTC prefix")
+            raise AssertionError("VLA sampler changed the fixed RTC prefix")
         payload: dict[str, Any] = dict(replay_visual)
         payload.update(
             {
+                "sampling_mode": self._sampling_mode,
                 "denormalized_wire_actions": rows.clone(),
                 "rtc_prefix_normalized_actions": _cpu_clone(rtc.normalized_actions[0]),
                 "rtc_prefix_mask": _cpu_clone(rtc.mask[0]),
+                "rtc_prefix_mode": rtc.prefix_mode,
+                "rtc_configured_continuity_prefix_rows": (
+                    rtc.configured_continuity_prefix_rows
+                ),
+                "rtc_observed_delay_rows": rtc.observed_delay_rows,
                 "instruction_sha256": self._instruction_sha256,
                 # This digest is attested together with the checkpoint source
                 # bundle. It is the only run-config provenance stamped into
                 # replay; no independently configured manifest identity exists.
-                "run_config_sha256": RUN_CONFIG_SHA256,
+                "run_config_sha256": self._run_config_sha256,
                 "camera_render_receipt_sha256": policy_input.camera_frames[
                     0
                 ].render_receipt_sha256,
@@ -626,24 +957,66 @@ class G1VlaHumanoidPolicy:
             }
         )
         trace = getattr(sample, "trace", None)
+        if self._sampling_mode == FLOW_SDE_TRAINING and trace is None:
+            raise ValueError("VLA Flow-SDE training sample is missing its PPO trace")
+        if self._sampling_mode == NATIVE_ODE_QUALIFICATION and trace is not None:
+            raise ValueError("VLA native ODE qualification sample carried a PPO trace")
+        if self._sampling_mode == NATIVE_ODE_QUALIFICATION:
+            forbidden = (
+                "old_element_logprobs",
+                "old_log_probs",
+                "values",
+            )
+            leaked = [
+                name for name in forbidden if getattr(sample, name, None) is not None
+            ]
+            if leaked:
+                raise ValueError(
+                    f"VLA native ODE qualification sample carried PPO fields {leaked}"
+                )
+            if (
+                sampled_density is None
+                or qualification_schedule_sha256 is None
+                or qualification_clip_normalized_actions is None
+            ):
+                raise AssertionError(
+                    "VLA qualification invariants changed after validation"
+                )
+            payload.update(
+                {
+                    "density_latent": _cpu_clone(sampled_density[0]),
+                    "clipped_normalized_actions": _cpu_clone(sampled_clipped[0]),
+                    "qualification_schedule_sha256": qualification_schedule_sha256,
+                    "qualification_inference_steps": int(
+                        actor_critic.qualification_schedule.num_steps
+                    ),
+                    "qualification_clip_normalized_actions": (
+                        qualification_clip_normalized_actions
+                    ),
+                }
+            )
         old_logprob: torch.Tensor | None = None
         value: torch.Tensor | None = None
         if trace is not None:
             chain = torch.as_tensor(trace.chain)
             if tuple(chain.shape[:2]) != (1, 11):
                 raise ValueError("VLA sampled chain must contain 10 denoise steps")
-            required = (
-                "clipped_normalized",
-                "old_element_logprobs",
-                "old_log_probs",
-                "values",
-            )
-            missing = [name for name in required if getattr(sample, name, None) is None]
+            clipped_normalized_raw = getattr(sample, "clipped_normalized", None)
+            old_element_logprobs_raw = getattr(sample, "old_element_logprobs", None)
+            old_log_probs_raw = getattr(sample, "old_log_probs", None)
+            values_raw = getattr(sample, "values", None)
+            required = {
+                "clipped_normalized": clipped_normalized_raw,
+                "old_element_logprobs": old_element_logprobs_raw,
+                "old_log_probs": old_log_probs_raw,
+                "values": values_raw,
+            }
+            missing = [name for name, field in required.items() if field is None]
             if missing:
                 raise ValueError(
                     f"VLA trainable sample is missing Flow replay fields {missing}"
                 )
-            old_element_logprobs = torch.as_tensor(sample.old_element_logprobs)
+            old_element_logprobs = torch.as_tensor(old_element_logprobs_raw)
             if tuple(old_element_logprobs.shape) != (
                 1,
                 _VLA_ACTION_ROWS * _VLA_ACTION_WIDTH,
@@ -670,7 +1043,7 @@ class G1VlaHumanoidPolicy:
                         torch.as_tensor(trace.denoise_indices)[0]
                     ),
                     "clipped_normalized_actions": _cpu_clone(
-                        torch.as_tensor(sample.clipped_normalized)[0]
+                        torch.as_tensor(clipped_normalized_raw)[0]
                     ),
                     "schedule_sha256": str(trace.schedule_sha256),
                     "flow_noise_level": VLA_FLOW_NOISE_LEVEL,
@@ -678,13 +1051,15 @@ class G1VlaHumanoidPolicy:
                     "old_element_logprobs": _cpu_clone(old_element_logprobs[0]),
                 }
             )
-            old_logprob = _cpu_clone(torch.as_tensor(sample.old_log_probs)[0]).reshape(
-                ()
-            )
-            value = _cpu_clone(torch.as_tensor(sample.values)[0]).reshape(())
+            old_logprob = _cpu_clone(torch.as_tensor(old_log_probs_raw)[0]).reshape(())
+            value = _cpu_clone(torch.as_tensor(values_raw)[0]).reshape(())
         replay = PolicyReplayData(
             replay_schema_version=1,
-            payload_schema=REPLAY_SCHEMA,
+            payload_schema=(
+                REPLAY_SCHEMA
+                if self._sampling_mode == FLOW_SDE_TRAINING
+                else QUALIFICATION_REPLAY_SCHEMA
+            ),
             payload_schema_version=1,
             model_family=MODEL_FAMILY,
             action_selection=ActionSelection(set_ix=0, sample_ix=0),
@@ -698,9 +1073,7 @@ class G1VlaHumanoidPolicy:
         previous_chunk = _PreviousRtcChunk(
             reference_id=reference_id,
             source_timestamp_us=int(policy_input.timestamp_us),
-            clipped_normalized_actions=_cpu_clone(sampled_clipped[0]).to(
-                dtype=torch.float32
-            ),
+            normalized_actions=_cpu_clone(rtc_normalized[0]).to(dtype=torch.float32),
             denormalized_joint_positions=rows[:, :29].clone(),
             base_quaternion_wxyz=qpos[3:7].clone(),
             base_xy=qpos[:2].clone(),
@@ -721,11 +1094,17 @@ class G1VlaHumanoidPolicy:
                     replay_visual["selected_history_indices"].numel()
                 ),
                 "vla_rtc_delay_rows": int(rtc.mask.sum().item()),
+                "vla_rtc_actual_prefix_rows": int(rtc.mask.sum().item()),
+                "vla_rtc_configured_continuity_prefix_rows": (
+                    rtc.configured_continuity_prefix_rows
+                ),
+                "vla_rtc_observed_delay_rows": rtc.observed_delay_rows,
+                "vla_rtc_prefix_mode": rtc.prefix_mode,
                 "vla_rtc_source_cursor_h50": rtc.source_cursor_h50,
                 "vla_rtc_source_start_row_h30": rtc.source_start_row_h30,
                 "vla_raw_action_rows": 30,
                 "vla_reference_frames": H50_FRAME_COUNT,
-                "vla_replan_controller_ticks": REPLAN_CONTROLLER_TICKS,
+                "vla_replan_controller_ticks": self._replan_controller_ticks,
             },
         )
 
@@ -745,6 +1124,7 @@ def build_humanoid_policy_factory(
     inference_engine: _SessionModelLookup,
 ):
     """Build motion-reference VLA sessions from strict bundle config."""
+    sampling_mode = vla_sampling_mode(run_config)
     config = run_config.policy.model.bundle_config
     if not isinstance(config, Mapping):
         raise TypeError("VLA bundle_config must be a mapping")
@@ -761,17 +1141,37 @@ def build_humanoid_policy_factory(
     language_instruction = _required_text(config, "language_instruction")
     camera_logical_id = _required_text(config, "camera_logical_id")
     camera_format = _required_text(config, "camera_image_format")
-    if camera_format not in {"png", "jpeg"}:
-        raise ValueError("VLA camera_image_format must be png or jpeg")
     camera_contract_sha256 = _required_sha(config, "camera_contract_sha256")
+    model_root = (
+        Path(str(run_config.policy.model.path)).expanduser().resolve(strict=False)
+    )
+    profile = vla_bundle_profile_for_model_root(model_root)
+    actual_camera_abi = (
+        camera_logical_id,
+        camera_format,
+        camera_contract_sha256,
+        language_instruction,
+    )
+    expected_camera_abi = (
+        profile.camera_logical_id,
+        profile.camera_image_format,
+        profile.camera_contract_sha256,
+        profile.language_instruction,
+    )
+    if actual_camera_abi != expected_camera_abi:
+        raise ValueError(
+            "VLA bundle camera/instruction ABI differs from its attested model profile"
+        )
 
     def _factory(session_uuid: str, request: Any) -> G1VlaHumanoidPolicy:
         """Validate one reserved H50 session before any model execution."""
-        _validate_session_request(
+        replan_controller_ticks = _validate_session_request(
             request,
             camera_logical_id=camera_logical_id,
             camera_format=camera_format,
             camera_contract_sha256=camera_contract_sha256,
+            camera_resolution=profile.camera_source_resolution,
+            camera_profile=profile.camera_profile,
         )
         return G1VlaHumanoidPolicy(
             inference_engine,
@@ -783,6 +1183,10 @@ def build_humanoid_policy_factory(
             humanoid_vla_reference_adapter_sha256=humanoid_vla_reference_adapter_sha256,
             humanoid_motion_reference_sha256=humanoid_motion_reference_sha256,
             language_instruction=language_instruction,
+            run_config_sha256=profile.run_config_sha256,
+            bundle_profile=profile,
+            sampling_mode=sampling_mode,
+            replan_controller_ticks=replan_controller_ticks,
         )
 
     return _factory
@@ -794,8 +1198,10 @@ def _validate_session_request(
     camera_logical_id: str,
     camera_format: str,
     camera_contract_sha256: str,
-) -> None:
-    """Require the one-second H50, canonical-joint, and D455 ABI."""
+    camera_resolution: tuple[int, int],
+    camera_profile: str,
+) -> int:
+    """Require the H50, canonical-joint, and profile-owned camera ABI."""
     if int(request.execution_mode) != HUMANOID_EXECUTION_MODE_MOTION_REFERENCE:
         raise ValueError("VLA policy requires motion-reference execution mode")
     if tuple(str(name) for name in request.joint_names) != MOTION_REFERENCE_JOINT_NAMES:
@@ -803,22 +1209,29 @@ def _validate_session_request(
     if int(request.action_size) != 0:
         raise ValueError("VLA motion-reference action_size must be zero")
     spec = request.reference_spec
-    actual = (
+    actual_without_replan = (
         str(spec.schema),
         int(spec.frame_count),
         int(spec.sample_period_us),
-        int(spec.control_ticks_per_policy_step),
         tuple(str(name) for name in spec.joint_names),
     )
-    expected = (
+    expected_without_replan = (
         _H50_SCHEMA,
         H50_FRAME_COUNT,
         REFERENCE_PERIOD_US,
-        REPLAN_CONTROLLER_TICKS,
         MOTION_REFERENCE_JOINT_NAMES,
     )
-    if actual != expected:
+    replan_controller_ticks = int(spec.control_ticks_per_policy_step)
+    if (
+        actual_without_replan != expected_without_replan
+        or replan_controller_ticks not in SUPPORTED_REPLAN_CONTROLLER_TICKS
+    ):
         raise ValueError("VLA H50 motion-reference contract changed")
+    if (
+        str(spec.decode_context_schema)
+        != HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA
+    ):
+        raise ValueError("VLA decode-context session contract changed")
     if str(request.action_schema) != _H50_SCHEMA:
         raise ValueError("VLA action_schema must match the H50 reference schema")
     camera = request.policy_camera_spec
@@ -833,21 +1246,23 @@ def _validate_session_request(
     camera_expected = (
         "humanoid_policy_camera_rgb_qpos.v1",
         camera_logical_id,
-        224,
-        140,
+        int(camera_resolution[0]),
+        int(camera_resolution[1]),
         camera_format,
         camera_contract_sha256,
     )
     if camera_actual != camera_expected:
-        raise ValueError("VLA D455 camera contract changed")
+        raise ValueError(f"VLA {camera_profile} camera contract changed")
     for field in ("attempt_id", "scene_id", "scenario_id"):
         if not str(getattr(request, field)):
             raise ValueError(f"VLA session requires non-empty {field}")
+    return replan_controller_ticks
 
 
 def _wire_reference(
     reference: Any,
     *,
+    decode_context: Any,
     reference_id: int,
     source_decision_id: int,
 ) -> HumanoidMotionReference:
@@ -868,8 +1283,18 @@ def _wire_reference(
         reference_id=reference_id,
         source_decision_id=source_decision_id,
         frames=frames,
-        reference_sha256=str(reference.sha256),
         root_z_alignment_offset_m=0.0,
+        decode_context=HumanoidReferenceDecodeContext(
+            schema=str(decode_context.schema),
+            chunk_base_quaternion_wxyz=torch.tensor(
+                decode_context.chunk_base_quaternion_wxyz,
+                dtype=torch.float32,
+            ),
+            local_xy_from_frame_zero=torch.tensor(
+                decode_context.local_xy_from_frame_zero,
+                dtype=torch.float32,
+            ),
+        ),
     )
 
 

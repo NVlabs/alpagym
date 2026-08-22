@@ -70,7 +70,7 @@ def write_run_artifacts(config: RunConfig) -> None:
     # OmegaConf's structured Enum loader accepts member names, not arbitrary
     # wire values.  Keep the host-owned resolved artifact round-trippable even
     # when an Enum value names an external Hydra group (for example
-    # ``vla_d455 -> humanoid_vla_d455``).
+    # ``vla_d435_native -> humanoid_vla_d435_native``).
     config_dict = cast(dict[str, Any], _to_resolved_config_data(asdict(config)))
     artifact_paths.resolved_config_path.write_text(
         yaml.safe_dump(config_dict, sort_keys=False),
@@ -121,6 +121,7 @@ def _build_cosmos_config(config: RunConfig) -> dict[str, Any]:
         "gae_lambda": train_policy.pop("ppo_gae_lambda", 0.95),
         "min_action_std": train_policy.pop("ppo_min_action_std", 0.02),
         "max_action_std": train_policy.pop("ppo_max_action_std", 2.0),
+        "target_behavior_kl": train_policy.pop("ppo_target_behavior_kl", None),
     }
     step_mini_batch = train_policy.pop("step_mini_batch", None)
     if step_mini_batch is not None:

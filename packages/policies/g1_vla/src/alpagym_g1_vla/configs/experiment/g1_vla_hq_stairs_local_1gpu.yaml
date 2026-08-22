@@ -25,10 +25,21 @@ alpasim:
     execution_profile: motion_reference
     reference_frame_count: 50
     grail_root_path: ???
-    policy_camera_profile: vla_d455
+    reference_controller_profile: sonic_visual
+    visual_controller_release_path: ???
+    # This checkpoint's successful teacher episode was generated against the
+    # Isaac-training cylinder plant.  Do not substitute the visual release's
+    # standalone capsule qualification plant.
+    robot_physics_profile: sonic.isaac_training.g1_cylinder_model_12.mujoco_port.v1
+    policy_camera_profile: vla_d435_native
     scene_cache_path: ???
     num_envs: 1
     rollout_seed_base: 292285
+    # ckpt1500 in-distribution qualification start. This changes only the
+    # runtime reset x/y/yaw; route and support z remain owned by scene `ascend`.
+    runtime_spawn_root_x_m: 0.9954772324738195
+    runtime_spawn_root_y_m: 2.8733132015389695
+    runtime_spawn_root_yaw_rad: -0.7295696089600734
     # The base humanoid image omits Open3D/Embree/gsplat/MuJoCo-Warp.  Use a
     # dependency-complete combined runtime+dynamics image for the local profile.
     service_image: alpasim-humanoid-nurec:local
@@ -38,18 +49,19 @@ alpasim:
     reward_profile_id: direct_v9_shaped.v1
   wizard_args:
     force_gt_duration_us: 0
-    # Native VLA starts the next inference after 0.5 s.  The active H50
-    # buffer remains owned by the controller until its atomic replacement.
+    # Match the native evaluator's action_exec_horizon=15: one policy decision
+    # owns 0.5 s = 25 Visual Sonic controller ticks.
     control_timestep_us: 500_000
     n_sim_steps: 30
 
 cosmos:
   train:
+    train_batch_per_replica: 4
     max_num_steps: 1
     num_epochs: 1
-    optm_lr: 5.0e-6
+    optm_lr: 1.0e-6
     # Cosmos applies these to separate_model_parts(): action head, then critic.
-    optm_part_lrs: [5.0e-6, 1.0e-4]
+    optm_part_lrs: [1.0e-6, 1.0e-4]
     optm_warmup_steps: 0
     epsilon: 1.0e-8
     optm_weight_decay: 0.01
@@ -61,8 +73,14 @@ cosmos:
       export_safetensors: false
     train_policy:
       trainer_type: alpagym_flow_ppo
+      allowed_outdated_steps: 0
+      on_policy: true
       mini_batch: 1
-      step_mini_batch: 30
+      # Rollout samples one VLA decision at a time. The complete 30x38 Flow-SDE
+      # chunk density is batch-kernel sensitive, so replay each transition at
+      # B=1 to keep the pre-update importance ratio exactly one. Gradients from
+      # every real transition are still accumulated into one optimizer step.
+      step_mini_batch: 1
       # These legacy field names belong to Cosmos's shared trainer schema;
       # trainer_type selects Flow-PPO, not a group-relative GRPO objective.
       grpo_optimization_iterations: 1
@@ -77,7 +95,9 @@ cosmos:
       ppo_value_clip_range: 0.2
       ppo_value_huber_delta: 10.0
       ppo_normalize_advantages: true
+      # Calibrate from observed post-update behavior KL before enabling a guard.
+      ppo_target_behavior_kl: null
   rollout:
-    n_generation: 1
+    n_generation: 4
     batch_size: 1
     prefetch_rollout: false

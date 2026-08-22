@@ -22,13 +22,18 @@ from alpagym_runtime.alpasim.humanoid_policy_server import (
     HumanoidRealizedFeedbackTrace,
 )
 
+from alpagym_g1_vla.bundle import (
+    FLOW_SDE_TRAINING,
+    NATIVE_ODE_QUALIFICATION,
+    QUALIFICATION_REPLAY_SCHEMA,
+)
 from alpagym_g1_vla.flow import VlaFlowSchedule
 from alpagym_g1_vla.history import (
     VlaImageHistory,
+    decode_native_d435,
     image_array,
     select_bats_history_indices,
     stable_episode_int,
-    width_fit_letterbox_d455,
 )
 from alpagym_g1_vla.humanoid_policy import (
     G1VlaHumanoidPolicy,
@@ -38,7 +43,9 @@ from alpagym_g1_vla.humanoid_policy import (
 from alpagym_g1_vla.inference_model import VlaNativeInferenceModel
 from alpagym_g1_vla.model import VlaPsiActorCritic
 from alpagym_g1_vla.normalization import VlaQ99Normalizer
-from alpagym_g1_vla.provenance import RUN_CONFIG_SHA256
+from alpagym_g1_vla.provenance import (
+    STAIRSBLOCKS_VLA_BUNDLE_PROFILE,
+)
 import alpagym_g1_vla.reference_adapter as reference_adapter_module
 from alpagym_g1_vla.reference_adapter import (
     H50_FRAME_COUNT,
@@ -134,6 +141,8 @@ def _fake_convert_vla_chunk(
             SimpleNamespace(
                 joint_position=position,
                 joint_velocity=velocity,
+                root_xy=np.asarray(chunk.chunk_base_xy, dtype=np.float64)
+                + np.asarray([phase * 0.01, -phase * 0.005]),
                 root_quaternion_wxyz=np.asarray(
                     chunk.chunk_base_quat_wxyz, dtype=np.float64
                 ),
@@ -141,6 +150,32 @@ def _fake_convert_vla_chunk(
         )
         previous = position
     return tuple(targets)
+
+
+def _fake_full_rotation_local_xy_context(
+    chunk: _FakeActionChunk,
+    *,
+    source_row_cursor: int,
+) -> SimpleNamespace:
+    """Mirror the H50 local-XY side channel from the isolated fake chunk."""
+    assert source_row_cursor == 0
+    actions = np.asarray(chunk.actions, dtype=np.float64)
+    local_xy = []
+    for target_index in range(50):
+        phase = min(target_index * 3.0 / 5.0, 29.0)
+        lower = int(math.floor(phase))
+        upper = min(lower + 1, 29)
+        fraction = phase - lower
+        local_xy.append(
+            actions[lower, 35:37] * (1.0 - fraction) + actions[upper, 35:37] * fraction
+        )
+    local_xy_from_frame_zero = np.asarray(local_xy) - local_xy[0]
+    local_xy_from_frame_zero[0] = 0.0
+    return SimpleNamespace(
+        schema="full_pelvis_rotation_local_xy_completed_z/v1",
+        chunk_base_quat_wxyz=np.asarray(chunk.chunk_base_quat_wxyz),
+        local_xy_from_frame_zero=local_xy_from_frame_zero,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -152,6 +187,9 @@ def _install_isolated_humanoid_support(monkeypatch: pytest.MonkeyPatch) -> None:
         VlaServerActionChunk=_FakeActionChunk,
         VlaVelocitySeed=_FakeVelocitySeed,
         convert_vla_chunk_to_reference_targets=_fake_convert_vla_chunk,
+        convert_vla_chunk_to_full_rotation_local_xy_context=(
+            _fake_full_rotation_local_xy_context
+        ),
     )
     motion = SimpleNamespace(
         MotionFrame=_FakeMotionFrame,
@@ -211,6 +249,39 @@ class _FakeActionHead(torch.nn.Module):
         )
 
 
+class _FakeResizeTransform:
+    interpolation = SimpleNamespace(name="NEAREST")
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        return image.resize((224, 224), resample=Image.Resampling.NEAREST)
+
+
+class _FakeCenterCropTransform:
+    def __call__(self, image: Image.Image) -> Image.Image:
+        return image.crop((0, 0, 224, 224))
+
+
+class _FakeResizeSpec:
+    size = (224, 224)
+
+    def __call__(self) -> _FakeResizeTransform:
+        return _FakeResizeTransform()
+
+
+class _FakeCenterCropSpec:
+    size = (224, 224)
+
+    def __call__(self) -> _FakeCenterCropTransform:
+        return _FakeCenterCropTransform()
+
+
+class _FakeEvalTransform:
+    adaptive_resize = False
+    compress_history_visual_tokens = False
+    resize = _FakeResizeSpec()
+    center_crop = _FakeCenterCropSpec()
+
+
 class _FakePsi(torch.nn.Module):
     """Expose native preprocessing and condition methods used by rollout."""
 
@@ -219,6 +290,7 @@ class _FakePsi(torch.nn.Module):
         self.vlm_model = _FakeVlm()
         self.action_header = _FakeActionHead()
         self.seen_images: list[list[np.ndarray]] = []
+        self.model_transform = _FakeEvalTransform()
 
     def _build_vlm_batch(
         self,
@@ -273,6 +345,57 @@ class _FakePsi(torch.nn.Module):
         return hidden, attention_mask
 
 
+class _FakePooledTransform(_FakeEvalTransform):
+    """Stand in for the checkpoint's training-time visual pooling transform."""
+
+    compress_history_visual_tokens = True
+    history_visual_pool_factor = 2
+
+    def __init__(self) -> None:
+        self.seen_pool_factors: list[list[int]] = []
+
+    def build_qwenvl_inputs(
+        self,
+        processor: object,
+        images: list[Image.Image],
+        instruction: str,
+        *,
+        image_pool_factors: list[int],
+    ) -> dict[str, torch.Tensor]:
+        del processor, instruction
+        self.seen_pool_factors.append(list(image_pool_factors))
+        count = len(images)
+        grid = torch.ones((count, 3), dtype=torch.int64)
+        return {
+            "input_ids": torch.arange(1, count + 3, dtype=torch.int64)[None],
+            "attention_mask": torch.ones((1, count + 2), dtype=torch.int64),
+            "pixel_values": torch.arange(count * 4, dtype=torch.float32).reshape(
+                count, 4
+            ),
+            "image_grid_thw": grid,
+            "effective_image_grid_thw": grid.clone(),
+            "visual_pool_factors": torch.tensor(image_pool_factors, dtype=torch.int64),
+        }
+
+
+class _FakeFourTuplePsi(_FakePsi):
+    """Mirror ckpt_1500's pre-fix four-tensor serving helper."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.model_transform = _FakePooledTransform()
+        self.vlm_processor = object()
+        self.device = torch.device("cpu")
+
+    def _build_vlm_batch(
+        self,
+        observations: list[list[Image.Image]],
+        instructions: list[str],
+    ) -> tuple[torch.Tensor, ...]:
+        built = super()._build_vlm_batch(observations, instructions)
+        return built[:4]
+
+
 class _Engine:
     """Minimal session-model lookup fake."""
 
@@ -285,8 +408,8 @@ class _Engine:
         return self.model
 
 
-def _model() -> VlaPsiActorCritic:
-    psi = _FakePsi()
+def _model(psi: _FakePsi | None = None) -> VlaPsiActorCritic:
+    psi = _FakePsi() if psi is None else psi
     psi.vlm_model.requires_grad_(False)
     schedule = VlaFlowSchedule(
         model_timesteps=torch.tensor(
@@ -298,6 +421,10 @@ def _model() -> VlaPsiActorCritic:
             dtype=torch.float32,
         ),
     )
+    qualification_schedule = VlaFlowSchedule(
+        model_timesteps=schedule.model_timesteps.clone(),
+        sigmas=schedule.sigmas.clone(),
+    )
     normalizer = VlaQ99Normalizer(
         state_q01=torch.full((29,), -2.0),
         state_q99=torch.full((29,), 2.0),
@@ -307,6 +434,8 @@ def _model() -> VlaPsiActorCritic:
     return VlaPsiActorCritic(
         psi_model=psi,
         schedule=schedule,
+        qualification_schedule=qualification_schedule,
+        qualification_clip_normalized_actions=False,
         noise_level=0.4,
         normalizer=normalizer,
         vlm_hidden_dim=8,
@@ -315,10 +444,15 @@ def _model() -> VlaPsiActorCritic:
     ).eval()
 
 
-def _png(color: tuple[int, int, int]) -> bytes:
-    image = Image.new("RGB", (224, 140), color=color)
+def _jpeg(
+    color: tuple[int, int, int],
+    *,
+    size: tuple[int, int] = (640, 480),
+    quality: int = 95,
+) -> bytes:
+    image = Image.new("RGB", size, color=color)
     stream = io.BytesIO()
-    image.save(stream, format="PNG")
+    image.save(stream, format="JPEG", quality=quality)
     image.close()
     return stream.getvalue()
 
@@ -340,8 +474,8 @@ def _input(
         env_id=0,
         frame_start_us=logical_timestamp_us,
         frame_end_us=logical_timestamp_us,
-        logical_id="d455_rgb",
-        image_bytes=_png(color),
+        logical_id="d435_rgb",
+        image_bytes=_jpeg(color),
         render_timestamp_us=logical_timestamp_us,
         observation_decision_id=step + 1,
         render_qpos=tuple(float(value) for value in qpos),
@@ -395,14 +529,96 @@ def _input(
     )
 
 
-def test_letterbox_preserves_native_pixels_and_black_padding() -> None:
-    image = width_fit_letterbox_d455(_png((12, 34, 56)), image_format="png")
+def test_native_d435_decoder_preserves_full_raster_without_letterbox() -> None:
+    image = decode_native_d435(_jpeg((100, 100, 100)), image_format="jpeg")
     array = image_array(image)
     image.close()
 
-    assert not bool(array[:42].any())
-    assert not bool(array[182:].any())
-    assert np.all(array[42:182] == np.asarray([12, 34, 56], dtype=np.uint8))
+    assert array.shape == (480, 640, 3)
+    assert np.all(array == np.asarray([100, 100, 100], dtype=np.uint8))
+
+
+def test_native_d435_decoder_rejects_legacy_d455_raster() -> None:
+    with pytest.raises(ValueError, match="exactly 640x480"):
+        decode_native_d435(
+            _jpeg((12, 34, 56), size=(224, 140)),
+            image_format="jpeg",
+        )
+
+
+def test_native_d435_decoder_rejects_non_training_jpeg_quality() -> None:
+    with pytest.raises(ValueError, match="quality=95"):
+        decode_native_d435(
+            _jpeg((100, 100, 100), quality=90),
+            image_format="jpeg",
+        )
+
+
+def test_checkpoint_eval_geometry_is_direct_nearest_resize_without_padding() -> None:
+    x = np.arange(640, dtype=np.uint16)[None, :]
+    y = np.arange(480, dtype=np.uint16)[:, None]
+    source_array = np.empty((480, 640, 3), dtype=np.uint8)
+    source_array[..., 0] = x % 256
+    source_array[..., 1] = y % 256
+    source_array[..., 2] = (x + y) % 256
+    source = Image.fromarray(source_array, mode="RGB")
+    expected = source.resize((224, 224), resample=Image.Resampling.NEAREST)
+
+    transformed = G1VlaHumanoidPolicy._apply_checkpoint_eval_image_transform(
+        SimpleNamespace(model_transform=_FakeEvalTransform()),
+        (source,),
+    )
+    assert len(transformed) == 1
+    np.testing.assert_array_equal(np.asarray(transformed[0]), np.asarray(expected))
+
+    transformed[0].close()
+    expected.close()
+    source.close()
+
+
+def test_checkpoint_eval_geometry_rejects_adaptive_resize() -> None:
+    transform = _FakeEvalTransform()
+    transform.adaptive_resize = True
+    source = Image.new("RGB", (640, 480))
+    with pytest.raises(ValueError, match="adaptive"):
+        G1VlaHumanoidPolicy._apply_checkpoint_eval_image_transform(
+            SimpleNamespace(model_transform=transform),
+            (source,),
+        )
+    source.close()
+
+
+def test_checkpoint_eval_geometry_rejects_wrong_resize_size() -> None:
+    transform = _FakeEvalTransform()
+    transform.resize = SimpleNamespace(size=(224, 168))
+    source = Image.new("RGB", (640, 480))
+    with pytest.raises(ValueError, match="resize must be exactly 224x224"):
+        G1VlaHumanoidPolicy._apply_checkpoint_eval_image_transform(
+            SimpleNamespace(model_transform=transform),
+            (source,),
+        )
+    source.close()
+
+
+def test_checkpoint_eval_geometry_rejects_wrong_interpolation() -> None:
+    resize = _FakeResizeTransform()
+    resize.interpolation = SimpleNamespace(name="BILINEAR")
+
+    class _BadResizeSpec:
+        size = (224, 224)
+
+        def __call__(self) -> _FakeResizeTransform:
+            return resize
+
+    transform = _FakeEvalTransform()
+    transform.resize = _BadResizeSpec()
+    source = Image.new("RGB", (640, 480))
+    with pytest.raises(ValueError, match="NEAREST"):
+        G1VlaHumanoidPolicy._apply_checkpoint_eval_image_transform(
+            SimpleNamespace(model_transform=transform),
+            (source,),
+        )
+    source.close()
 
 
 def test_history_is_oldest_to_current_and_bats_is_frozen() -> None:
@@ -487,17 +703,55 @@ def test_history_defers_duplicate_current_capture_receipt() -> None:
         history.close()
 
 
-def _policy(model: VlaPsiActorCritic, *, seed: int = 41) -> G1VlaHumanoidPolicy:
+def test_history_remains_two_hz_when_policy_replans_at_ten_hz() -> None:
+    """Fresh 100 ms decisions must not accelerate the BATS history clock."""
+    history = VlaImageHistory(episode_index=17)
+    selected_batches: list[tuple[Image.Image, ...]] = []
+    try:
+        for index in range(6):
+            current = Image.new("RGB", (224, 224), color=(index, 0, 0))
+            selected_batches.append(
+                history.select_with_current(
+                    current,
+                    timestamp_us=index * 100_000,
+                    capture_receipt_sha256=f"receipt-{index}",
+                )
+            )
+            current.close()
+        assert [len(batch) for batch in selected_batches] == [1, 1, 1, 1, 1, 2]
+        assert [int(np.asarray(image)[0, 0, 0]) for image in selected_batches[-1]] == [
+            0,
+            5,
+        ]
+    finally:
+        for batch in selected_batches:
+            for image in batch:
+                image.close()
+        history.close()
+
+
+def _policy(
+    model: VlaPsiActorCritic,
+    *,
+    seed: int = 41,
+    run_config_sha256: str = STAIRSBLOCKS_VLA_BUNDLE_PROFILE.run_config_sha256,
+    sampling_mode: str = FLOW_SDE_TRAINING,
+) -> G1VlaHumanoidPolicy:
+    profile = STAIRSBLOCKS_VLA_BUNDLE_PROFILE
     return G1VlaHumanoidPolicy(
         _Engine(model),
         session_uuid="session",
         request=SimpleNamespace(random_seed=seed, scenario_id="ascend"),
-        image_format="png",
+        image_format="jpeg",
         expected_schedule_sha256=model.schedule.sha256,
         humanoid_repo_path=_HUMANOID_REPO,
         humanoid_vla_reference_adapter_sha256=_HUMANOID_VLA_REFERENCE_ADAPTER_SHA256,
         humanoid_motion_reference_sha256=_HUMANOID_MOTION_REFERENCE_SHA256,
-        language_instruction="walk up the stairs",
+        language_instruction="walk ahead.",
+        run_config_sha256=run_config_sha256,
+        bundle_profile=profile,
+        sampling_mode=sampling_mode,
+        replan_controller_ticks=25,
     )
 
 
@@ -507,6 +761,8 @@ def test_reference_adapter_preserves_policy_target_zero_and_exact_target_clock()
     rows = np.zeros((30, 38), dtype=np.float32)
     rows[:, :29] = np.arange(30, dtype=np.float32)[:, None] * 0.01
     rows[:, 29:35] = np.asarray([1, 0, 0, 0, 1, 0], dtype=np.float32)
+    rows[:, 35] = np.arange(30, dtype=np.float32) * 0.01
+    rows[:, 36] = np.arange(30, dtype=np.float32) * -0.005
     qpos = np.zeros(36, dtype=np.float32)
     qpos[:3] = [0.1, -0.2, 0.8]
     qpos[3] = 1.0
@@ -519,7 +775,8 @@ def test_reference_adapter_preserves_policy_target_zero_and_exact_target_clock()
         motion_reference_sha256=_HUMANOID_MOTION_REFERENCE_SHA256,
     )
     assert adapter.rtc_max_delay_exclusive == 8
-    reference = adapter.build(rows, qpos=qpos, qvel=qvel, timestamp_us=500_000)
+    built = adapter.build(rows, qpos=qpos, qvel=qvel, timestamp_us=500_000)
+    reference = built.reference
 
     assert len(reference.frames) == H50_FRAME_COUNT
     np.testing.assert_array_equal(reference.frames[0].joint_position, rows[0, :29])
@@ -545,6 +802,25 @@ def test_reference_adapter_preserves_policy_target_zero_and_exact_target_clock()
     assert [round(frame.time_s * 1_000_000) for frame in reference.frames] == [
         500_000 + index * 20_000 for index in range(50)
     ]
+    np.testing.assert_array_equal(reference.frames[0].root_position[:2], qpos[:2])
+    np.testing.assert_allclose(
+        reference.frames[10].root_position[:2],
+        qpos[:2] + np.asarray([0.06, -0.03]),
+        rtol=0,
+        atol=1.0e-8,
+    )
+    assert all(frame.root_position[2] == qpos[2] for frame in reference.frames)
+    assert built.decode_context.schema == "full_pelvis_rotation_local_xy_completed_z/v1"
+    np.testing.assert_array_equal(
+        built.decode_context.local_xy_from_frame_zero[0],
+        np.zeros(2, dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        built.decode_context.local_xy_from_frame_zero[10],
+        np.asarray([0.06, -0.03], dtype=np.float32),
+        rtol=0,
+        atol=1.0e-8,
+    )
 
 
 def test_dynamic_humanoid_module_is_content_pinned_and_content_cached(
@@ -587,9 +863,24 @@ def test_flow_sample_emits_h50_and_preserves_exact_raw_action_replay() -> None:
     assert output.motion_reference.reference_id == (1 << 32) | 1
     assert output.motion_reference.source_decision_id == policy_input.decision_id
     assert len(output.motion_reference.frames) == 50
+    assert output.motion_reference.decode_context is not None
+    assert output.motion_reference.decode_context.schema == (
+        "full_pelvis_rotation_local_xy_completed_z/v1"
+    )
+    torch.testing.assert_close(
+        output.motion_reference.decode_context.chunk_base_quaternion_wxyz,
+        policy_input.qpos[3:7],
+    )
+    assert output.motion_reference.decode_context.local_xy_from_frame_zero.shape == (
+        50,
+        2,
+    )
     assert output.replay_data.old_logprob is not None
     payload = output.replay_data.payload
-    assert payload["run_config_sha256"] == RUN_CONFIG_SHA256
+    assert (
+        payload["run_config_sha256"]
+        == STAIRSBLOCKS_VLA_BUNDLE_PROFILE.run_config_sha256
+    )
     assert "inference_manifest_sha256" not in payload
     torch.testing.assert_close(
         payload["physical_states"][0],
@@ -621,6 +912,74 @@ def test_flow_sample_emits_h50_and_preserves_exact_raw_action_replay() -> None:
     policy.close()
 
 
+def test_four_tuple_psi_rebuilds_checkpoint_training_visual_pooling() -> None:
+    """The ckpt_1500 serving gap must not silently unpool BATS history."""
+    psi = _FakeFourTuplePsi()
+    policy = _policy(_model(psi), seed=43)
+
+    first = policy.step((_input(step=0, color=(11, 12, 13)),))[0]
+    assert first.motion_reference is not None
+    assert first.replay_data is not None
+    torch.testing.assert_close(
+        first.replay_data.payload["visual_pool_factors"],
+        torch.tensor([1], dtype=torch.int64),
+    )
+
+    second = policy.step(
+        (
+            _input(
+                step=1,
+                color=(21, 22, 23),
+                active_reference_ids=(first.motion_reference.reference_id,) * 25,
+            ),
+        )
+    )[0]
+    assert second.replay_data is not None
+    torch.testing.assert_close(
+        second.replay_data.payload["visual_pool_factors"],
+        torch.tensor([2, 1], dtype=torch.int64),
+    )
+    assert psi.model_transform.seen_pool_factors == [[1], [2, 1]]
+    policy.close()
+
+
+def test_policy_stamps_the_selected_bundle_run_config_identity() -> None:
+    profile = STAIRSBLOCKS_VLA_BUNDLE_PROFILE
+    policy = _policy(_model(), run_config_sha256=profile.run_config_sha256)
+
+    output = policy.step((_input(step=0, color=(7, 8, 9)),))[0]
+
+    assert output.replay_data is not None
+    assert output.replay_data.payload["run_config_sha256"] == profile.run_config_sha256
+    policy.close()
+
+
+def test_async_training_initial_delay_preserves_suffix_on_first_replan() -> None:
+    """Async training keeps the conservative native six-row latency prior."""
+    model = _model()
+    policy = _policy(model, seed=13)
+    first = policy.step((_input(step=0, color=(4, 5, 6)),))[0]
+    assert first.motion_reference is not None
+
+    second = policy.step(
+        (
+            _input(
+                step=1,
+                color=(7, 8, 9),
+                active_reference_ids=(first.motion_reference.reference_id,) * 25,
+            ),
+        )
+    )[0]
+
+    assert second.replay_data is not None
+    assert second.model_extra is not None
+    assert int(second.replay_data.payload["rtc_prefix_mask"].sum()) == 6
+    assert second.model_extra["vla_rtc_delay_rows"] == 6
+    assert second.model_extra["vla_rtc_source_cursor_h50"] == 25
+    assert second.model_extra["vla_rtc_source_start_row_h30"] == 15
+    policy.close()
+
+
 def test_second_sample_hard_inpaints_rebased_predecessor_suffix() -> None:
     """RTC freezes predicted overlap rows and gives them zero Flow density."""
     model = _model()
@@ -636,7 +995,7 @@ def test_second_sample_hard_inpaints_rebased_predecessor_suffix() -> None:
     assert previous is not None
     assert previous.reference_id == first.motion_reference.reference_id
     assert previous.source_timestamp_us == first_input.timestamp_us
-    torch.testing.assert_close(previous.clipped_normalized_actions, first_chunk)
+    torch.testing.assert_close(previous.normalized_actions, first_chunk)
     torch.testing.assert_close(
         previous.base_quaternion_wxyz,
         first_input.qpos[3:7],
@@ -744,7 +1103,7 @@ def test_late_cursor_28_uses_row_17_suffix_and_row_16_seam_seed() -> None:
     assert second.model_extra is not None
     assert second.model_extra["vla_rtc_source_cursor_h50"] == 28
     assert second.model_extra["vla_rtc_source_start_row_h30"] == 17
-    assert int(second_payload["rtc_prefix_mask"].sum().item()) == 6
+    assert int(second_payload["rtc_prefix_mask"].sum()) == 6
 
     expected_suffix = _rebase_normalized_chunk_relative_dims(
         first_payload["clipped_normalized_actions"][17:],
@@ -983,10 +1342,21 @@ def test_inference_only_sample_needs_no_flow_trace_logprob_or_value(
     rows[..., 33] = 1.0
     monkeypatch.setattr(
         model,
-        "sample_actions",
-        lambda **kwargs: SimpleNamespace(denormalized_wire=rows),
+        "sample_actions_native_ode",
+        lambda **kwargs: SimpleNamespace(
+            density_latent=torch.zeros_like(rows),
+            clipped_normalized=torch.zeros_like(rows),
+            denormalized_wire=rows,
+            schedule_sha256=model.qualification_schedule.sha256,
+            clip_normalized_actions=False,
+        ),
     )
-    policy = _policy(model)
+    monkeypatch.setattr(
+        model,
+        "sample_actions",
+        lambda **kwargs: pytest.fail("qualification called the Flow-SDE sampler"),
+    )
+    policy = _policy(model, sampling_mode=NATIVE_ODE_QUALIFICATION)
 
     output = policy.step((_input(step=0, color=(3, 4, 5)),))[0]
 
@@ -994,12 +1364,162 @@ def test_inference_only_sample_needs_no_flow_trace_logprob_or_value(
     assert output.logprob is None
     assert output.value is None
     assert output.replay_data is not None
+    assert output.replay_data.payload_schema == QUALIFICATION_REPLAY_SCHEMA
     assert output.replay_data.old_logprob is None
+    assert output.replay_data.payload["sampling_mode"] == NATIVE_ODE_QUALIFICATION
     torch.testing.assert_close(
         output.replay_data.payload["denormalized_wire_actions"], rows[0]
     )
     assert "latent_chain" not in output.replay_data.payload
     policy.close()
+
+
+def test_synchronous_qualification_keeps_fixed_continuity_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Zero simulator-time latency must not erase the action seam overlap."""
+    model = _model()
+
+    def _sample_native_ode(**kwargs: torch.Tensor) -> SimpleNamespace:
+        prefix = kwargs["rtc_prefix_normalized_actions"]
+        mask = kwargs["rtc_prefix_mask"]
+        clipped = torch.zeros_like(prefix)
+        clipped = torch.where(mask[..., None], prefix, clipped)
+        denormalized = model.normalizer.denormalize_action(clipped)
+        # Keep the sampler-owned suffix a valid identity rotation. Prefix rows
+        # remain the exact denormalization of the previous chunk's suffix.
+        suffix = ~mask
+        denormalized[:, :, 29] = torch.where(
+            suffix, torch.ones_like(denormalized[:, :, 29]), denormalized[:, :, 29]
+        )
+        denormalized[:, :, 33] = torch.where(
+            suffix, torch.ones_like(denormalized[:, :, 33]), denormalized[:, :, 33]
+        )
+        return SimpleNamespace(
+            density_latent=clipped.clone(),
+            clipped_normalized=clipped,
+            denormalized_wire=denormalized,
+            schedule_sha256=model.qualification_schedule.sha256,
+            clip_normalized_actions=False,
+        )
+
+    monkeypatch.setattr(
+        model,
+        "sample_actions_native_ode",
+        _sample_native_ode,
+    )
+    policy = _policy(model, sampling_mode=NATIVE_ODE_QUALIFICATION)
+
+    previous = policy.step((_input(step=0, color=(3, 4, 5)),))[0]
+    assert previous.motion_reference is not None
+    assert previous.replay_data is not None
+    lane = policy._lanes[0]
+    assert lane.rtc_state is not None
+    assert lane.rtc_state.delay_rows == (0,)
+
+    # More replans than the six-entry latency window proves observed zeros can
+    # no longer flush the separately configured qualification continuity ABI.
+    for step in range(1, 9):
+        previous_wire = previous.replay_data.payload["denormalized_wire_actions"]
+        current = policy.step(
+            (
+                _input(
+                    step=step,
+                    color=(step, step + 1, step + 2),
+                    active_reference_ids=(previous.motion_reference.reference_id,) * 25,
+                ),
+            )
+        )[0]
+        assert current.motion_reference is not None
+        assert current.replay_data is not None
+        assert current.model_extra is not None
+        payload = current.replay_data.payload
+        assert int(payload["rtc_prefix_mask"].sum()) == 6
+        assert payload["rtc_prefix_mode"] == "fixed_continuity/v1"
+        assert payload["rtc_configured_continuity_prefix_rows"] == 6
+        assert payload["rtc_observed_delay_rows"] == 0
+        torch.testing.assert_close(
+            payload["denormalized_wire_actions"][:6, :29],
+            previous_wire[15:21, :29],
+            rtol=0,
+            atol=0,
+        )
+        expected_velocity = (previous_wire[15, :29] - previous_wire[14, :29]) * 30.0
+        torch.testing.assert_close(
+            current.motion_reference.frames[0].joint_velocity,
+            expected_velocity,
+            rtol=0,
+            atol=2.0e-5,
+        )
+        assert current.model_extra["vla_rtc_delay_rows"] == 6
+        assert current.model_extra["vla_rtc_actual_prefix_rows"] == 6
+        assert current.model_extra["vla_rtc_observed_delay_rows"] == 0
+        assert current.model_extra["vla_rtc_prefix_mode"] == "fixed_continuity/v1"
+        previous = current
+
+    assert lane.rtc_state is not None
+    assert lane.rtc_state.delay_rows == (0, 0, 0, 0, 0, 0)
+    policy.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    (
+        ("camera_logical_id", "vla_d455_policy_rgb"),
+        ("camera_image_format", "png"),
+        ("camera_contract_sha256", "d" * 64),
+        ("language_instruction", "Walk ahead."),
+    ),
+)
+def test_ckpt1500_profile_rejects_camera_or_instruction_yaml_override(
+    field: str,
+    wrong_value: str,
+) -> None:
+    model = _model()
+    profile = STAIRSBLOCKS_VLA_BUNDLE_PROFILE
+    bundle_config = {
+        "sampling_mode": FLOW_SDE_TRAINING,
+        "expected_schedule_sha256": model.schedule.sha256,
+        "humanoid_repo_path": str(_HUMANOID_REPO),
+        "humanoid_vla_reference_adapter_sha256": (
+            _HUMANOID_VLA_REFERENCE_ADAPTER_SHA256
+        ),
+        "humanoid_motion_reference_sha256": _HUMANOID_MOTION_REFERENCE_SHA256,
+        "language_instruction": profile.language_instruction,
+        "camera_logical_id": profile.camera_logical_id,
+        "camera_image_format": profile.camera_image_format,
+        "camera_contract_sha256": profile.camera_contract_sha256,
+    }
+    bundle_config[field] = wrong_value
+    config = SimpleNamespace(
+        policy=SimpleNamespace(
+            model=SimpleNamespace(
+                path=f"/test/models/{profile.model_id}",
+                bundle_config=bundle_config,
+            ),
+            inference=SimpleNamespace(return_trace_for_rl=True),
+        )
+    )
+
+    with pytest.raises(ValueError, match="attested model profile"):
+        build_humanoid_policy_factory(config, _Engine(model))
+
+
+def test_ckpt1500_profile_records_exact_training_eval_camera_abi() -> None:
+    profile = STAIRSBLOCKS_VLA_BUNDLE_PROFILE
+    assert profile.camera_profile == "vla_d435_native"
+    assert profile.camera_logical_id == "vla_d435_policy_rgb"
+    assert profile.camera_image_format == "jpeg"
+    assert profile.camera_source_resolution == (640, 480)
+    assert profile.camera_contract_sha256 == (
+        "dc01fdaaac67036fb69044ea8ff66fb554131dc89bd708a66b8b955c3471a297"
+    )
+    assert profile.camera_preprocess_profile == (
+        "psi_resize_nearest_224x224_center_crop_224x224_no_letterbox.v1"
+    )
+    # Dataset task is ``Walk ahead.``; VlnverseRepackTransform lowercases it.
+    assert profile.language_instruction == "walk ahead."
+    assert profile.native_qualification_clip_normalized_actions is False
 
 
 def test_factory_and_inference_adapter_fail_closed_on_wrong_contracts() -> None:
@@ -1012,19 +1532,26 @@ def test_factory_and_inference_adapter_fail_closed_on_wrong_contracts() -> None:
     config = SimpleNamespace(
         policy=SimpleNamespace(
             model=SimpleNamespace(
+                path=(f"/test/models/{STAIRSBLOCKS_VLA_BUNDLE_PROFILE.model_id}"),
                 bundle_config={
+                    "sampling_mode": FLOW_SDE_TRAINING,
                     "expected_schedule_sha256": model.schedule.sha256,
                     "humanoid_repo_path": str(_HUMANOID_REPO),
                     "humanoid_vla_reference_adapter_sha256": _HUMANOID_VLA_REFERENCE_ADAPTER_SHA256,
                     "humanoid_motion_reference_sha256": (
                         _HUMANOID_MOTION_REFERENCE_SHA256
                     ),
-                    "language_instruction": "walk up the stairs",
-                    "camera_logical_id": "d455_rgb",
-                    "camera_image_format": "png",
-                    "camera_contract_sha256": "6" * 64,
-                }
-            )
+                    "language_instruction": "walk ahead.",
+                    "camera_logical_id": (
+                        STAIRSBLOCKS_VLA_BUNDLE_PROFILE.camera_logical_id
+                    ),
+                    "camera_image_format": "jpeg",
+                    "camera_contract_sha256": (
+                        STAIRSBLOCKS_VLA_BUNDLE_PROFILE.camera_contract_sha256
+                    ),
+                },
+            ),
+            inference=SimpleNamespace(return_trace_for_rl=True),
         )
     )
     factory = build_humanoid_policy_factory(config, _Engine(model))
@@ -1043,15 +1570,28 @@ def test_factory_and_inference_adapter_fail_closed_on_wrong_contracts() -> None:
             sample_period_us=20_000,
             control_ticks_per_policy_step=25,
             joint_names=MOTION_REFERENCE_JOINT_NAMES,
+            decode_context_schema="full_pelvis_rotation_local_xy_completed_z/v1",
         ),
         policy_camera_spec=SimpleNamespace(
             schema="humanoid_policy_camera_rgb_qpos.v1",
             logical_id="wrong_camera",
-            width=224,
-            height=140,
-            image_format="png",
-            contract_sha256="6" * 64,
+            width=640,
+            height=480,
+            image_format="jpeg",
+            contract_sha256=(STAIRSBLOCKS_VLA_BUNDLE_PROFILE.camera_contract_sha256),
         ),
     )
-    with pytest.raises(ValueError, match="D455 camera contract changed"):
+    with pytest.raises(ValueError, match="vla_d435_native camera contract changed"):
         factory("session", request)
+
+    request.policy_camera_spec.logical_id = (
+        STAIRSBLOCKS_VLA_BUNDLE_PROFILE.camera_logical_id
+    )
+    request.reference_spec.control_ticks_per_policy_step = 25
+    policy = factory("session-visual-k25", request)
+    assert policy._replan_controller_ticks == 25
+    policy.close()
+
+    request.reference_spec.decode_context_schema = ""
+    with pytest.raises(ValueError, match="decode-context session contract"):
+        factory("session-missing-decode-context", request)

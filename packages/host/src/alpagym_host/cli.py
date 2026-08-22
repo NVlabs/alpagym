@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+from typing import TYPE_CHECKING
 
 import hydra
 from hydra.core.hydra_config import HydraConfig
@@ -25,6 +26,9 @@ from alpagym_host.run_artifacts import (
 from alpagym_host.run_lifecycle import execute_run
 from alpagym_host.slurm import submit_slurm_job
 
+if TYPE_CHECKING:
+    from alpagym_host.qualification_lifecycle import QualificationArtifacts
+
 
 def load_or_create_run_config(cfg: DictConfig) -> RunConfig:
     """Load an existing resolved config or create and write a new one."""
@@ -41,6 +45,13 @@ def load_or_create_run_config(cfg: DictConfig) -> RunConfig:
     if should_write_artifacts:
         write_run_artifacts(run_config)
     return run_config
+
+
+def _execute_qualification_rollout(config: RunConfig) -> "QualificationArtifacts":
+    """Import the GPU/runtime qualification stack only for command=rollout."""
+    from alpagym_host.qualification_lifecycle import execute_qualification_rollout
+
+    return execute_qualification_rollout(config)
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="default")
@@ -63,6 +74,13 @@ def main(cfg: DictConfig) -> object:
         validate_huggingface_access()
     if cfg.command == "run":
         execute_run(run_config)
+        return run_config
+
+    elif cfg.command == "rollout":
+        artifacts = _execute_qualification_rollout(run_config)
+        print(f"Episode manifest: {artifacts.episode_manifest}")
+        print(f"Metrics manifest: {artifacts.metrics_manifest}")
+        print(f"Run directory: {run_config.artifact_paths.run_dir}")
         return run_config
 
     elif cfg.command == "submit":

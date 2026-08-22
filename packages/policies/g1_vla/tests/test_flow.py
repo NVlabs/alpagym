@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
+)
 
 from alpagym_g1_vla.flow import (
     VlaFlowSchedule,
@@ -81,6 +84,33 @@ def test_deterministic_flow_uses_vla_nonuniform_euler_grid() -> None:
     actual = sample_flow_ode(constant_velocity, initial, schedule)
     # Sum_i (sigma_i - sigma_{i+1}) == 1 even on VLA's .889/.001 grid.
     torch.testing.assert_close(actual, initial - 0.25, rtol=1.0e-6, atol=1.0e-6)
+
+
+def test_native_ode_is_byte_exact_with_diffusers_scheduler() -> None:
+    """Qualification Euler integration must remain checkpoint-scheduler exact."""
+    scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
+    scheduler.set_timesteps(10, device="cpu")
+    schedule = VlaFlowSchedule(
+        model_timesteps=scheduler.timesteps,
+        sigmas=scheduler.sigmas,
+    )
+    assert schedule.sha256 == (
+        "d01fcb068a81712b78f9b72ff95877e332ae03245a2d1aba518c83354cf7ad12"
+    )
+    initial = torch.randn((2, 30, 38), generator=torch.Generator().manual_seed(37))
+
+    def nonlinear_velocity(
+        latent: torch.Tensor, timestep: torch.Tensor
+    ) -> torch.Tensor:
+        return latent.square() * 0.017 + timestep[:, None, None] / 10_000.0
+
+    expected = initial.clone()
+    for timestep in scheduler.timesteps:
+        velocity = nonlinear_velocity(expected, timestep.expand(2))
+        expected = scheduler.step(velocity, timestep, expected).prev_sample
+
+    actual = sample_flow_ode(nonlinear_velocity, initial, schedule)
+    assert torch.equal(actual, expected)
 
 
 def test_zero_rtc_mask_replays_exactly() -> None:

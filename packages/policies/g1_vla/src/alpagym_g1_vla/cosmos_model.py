@@ -38,16 +38,11 @@ from alpagym_g1_vla.flow import (
 from alpagym_g1_vla.model import VlaPsiActorCritic
 from alpagym_g1_vla.normalization import VlaQ99Normalizer
 from alpagym_g1_vla.provenance import (
-    ARGV_SHA256,
-    BASE_VLM_TREE_SHA256,
-    CHECKPOINT_STEP,
-    MODEL_ID,
-    MODEL_SHA256,
-    PSI_SOURCE_TREE_SHA256,
-    RUN_CONFIG_SHA256,
-    STATS_SHA256,
+    VlaBundleProfile,
     VlaSourceBundle,
     canonical_tree_snapshot,
+    vla_bundle_profile,
+    vla_bundle_profile_for_model_root,
 )
 
 VLA_PSI_PPO_MODEL_TYPE = "g1_vla_psi_ppo"
@@ -209,20 +204,23 @@ class VlaPsiPPOConfig(PretrainedConfig):
     ) -> None:
         """Validate the exact source, weights, statistics, and PPO schedule."""
         super().__init__(**kwargs)
+        profile = vla_bundle_profile(bundle_model_id)
         expected_pins = {
-            "bundle_model_id": (bundle_model_id, MODEL_ID),
-            "checkpoint_step": (int(checkpoint_step), CHECKPOINT_STEP),
-            "model_sha256": (model_sha256, MODEL_SHA256),
-            "run_config_sha256": (run_config_sha256, RUN_CONFIG_SHA256),
-            "argv_sha256": (argv_sha256, ARGV_SHA256),
-            "stats_sha256": (stats_sha256, STATS_SHA256),
+            "checkpoint_step": (int(checkpoint_step), profile.checkpoint_step),
+            "model_sha256": (model_sha256, profile.model_sha256),
+            "run_config_sha256": (
+                run_config_sha256,
+                profile.run_config_sha256,
+            ),
+            "argv_sha256": (argv_sha256, profile.argv_sha256),
+            "stats_sha256": (stats_sha256, profile.stats_sha256),
             "base_vlm_tree_sha256": (
                 base_vlm_tree_sha256,
-                BASE_VLM_TREE_SHA256,
+                profile.base_vlm_tree_sha256,
             ),
             "psi_source_tree_sha256": (
                 psi_source_tree_sha256,
-                PSI_SOURCE_TREE_SHA256,
+                profile.psi_source_tree_sha256,
             ),
         }
         for label, (actual, expected) in expected_pins.items():
@@ -306,7 +304,10 @@ class VlaPsiPPOModel(BaseModel):
         """Build the attested Psi architecture without allocating 2B weights."""
         super().__init__(hf_config)
         self.config = hf_config
-        self.source_bundle = VlaSourceBundle.verify(hf_config.policy_eval_root)
+        self.source_bundle = VlaSourceBundle.verify(
+            hf_config.policy_eval_root,
+            model_id=hf_config.bundle_model_id,
+        )
         if self.source_bundle.model_root.name != hf_config.bundle_model_id:
             raise ValueError("Verified VLA model root does not match bundle_model_id")
 
@@ -332,10 +333,17 @@ class VlaPsiPPOModel(BaseModel):
                 model_timesteps=torch.tensor(hf_config.flow_model_timesteps),
                 sigmas=torch.tensor(hf_config.flow_sigmas),
             )
+            qualification_schedule = _native_qualification_schedule(
+                self.source_bundle.profile
+            )
             normalizer = VlaQ99Normalizer.from_stats_file(self.source_bundle.stats_path)
         self.actor_critic = VlaPsiActorCritic(
             psi_model=psi_model,
             schedule=schedule,
+            qualification_schedule=qualification_schedule,
+            qualification_clip_normalized_actions=(
+                self.source_bundle.profile.native_qualification_clip_normalized_actions
+            ),
             noise_level=hf_config.flow_noise_level,
             normalizer=normalizer,
             vlm_hidden_dim=hf_config.vlm_hidden_dim,
@@ -372,6 +380,55 @@ class VlaPsiPPOModel(BaseModel):
         if tp_size != 1:
             raise NotImplementedError("VLA Psi v1 does not support TP")
 
+    def _restore_qwen3_vl_rotary_buffers(self) -> None:
+        """Recreate Qwen3-VL RoPE state omitted from its checkpoint.
+
+        Qwen3-VL registers both inverse-frequency tensors as non-persistent
+        buffers. Cosmos constructs this model on the meta device, so those
+        tensors must be recreated after materialization rather than loaded
+        from the safetensors state dict.
+        """
+        psi = cast(_PsiRuntimeProtocol, self.actor_critic.psi_model)
+        vlm = cast(Any, psi.vlm_model)
+        vision_rotary = vlm.model.visual.rotary_pos_emb
+        text_rotary = vlm.model.language_model.rotary_emb
+        if (
+            vision_rotary.inv_freq.device.type == "meta"
+            or text_rotary.inv_freq.device.type == "meta"
+        ):
+            raise RuntimeError(
+                "VLA Qwen3-VL rotary buffers must be materialized before restore"
+            )
+
+        vision_dim = int(vision_rotary.inv_freq.numel()) * 2
+        expected_vision = 1.0 / (
+            10000.0
+            ** (torch.arange(0, vision_dim, 2, dtype=torch.float32) / float(vision_dim))
+        )
+        expected_text, _attention_scaling = text_rotary.rope_init_fn(
+            text_rotary.config,
+            torch.device("cpu"),
+        )
+        if expected_vision.shape != vision_rotary.inv_freq.shape:
+            raise RuntimeError("VLA Qwen3-VL vision RoPE shape changed")
+        if expected_text.shape != text_rotary.inv_freq.shape:
+            raise RuntimeError("VLA Qwen3-VL text RoPE shape changed")
+
+        with torch.no_grad():
+            vision_rotary.inv_freq.copy_(
+                expected_vision.to(
+                    device=vision_rotary.inv_freq.device,
+                    dtype=vision_rotary.inv_freq.dtype,
+                )
+            )
+            text_rotary.inv_freq.copy_(
+                expected_text.to(
+                    device=text_rotary.inv_freq.device,
+                    dtype=text_rotary.inv_freq.dtype,
+                )
+            )
+        text_rotary.original_inv_freq = text_rotary.inv_freq
+
     def post_to_empty_hook(self, cosmos_config: Any) -> None:
         """Initialize trainable state after Cosmos materializes the model.
 
@@ -381,6 +438,7 @@ class VlaPsiPPOModel(BaseModel):
         phases separate matches the native Cosmos model contract.
         """
         del cosmos_config
+        self._restore_qwen3_vl_rotary_buffers()
         if not self._critic_initialized:
             self.actor_critic.critic.prefix_projection.reset_parameters()
             self.actor_critic.critic.value_head._init_weights("relu")
@@ -570,18 +628,20 @@ def load_vla_rollout_model(
 
 
 def _is_attested_model_root(model_name_or_path: str) -> bool:
-    """Match only paths shaped like the single pinned VLA model root."""
+    """Match only paths shaped like one registered VLA model root."""
     path = Path(model_name_or_path).expanduser()
-    return path.name == MODEL_ID and path.parent.name == "models"
+    try:
+        vla_bundle_profile_for_model_root(path)
+    except ValueError:
+        return False
+    return True
 
 
 def _config_from_attested_model_root(model_name_or_path: str) -> VlaPsiPPOConfig:
     """Create the v1 config after fully attesting a local VLA model root."""
     model_root = Path(model_name_or_path).expanduser().resolve(strict=True)
-    policy_eval_root = model_root.parent.parent
-    bundle = VlaSourceBundle.verify(policy_eval_root)
-    if bundle.model_root != model_root:
-        raise ValueError("VLA local config path differs from the verified model root")
+    bundle = VlaSourceBundle.verify_model_root(model_root)
+    profile = bundle.profile
     run_config = _read_attested_run_config(bundle)
     rtc_max_delay_exclusive = _rtc_max_delay_exclusive(run_config)
     with cosmos_default_dtype(torch.float32):
@@ -610,15 +670,15 @@ def _config_from_attested_model_root(model_name_or_path: str) -> VlaPsiPPOConfig
             ),
         )
     return VlaPsiPPOConfig(
-        policy_eval_root=str(policy_eval_root),
-        bundle_model_id=MODEL_ID,
-        checkpoint_step=CHECKPOINT_STEP,
-        model_sha256=MODEL_SHA256,
-        run_config_sha256=RUN_CONFIG_SHA256,
-        argv_sha256=ARGV_SHA256,
-        stats_sha256=STATS_SHA256,
-        base_vlm_tree_sha256=BASE_VLM_TREE_SHA256,
-        psi_source_tree_sha256=PSI_SOURCE_TREE_SHA256,
+        policy_eval_root=str(bundle.policy_eval_root),
+        bundle_model_id=profile.model_id,
+        checkpoint_step=profile.checkpoint_step,
+        model_sha256=profile.model_sha256,
+        run_config_sha256=profile.run_config_sha256,
+        argv_sha256=profile.argv_sha256,
+        stats_sha256=profile.stats_sha256,
+        base_vlm_tree_sha256=profile.base_vlm_tree_sha256,
+        psi_source_tree_sha256=profile.psi_source_tree_sha256,
         normalization_type="bounds_q99",
         flow_model_timesteps=schedule.model_timesteps.tolist(),
         flow_sigmas=schedule.sigmas.tolist(),
@@ -629,6 +689,24 @@ def _config_from_attested_model_root(model_name_or_path: str) -> VlaPsiPPOConfig
         vlm_hidden_dim=2048,
         critic_hidden_sizes=[1024, 512, 256],
     )
+
+
+def _native_qualification_schedule(profile: VlaBundleProfile) -> VlaFlowSchedule:
+    """Materialize and attest one profile's original serving ODE grid."""
+    scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
+    scheduler.set_timesteps(
+        profile.native_qualification_inference_steps,
+        device="cpu",
+    )
+    schedule = VlaFlowSchedule(
+        model_timesteps=cast(torch.Tensor, scheduler.timesteps),
+        sigmas=cast(torch.Tensor, scheduler.sigmas),
+    )
+    if schedule.sha256 != profile.native_qualification_schedule_sha256:
+        raise ValueError(
+            "VLA native qualification scheduler differs from the pinned profile"
+        )
+    return schedule
 
 
 def _read_attested_run_config(bundle: VlaSourceBundle) -> Mapping[str, Any]:
@@ -646,7 +724,8 @@ def _validate_training_contract(
 ) -> None:
     """Check architecture and normalization fields that affect checkpoint meaning."""
     model = run_config["model"]
-    field = run_config["data"]["transform"]["action"]["field"]
+    action_transform = _action_transform(run_config)
+    field = action_transform["field"]
     if not isinstance(model, Mapping) or not isinstance(field, Mapping):
         raise TypeError("VLA run config model/field entries must be mappings")
     expected = {
@@ -676,6 +755,21 @@ def _validate_training_contract(
         raise ValueError("VLA v1 requires use_norm_mask=false")
     if run_config["train"]["lora"] is not False:
         raise NotImplementedError("VLA Psi v1 does not support LoRA checkpoints")
+
+
+def _action_transform(run_config: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Read the model transform across the two attested Psi config schemas."""
+    transform = run_config["data"]["transform"]
+    if not isinstance(transform, Mapping):
+        raise TypeError("VLA run config data.transform must be a mapping")
+    nested = transform.get("action")
+    if isinstance(nested, Mapping):
+        return nested
+    if isinstance(transform.get("field"), Mapping) and isinstance(
+        transform.get("model"), Mapping
+    ):
+        return transform
+    raise TypeError("VLA run config has no admitted action transform schema")
 
 
 def _rtc_max_delay_exclusive(run_config: Mapping[str, Any]) -> int:
@@ -708,7 +802,7 @@ def _construct_psi_architecture(
     """Import only attested Psi source and construct its full runtime on meta."""
     _import_attested_psi(
         source_bundle.psi_source_root,
-        expected_tree_sha256=PSI_SOURCE_TREE_SHA256,
+        expected_tree_sha256=source_bundle.profile.psi_source_tree_sha256,
     )
     psi_module = importlib.import_module("psi.models.psi0")
     model_config_module = importlib.import_module("psi.config.model_psi0")
@@ -717,7 +811,7 @@ def _construct_psi_architecture(
         run_config["model"]
     )
     model_transform = transform_module.Psi0ModelTransform.model_validate(
-        run_config["data"]["transform"]["action"]["model"]
+        _action_transform(run_config)["model"]
     )
 
     base_vlm_root = source_bundle.model_root / "base_vlm"

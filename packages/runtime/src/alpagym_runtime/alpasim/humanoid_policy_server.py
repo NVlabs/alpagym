@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
 import math
 import os
@@ -24,10 +25,12 @@ from PIL import Image, UnidentifiedImageError
 from alpagym_runtime.alpasim.grpc_import import (
     ensure_alpasim_grpc_source,
     ensure_humanoid_policy_camera_abi,
+    ensure_humanoid_reference_decode_context_abi,
 )
 
 ensure_alpasim_grpc_source()
 from alpagym_host.endpoint_registry import TopologyEndpoint
+from alpasim_grpc.v0 import humanoid_contracts, humanoid_pb2
 from alpasim_grpc.v0.common_pb2 import (
     Empty,
     Quat,
@@ -44,6 +47,7 @@ from alpasim_grpc.v0.humanoid_pb2 import (
     HumanoidEnvValue,
     HumanoidEnvState,
     HumanoidMotionFrame,
+    HumanoidMotionReferenceSpec,
     HumanoidPlanUpdate,
     HumanoidPolicyRequest,
     HumanoidPolicyResponse,
@@ -65,6 +69,9 @@ logger = logging.getLogger(__name__)
 
 _LOWERCASE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MOTION_REFERENCE_SCHEMA_H50 = "g1_motion_reference_29d_50hz_h50.v1"
+HUMANOID_FEEDBACK_STATE_CONTRACT_SCHEMA = (
+    "alpagym.humanoid_feedback_state.named_joint_order.v1"
+)
 MOTION_REFERENCE_JOINT_NAMES = (
     "left_hip_pitch_joint",
     "right_hip_pitch_joint",
@@ -225,14 +232,23 @@ class HumanoidMotionReferenceFrame:
 
 
 @dataclass(frozen=True)
+class HumanoidReferenceDecodeContext:
+    """Policy-owned context needed to finish a reference at the physics boundary."""
+
+    schema: str
+    chunk_base_quaternion_wxyz: torch.Tensor
+    local_xy_from_frame_zero: torch.Tensor
+
+
+@dataclass(frozen=True)
 class HumanoidMotionReference:
     """Typed fixed-horizon reference returned instead of a direct joint action."""
 
     reference_id: int
     source_decision_id: int
     frames: tuple[HumanoidMotionReferenceFrame, ...]
-    reference_sha256: str
     root_z_alignment_offset_m: float
+    decode_context: HumanoidReferenceDecodeContext | None = None
 
 
 @dataclass(frozen=True)
@@ -301,6 +317,7 @@ class _Session:
     reference_joint_names: tuple[str, ...] = ()
     reference_frame_count: int = 0
     reference_sample_period_us: int = 0
+    reference_decode_context_schema: str = ""
     control_ticks_per_policy_step: int = 1
     behavior_policy_version: int = 0
     save_camera_dir: Path | None = None
@@ -468,7 +485,10 @@ class _Session:
                         "a predecessor-only feedback interval must end in "
                         "termination or truncation"
                     )
-                payload["feedback_trace"] = _feedback_trace_payload(trace)
+                payload["feedback_trace"] = _feedback_trace_payload(
+                    trace,
+                    joint_names=self.joint_names,
+                )
                 self.outputs[match_index] = replace(
                     output,
                     replay_data=replace(output.replay_data, payload=payload),
@@ -625,6 +645,7 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
         *,
         require_policy_camera: bool = False,
     ) -> None:
+        ensure_humanoid_reference_decode_context_abi()
         if require_policy_camera:
             ensure_humanoid_policy_camera_abi()
         self._policy_factory = policy_factory
@@ -694,6 +715,7 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
                 reference_joint_names: tuple[str, ...] = ()
                 reference_frame_count = 0
                 reference_sample_period_us = 0
+                reference_decode_context_schema = ""
                 control_ticks_per_policy_step = 1
                 if execution_mode == HUMANOID_EXECUTION_MODE_MOTION_REFERENCE:
                     (
@@ -701,6 +723,7 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
                         reference_frame_count,
                         reference_sample_period_us,
                         control_ticks_per_policy_step,
+                        reference_decode_context_schema,
                     ) = _validate_motion_reference_session(request)
                 else:
                     if _message_has_fields(getattr(request, "reference_spec", None)):
@@ -742,6 +765,7 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
                     reference_joint_names=reference_joint_names,
                     reference_frame_count=reference_frame_count,
                     reference_sample_period_us=reference_sample_period_us,
+                    reference_decode_context_schema=reference_decode_context_schema,
                     control_ticks_per_policy_step=control_ticks_per_policy_step,
                     behavior_policy_version=behavior_policy_version,
                     save_camera_dir=save_camera_dir,
@@ -890,19 +914,20 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
         for policy_input, output in zip(policy_inputs, ordered_outputs, strict=True):
             action_values: torch.Tensor | None = None
             motion_reference: HumanoidMotionReference | None = None
+            reference_sha256: str | None = None
             if session.execution_mode == HUMANOID_EXECUTION_MODE_MOTION_REFERENCE:
                 if output.action is not None or output.motion_reference is None:
                     raise ValueError(
                         "motion-reference session requires exactly one motion_reference output"
                     )
                 motion_reference = output.motion_reference
-                plan_updates.append(
-                    _plan_update_from_output(
-                        output=output,
-                        policy_input=policy_input,
-                        session=session,
-                    )
+                plan_update = _plan_update_from_output(
+                    output=output,
+                    policy_input=policy_input,
+                    session=session,
                 )
+                plan_updates.append(plan_update)
+                reference_sha256 = str(plan_update.reference_sha256)
             else:
                 if output.action is None or output.motion_reference is not None:
                     raise ValueError(
@@ -933,6 +958,7 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
                     output=output,
                     action_values=action_values,
                     motion_reference=motion_reference,
+                    reference_sha256=reference_sha256,
                 )
             )
         session.record_outputs(tuple(recorded))
@@ -1093,7 +1119,8 @@ def _encoded_image_size(
                 )
             if image.mode != "RGB":
                 raise ValueError("policy camera image must be HWC uint8 RGB")
-            size = tuple(int(value) for value in image.size)
+            width, height = image.size
+            size = (int(width), int(height))
             if expected_size is not None and size != expected_size:
                 raise ValueError(
                     "policy camera encoded raster does not match its session spec"
@@ -1163,7 +1190,7 @@ def _policy_camera_contract(
 def _route_camera_frames(
     *,
     states: Iterable[HumanoidEnvState],
-    camera_images: Iterable[object],
+    camera_images: Iterable[humanoid_pb2.HumanoidCameraImage],
     observation_timestamp_us: int,
     observation_decision_id: int,
     joint_names: tuple[str, ...],
@@ -1352,7 +1379,7 @@ def _route_camera_frames(
 def _camera_frames_by_env(
     *,
     states: Iterable[HumanoidEnvState],
-    camera_images: Iterable[object],
+    camera_images: Iterable[humanoid_pb2.HumanoidCameraImage],
     observation_timestamp_us: int,
     observation_decision_id: int,
     joint_names: tuple[str, ...],
@@ -1433,7 +1460,7 @@ def _message_has_fields(value: object | None) -> bool:
 
 def _validate_motion_reference_session(
     request: HumanoidPolicySessionRequest,
-) -> tuple[tuple[str, ...], int, int, int]:
+) -> tuple[tuple[str, ...], int, int, int, str]:
     """Validate one supported 50 Hz motion-reference wire ABI."""
     spec = request.reference_spec
     joint_names = tuple(str(name) for name in spec.joint_names)
@@ -1464,7 +1491,21 @@ def _validate_motion_reference_session(
             f"H={frame_count}, period={sample_period_us}, K={control_ticks}; "
             "expected H=50, period=20000us, replan_ticks=25"
         )
-    return joint_names, frame_count, sample_period_us, control_ticks
+    decode_context_schema = str(spec.decode_context_schema)
+    if decode_context_schema not in {
+        "",
+        humanoid_contracts.HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA,
+    }:
+        raise ValueError(
+            "motion-reference session has an unsupported decode_context_schema"
+        )
+    return (
+        joint_names,
+        frame_count,
+        sample_period_us,
+        control_ticks,
+        decode_context_schema,
+    )
 
 
 def _validate_policy_request_kind(
@@ -1674,10 +1715,6 @@ def _plan_update_from_output(
         raise ValueError("motion reference_id must be positive")
     if reference.source_decision_id != policy_input.decision_id:
         raise ValueError("motion reference source_decision_id does not match request")
-    digest = _require_lowercase_sha256(
-        "motion reference_sha256",
-        reference.reference_sha256,
-    )
     if len(reference.frames) != session.reference_frame_count:
         raise ValueError(
             f"motion reference must contain {session.reference_frame_count} frames"
@@ -1755,16 +1792,102 @@ def _plan_update_from_output(
                 ),
             )
         )
-    return HumanoidPlanUpdate(
+
+    decode_context_message: humanoid_pb2.HumanoidReferenceDecodeContext | None = None
+    decode_context = reference.decode_context
+    if not session.reference_decode_context_schema:
+        if decode_context is not None:
+            raise ValueError(
+                "motion reference decode context was not negotiated by the session"
+            )
+    else:
+        if decode_context is None:
+            raise ValueError(
+                "motion reference is missing its negotiated decode context"
+            )
+        if decode_context.schema != session.reference_decode_context_schema:
+            raise ValueError(
+                "motion reference decode-context schema does not match the session"
+            )
+        chunk_base_quaternion = _finite_vector(
+            "motion decode-context chunk_base_quaternion_wxyz",
+            decode_context.chunk_base_quaternion_wxyz,
+            4,
+        )
+        if not torch.isclose(
+            torch.linalg.vector_norm(chunk_base_quaternion),
+            torch.tensor(1.0),
+            rtol=0.0,
+            atol=1.0e-5,
+        ):
+            raise ValueError(
+                "motion decode-context chunk_base_quaternion_wxyz must be normalized"
+            )
+        if not torch.allclose(
+            chunk_base_quaternion,
+            policy_input.qpos[3:7],
+            rtol=0.0,
+            atol=1.0e-5,
+        ):
+            raise ValueError(
+                "motion decode-context chunk-base quaternion does not match "
+                "the policy input"
+            )
+        local_xy = torch.as_tensor(
+            decode_context.local_xy_from_frame_zero,
+            dtype=torch.float32,
+        )
+        if (
+            tuple(local_xy.shape)
+            != (
+                session.reference_frame_count,
+                2,
+            )
+            or not torch.isfinite(local_xy).all()
+        ):
+            raise ValueError(
+                "motion decode-context local_xy_from_frame_zero must be a finite "
+                f"[{session.reference_frame_count},2] matrix"
+            )
+        if not torch.equal(local_xy[0], torch.zeros(2, dtype=torch.float32)):
+            raise ValueError(
+                "motion decode-context local_xy_from_frame_zero row zero must be "
+                "exact zero"
+            )
+        decode_context_message = humanoid_pb2.HumanoidReferenceDecodeContext(
+            schema=decode_context.schema,
+            chunk_base_quaternion_wxyz=Quat(
+                w=float(chunk_base_quaternion[0]),
+                x=float(chunk_base_quaternion[1]),
+                y=float(chunk_base_quaternion[2]),
+                z=float(chunk_base_quaternion[3]),
+            ),
+            local_xy_from_frame_zero=local_xy.reshape(-1).tolist(),
+        )
+
+    update: HumanoidPlanUpdate = HumanoidPlanUpdate(
         env_id=int(output.env_id),
         reference_id=int(reference.reference_id),
         source_decision_id=int(reference.source_decision_id),
         valid=True,
         failure_reason="",
         frames=messages,
-        reference_sha256=digest,
         root_z_alignment_offset_m=float(reference.root_z_alignment_offset_m),
+        decode_context=decode_context_message,
     )
+    spec: HumanoidMotionReferenceSpec = HumanoidMotionReferenceSpec(
+        schema=_MOTION_REFERENCE_SCHEMA_H50,
+        joint_names=session.reference_joint_names,
+        frame_count=session.reference_frame_count,
+        sample_period_us=session.reference_sample_period_us,
+        control_ticks_per_policy_step=session.control_ticks_per_policy_step,
+        decode_context_schema=session.reference_decode_context_schema,
+    )
+    update.reference_sha256 = humanoid_contracts.humanoid_reference_sha256(
+        spec,
+        update,
+    )
+    return update
 
 
 def _finite_vector(name: str, value: object, length: int) -> torch.Tensor:
@@ -1781,11 +1904,33 @@ def _require_lowercase_sha256(name: str, value: object) -> str:
     return digest
 
 
-def _feedback_trace_payload(trace: HumanoidRealizedFeedbackTrace) -> dict[str, object]:
+def _ordered_joint_names_sha256(joint_names: tuple[str, ...]) -> str:
+    """Hash a non-empty ordered joint tuple with a stable JSON encoding."""
+
+    names = tuple(str(name) for name in joint_names)
+    if not names or len(set(names)) != len(names):
+        raise ValueError("joint_names must be a non-empty unique sequence")
+    encoded = json.dumps(
+        list(names),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _feedback_trace_payload(
+    trace: HumanoidRealizedFeedbackTrace,
+    *,
+    joint_names: tuple[str, ...],
+) -> dict[str, object]:
     """Return a transport-safe exact controller receipt for replay auditing."""
+    names = tuple(str(name) for name in joint_names)
     return {
         "env_id": trace.env_id,
         "source_decision_id": trace.source_decision_id,
+        "state_contract_schema": HUMANOID_FEEDBACK_STATE_CONTRACT_SCHEMA,
+        "joint_names": list(names),
+        "ordered_joint_names_sha256": _ordered_joint_names_sha256(names),
         "ticks": [
             {
                 "control_tick_offset": tick.control_tick_offset,
@@ -1900,6 +2045,7 @@ def _recorded_policy_output(
     output: HumanoidPolicyStepOutput,
     action_values: torch.Tensor | None,
     motion_reference: HumanoidMotionReference | None,
+    reference_sha256: str | None = None,
 ) -> PolicyOutput:
     model_extra = dict(output.model_extra or {})
     server_owned_metadata = {
@@ -1966,10 +2112,15 @@ def _recorded_policy_output(
         if action_values is not None:
             humanoid_payload.setdefault("action", action_values.detach().cpu())
         if motion_reference is not None:
+            if reference_sha256 is None:
+                raise ValueError("recorded motion reference is missing its wire digest")
             expected_identity = {
                 "reference_id": int(motion_reference.reference_id),
                 "source_decision_id": int(motion_reference.source_decision_id),
-                "reference_sha256": str(motion_reference.reference_sha256),
+                "reference_sha256": _require_lowercase_sha256(
+                    "motion reference wire digest",
+                    reference_sha256,
+                ),
                 "root_z_alignment_offset_m": float(
                     motion_reference.root_z_alignment_offset_m
                 ),

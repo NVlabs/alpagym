@@ -255,6 +255,60 @@ def test_ppo_prepare_keeps_actor_invalid_transition_in_gae_and_value_targets(
     )
 
 
+def test_ppo_prepare_compacts_padding_after_gae_on_single_gpu(
+    cosmos_stubs: None,
+) -> None:
+    """Single-GPU replay drops fake visual rows but keeps critic-only rows.
+
+    The padding row is present while GAE is computed and only then removed.
+    The terminal non-padding row has ``actor_valid=False``: it must remain in
+    the replay pool with a return target even though its actor advantage is
+    zero.
+    """
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer.data_packer = _PpoActorValidityAndPaddingPacker()
+    trainer.parallel_dims = SimpleNamespace(world_size=1)
+    trainer._normalize_advantages = False
+    trainer._gamma = 1.0
+    trainer._gae_lambda = 1.0
+    gae_padding_masks: list[list[bool]] = []
+    compute_gae = trainer._compute_gae
+
+    def _record_gae_input(step_samples: list[Any]) -> tuple[list[float], list[float]]:
+        gae_padding_masks.append(
+            [bool(step.training_signal.is_padding.item()) for step in step_samples]
+        )
+        return compute_gae(step_samples)
+
+    trainer._compute_gae = _record_gae_input
+    rollouts = [
+        SimpleNamespace(
+            prompt="a",
+            completion="a",
+            n_ignore_prefix_tokens=0,
+            advantage=99.0,
+            weight_version=0,
+        )
+    ]
+
+    samples, advantages = trainer._prepare_training_data(rollouts)
+
+    assert gae_padding_masks == [[False, False, True]]
+    assert len(samples) == 2
+    assert all(not bool(sample.training_signal.is_padding.item()) for sample in samples)
+    assert [bool(sample.training_signal.actor_valid.item()) for sample in samples] == [
+        True,
+        False,
+    ]
+    torch.testing.assert_close(advantages, torch.tensor([2.0, 0.0]))
+    torch.testing.assert_close(
+        torch.cat([sample.training_signal.returns for sample in samples]),
+        torch.tensor([2.0, 1.0]),
+    )
+
+
 def test_ppo_smdp_gae_discounts_variable_controller_tick_blocks(
     cosmos_stubs: None,
 ) -> None:
@@ -508,6 +562,47 @@ def test_ppo_smoke_rl_training_step_with_mlp_actor_and_value_network(
         log_std_before,
     )
     assert _parameters_changed(model.value_net, value_before)
+
+
+def test_ppo_step_microbatches_accumulate_one_exact_optimizer_update(
+    cosmos_stubs: None,
+) -> None:
+    """GPU microbatches equal one full-batch PPO update with mixed masks.
+
+    Actor and critic reductions have different denominators because two real
+    rows are critic-only. Splitting the four rows into two forwards must scale
+    those losses independently, accumulate gradients, and call ``step`` once.
+    """
+    del cosmos_stubs
+    samples, advantages = _ppo_accumulation_samples()
+    full_batch = _trainer_for_ppo_accumulation_test(step_mini_batch=4)
+    micro_batch = _trainer_for_ppo_accumulation_test(step_mini_batch=2)
+
+    torch.manual_seed(31)
+    full_metrics = full_batch._run_training_loop(samples, advantages, object())
+    torch.manual_seed(31)
+    micro_metrics = micro_batch._run_training_loop(samples, advantages, object())
+
+    assert full_batch.optimizers.step_calls == 1
+    assert micro_batch.optimizers.step_calls == 1
+    assert full_metrics[2] == 1
+    assert micro_metrics[2] == 1
+    assert full_batch._last_micro_batches == 1
+    assert micro_batch._last_micro_batches == 2
+    assert full_batch.model.actor_weight.item() != 0.0
+    assert full_batch.model.value_weight.item() != 0.0
+    torch.testing.assert_close(
+        micro_batch.model.actor_weight,
+        full_batch.model.actor_weight,
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    )
+    torch.testing.assert_close(
+        micro_batch.model.value_weight,
+        full_batch.model.value_weight,
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    )
 
 
 def test_ppo_minibatch_trains_value_head(cosmos_stubs: None) -> None:
@@ -819,6 +914,94 @@ def test_step_training_success_reports_scalar_scheduler_lr(
     assert metrics["train/kl_avg"] == 0.125
     assert metrics["train/clip_fraction"] == 0.25
     assert scheduler.steps == 1
+
+
+def test_ppo_pre_update_behavior_kl_guard_rejects_before_training(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An already-diverged replay batch must not apply another PPO update."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = _ppo_step_guard_trainer(trainer_module)
+    events: list[str] = []
+    monkeypatch.setattr(
+        trainer_module, "filter_trainable_rollouts", lambda rollouts, **kwargs: rollouts
+    )
+    trainer._pre_update_diagnostics = lambda samples: {
+        "train/pre_update_approx_kl": 0.25,
+        "train/pre_update_valid_rows": len(samples),
+    }
+    trainer._post_update_diagnostics = lambda samples: {
+        "train/post_update_approx_kl": 0.0,
+        "train/post_update_valid_rows": len(samples),
+    }
+
+    def _unexpected_training(*args: Any) -> Any:
+        del args
+        events.append("train")
+        raise AssertionError("training ran after the pre-update KL guard failed")
+
+    trainer._run_training_loop = _unexpected_training
+
+    with pytest.raises(FloatingPointError, match="pre-update.*behavior KL"):
+        trainer.step_training(
+            rollouts=[object()],
+            current_step=1,
+            total_steps=1,
+            remain_samples_num=0,
+            inter_policy_nccl=object(),
+            is_master_replica=True,
+        )
+
+    assert events == []
+    assert trainer.lr_schedulers.steps == 0
+    assert trainer.saved_checkpoints == []
+
+
+def test_ppo_post_update_behavior_kl_guard_precedes_scheduler_and_checkpoint(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bad candidate update cannot advance LR state or become a checkpoint."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = _ppo_step_guard_trainer(trainer_module)
+    events: list[str] = []
+    monkeypatch.setattr(
+        trainer_module, "filter_trainable_rollouts", lambda rollouts, **kwargs: rollouts
+    )
+    trainer._pre_update_diagnostics = lambda samples: {
+        "train/pre_update_approx_kl": 0.01,
+        "train/pre_update_valid_rows": len(samples),
+    }
+    trainer._post_update_diagnostics = lambda samples: {
+        "train/post_update_approx_kl": 0.25,
+        "train/post_update_valid_rows": len(samples),
+    }
+
+    def _record_training(
+        *args: Any,
+    ) -> tuple[float, float, int, float, float, float, float]:
+        del args
+        events.append("train")
+        return (1.0, 0.0, 1, 1.0, 1.0, 0.0, 0.0)
+
+    trainer._run_training_loop = _record_training
+
+    with pytest.raises(FloatingPointError, match="post-update.*behavior KL"):
+        trainer.step_training(
+            rollouts=[object()],
+            current_step=1,
+            total_steps=1,
+            remain_samples_num=0,
+            inter_policy_nccl=object(),
+            is_master_replica=True,
+        )
+
+    assert events == ["train"]
+    assert trainer.lr_schedulers.steps == 0
+    assert trainer.saved_checkpoints == []
 
 
 def test_final_checkpoint_respects_disabled_safetensors_export(
@@ -1303,6 +1486,39 @@ class _ListLRScheduler:
         self.steps += 1
 
 
+def _ppo_step_guard_trainer(trainer_module: Any) -> Any:
+    """Build a stubbed PPO trainer whose KL-guard ordering is observable."""
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer.lr_schedulers = _ListLRScheduler(0.05)
+    trainer.parallel_dims = SimpleNamespace(
+        dp_replicate_enabled=False,
+        dp_shard_enabled=False,
+        cp_enabled=False,
+    )
+    trainer._group_size = 1
+    trainer._mini_batch = 1
+    trainer._grpo_optimization_iterations = 1
+    trainer._allowed_outdated_steps = 100
+    trainer._target_behavior_kl = 0.1
+    trainer.config = SimpleNamespace(
+        train=SimpleNamespace(
+            train_batch_per_replica=1,
+            ckpt=SimpleNamespace(enable_checkpoint=True),
+        )
+    )
+    trainer._prepare_training_data = lambda rollouts: (
+        [object()],
+        torch.tensor([0.5], dtype=torch.float32),
+    )
+    trainer.saved_checkpoints = []
+
+    def _record_save(step: int, steps: int, remaining: int) -> None:
+        trainer.saved_checkpoints.append((step, steps, remaining))
+
+    trainer._save_checkpoint = _record_save
+    return trainer
+
+
 class _PerStepPacker:
     """Packer returning a per-rollout list of single-step samples for flattening."""
 
@@ -1386,6 +1602,108 @@ def _trainer_for_ppo_replay_test(model: torch.nn.Module) -> Any:
     trainer.data_packer = _PpoSignalCapturingPacker()
     trainer.all_reduce_states = MethodType(_step_without_distributed, trainer)
     return trainer
+
+
+def _trainer_for_ppo_accumulation_test(*, step_mini_batch: int) -> Any:
+    """Build a scalar actor-critic trainer for exact accumulation checks."""
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer.device = torch.device("cpu")
+    trainer._reference_model = None
+    trainer._grpo_ratio_clip_low = 0.2
+    trainer._grpo_ratio_clip_high = 0.2
+    trainer._grpo_optimization_iterations = 1
+    trainer._mini_batch = step_mini_batch
+    trainer._kl_beta = 0.0
+    trainer._value_loss_coef = 1.0
+    trainer._value_clip_range = None
+    trainer._value_huber_delta = None
+    trainer._flow_chunk_density = False
+    trainer._dual_clip_ratio = None
+    trainer.model = _ScalarActorCriticModel()
+    trainer.optimizers = _CountingSGD(trainer.model.parameters(), lr=0.05)
+    trainer.data_packer = _StackingPpoPacker()
+    trainer._ensure_reference_model = MethodType(_noop_reference_model, trainer)
+    trainer.all_reduce_states = MethodType(_step_without_distributed, trainer)
+    return trainer
+
+
+def _noop_reference_model(self: Any) -> None:
+    """Leave the optional fixed-reference policy disabled in unit tests."""
+    del self
+
+
+def _ppo_accumulation_samples() -> tuple[list[TrainerReplayData], torch.Tensor]:
+    """Return four real PPO rows with two actor and four critic targets."""
+    actor_valid = (True, False, True, False)
+    advantage_values = (1.0, 0.0, -2.0, 0.0)
+    returns = (1.0, 2.0, -1.0, 4.0)
+    samples = [
+        TrainerReplayData(
+            model_inputs={"features": torch.tensor([float(index + 1)])},
+            training_signal=TrainingSignal(
+                old_logprobs=torch.zeros(1, dtype=torch.float32),
+                is_padding=torch.zeros(1, dtype=torch.bool),
+                actor_valid=torch.tensor([actor_valid[index]], dtype=torch.bool),
+                advantages=torch.tensor([advantage_values[index]], dtype=torch.float32),
+                returns=torch.tensor([returns[index]], dtype=torch.float32),
+                old_values=torch.zeros(1, dtype=torch.float32),
+            ),
+            rollout_id=f"accum-{index}",
+            weight_version=torch.zeros((), dtype=torch.int64),
+        )
+        for index in range(4)
+    ]
+    return samples, torch.tensor(advantage_values, dtype=torch.float32)
+
+
+class _CountingSGD(torch.optim.SGD):
+    """SGD optimizer exposing how many parameter updates were applied."""
+
+    def __init__(self, params: Any, *, lr: float) -> None:
+        """Initialize SGD and its observable step counter."""
+        super().__init__(params, lr=lr)
+        self.step_calls = 0
+
+    def step(self, closure: Any = None) -> Any:
+        """Count and delegate one optimizer update."""
+        self.step_calls += 1
+        return super().step(closure)
+
+
+class _StackingPpoPacker:
+    """Collate the exact subset selected by the trainer microbatch loop."""
+
+    def policy_collate_fn(
+        self, samples: list[TrainerReplayData]
+    ) -> TrainerReplayDataBatch:
+        """Stack single-row replay objects without synthesizing extra rows."""
+        return TrainerReplayDataBatch.stack(samples)
+
+
+class _ScalarActorCriticModel(torch.nn.Module):
+    """Independent scalar actor and critic used for accumulation equivalence."""
+
+    def __init__(self) -> None:
+        """Initialize both linear coefficients at the behavior policy."""
+        super().__init__()
+        self.actor_weight = torch.nn.Parameter(torch.tensor(0.0))
+        self.value_weight = torch.nn.Parameter(torch.tensor(0.0))
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        return_log_prob: bool = True,
+        teacher_model: Any = None,
+    ) -> dict[str, torch.Tensor | None]:
+        """Score each row with independent actor and critic coefficients."""
+        del return_log_prob, teacher_model
+        flattened = features.float().reshape(-1)
+        return {
+            "log_probs": flattened * self.actor_weight,
+            "values": flattened * self.value_weight,
+            "kl_div": None,
+        }
 
 
 class _ActorCriticValueModel(torch.nn.Module):
@@ -1494,6 +1812,40 @@ class _PpoActorValidityPacker:
             )
             for index in range(2)
         ]
+
+
+class _PpoActorValidityAndPaddingPacker:
+    """Two real transitions followed by one packer-added visual padding row."""
+
+    def get_policy_input(
+        self,
+        prompt: str,
+        completion: str,
+        n_ignore_prefix_tokens: int = 0,
+    ) -> list[TrainerReplayData]:
+        """Return actor-valid, critic-only, then padding rows in one rollout."""
+        del prompt, completion, n_ignore_prefix_tokens
+        rows: list[TrainerReplayData] = []
+        for index in range(3):
+            is_padding = index == 2
+            rows.append(
+                TrainerReplayData(
+                    model_inputs={"x": torch.tensor([float(index)])},
+                    training_signal=TrainingSignal(
+                        old_logprobs=torch.zeros(1, dtype=torch.float32),
+                        is_padding=torch.tensor([is_padding], dtype=torch.bool),
+                        rewards=torch.tensor(
+                            [100.0 if is_padding else 1.0], dtype=torch.float32
+                        ),
+                        terminateds=torch.tensor([index == 1], dtype=torch.bool),
+                        old_values=torch.zeros(1, dtype=torch.float32),
+                        actor_valid=torch.tensor([index == 0], dtype=torch.bool),
+                    ),
+                    rollout_id="actor-validity-padding",
+                    weight_version=torch.zeros((), dtype=torch.int64),
+                )
+            )
+        return rows
 
 
 def _direct_ppo_sample(

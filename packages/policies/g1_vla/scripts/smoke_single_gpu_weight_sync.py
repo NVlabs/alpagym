@@ -40,7 +40,7 @@ def _parse_args() -> argparse.Namespace:
         help="Pinned VLA model directory under alpa_policy_eval/models.",
     )
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--instruction", default="Walk up the stairs safely.")
+    parser.add_argument("--instruction", default="walk ahead.")
     return parser.parse_args()
 
 

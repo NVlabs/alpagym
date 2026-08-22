@@ -47,7 +47,12 @@ _HUMANOID_REQUIRED_FIELDS: Mapping[str, frozenset[str]] = {
             "frames",
             "reference_sha256",
             "root_z_alignment_offset_m",
+            "decode_context",
         }
+    ),
+    "HumanoidMotionReferenceSpec": frozenset({"decode_context_schema"}),
+    "HumanoidReferenceDecodeContext": frozenset(
+        {"schema", "chunk_base_quaternion_wxyz", "local_xy_from_frame_zero"}
     ),
     "HumanoidRealizedControlTick": frozenset(
         {
@@ -204,6 +209,26 @@ def ensure_humanoid_policy_camera_abi() -> None:
         ) from exc
 
 
+def ensure_humanoid_reference_decode_context_abi() -> None:
+    """Require the protobuf links and shared source-hash contract used by plans."""
+    try:
+        humanoid_pb2 = importlib.import_module("alpasim_grpc.v0.humanoid_pb2")
+        humanoid_contracts = importlib.import_module(
+            "alpasim_grpc.v0.humanoid_contracts"
+        )
+        _validate_humanoid_reference_decode_context_abi(
+            humanoid_pb2.DESCRIPTOR,
+            humanoid_contracts,
+        )
+    except (AttributeError, ImportError, RuntimeError) as exc:
+        raise RuntimeError(
+            "humanoid motion-reference planning requires a matching alpasim-grpc "
+            "build with decode-context fields and the shared source-hash helper. "
+            "Install the matching AlpaSim gRPC package or set ALPASIM_GRPC_ROOT "
+            "to its src/grpc directory."
+        ) from exc
+
+
 def _validate_humanoid_policy_camera_abi(
     descriptor: Any,
     humanoid_contracts: Any,
@@ -249,6 +274,52 @@ def _validate_humanoid_policy_camera_abi(
             )
 
 
+def _validate_humanoid_reference_decode_context_abi(
+    descriptor: Any,
+    humanoid_contracts: Any,
+) -> None:
+    """Validate plan decode-context protobuf links and shared hash domains."""
+    source = "alpasim_grpc.v0.humanoid_pb2"
+    requirements = {
+        "HumanoidMotionReferenceSpec": frozenset({"decode_context_schema"}),
+        "HumanoidPlanUpdate": frozenset({"decode_context"}),
+        "HumanoidReferenceDecodeContext": frozenset(
+            {"schema", "chunk_base_quaternion_wxyz", "local_xy_from_frame_zero"}
+        ),
+    }
+    _validate_descriptor_fields(descriptor, requirements, source=source)
+    messages = descriptor.message_types_by_name
+    _validate_message_field_type(
+        owner=messages["HumanoidPlanUpdate"],
+        field_name="decode_context",
+        expected=messages["HumanoidReferenceDecodeContext"],
+        source=source,
+    )
+    schema = getattr(
+        humanoid_contracts,
+        "HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA",
+        None,
+    )
+    if not isinstance(schema, str) or not schema:
+        raise RuntimeError(
+            "alpasim_grpc.v0.humanoid_contracts has an incompatible "
+            "HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA"
+        )
+    for name in (
+        "HUMANOID_REFERENCE_HASH_DOMAIN_V1",
+        "HUMANOID_REFERENCE_HASH_DOMAIN_V2",
+    ):
+        if not isinstance(getattr(humanoid_contracts, name, None), bytes):
+            raise RuntimeError(
+                f"alpasim_grpc.v0.humanoid_contracts has an incompatible {name}"
+            )
+    if not callable(getattr(humanoid_contracts, "humanoid_reference_sha256", None)):
+        raise RuntimeError(
+            "alpasim_grpc.v0.humanoid_contracts is missing callable "
+            "humanoid_reference_sha256"
+        )
+
+
 def _validate_message_field_type(
     *,
     owner: Any,
@@ -261,7 +332,7 @@ def _validate_message_field_type(
     actual = getattr(field, "message_type", None)
     if actual is not expected:
         raise RuntimeError(
-            f"{source} is incompatible with the strict humanoid policy-camera ABI: "
+            f"{source} is incompatible with the strict humanoid wire ABI: "
             f"field {field_name!r} does not reference the matching message type"
         )
 
@@ -269,11 +340,16 @@ def _validate_message_field_type(
 def _validate_humanoid_grpc_abi() -> None:
     """Fail closed when generated protos cannot carry correct PPO transitions."""
     humanoid_pb2 = importlib.import_module("alpasim_grpc.v0.humanoid_pb2")
+    humanoid_contracts = importlib.import_module("alpasim_grpc.v0.humanoid_contracts")
     runtime_pb2 = importlib.import_module("alpasim_grpc.v0.runtime_pb2")
     _validate_descriptor_fields(
         humanoid_pb2.DESCRIPTOR,
         _HUMANOID_REQUIRED_FIELDS,
         source="alpasim_grpc.v0.humanoid_pb2",
+    )
+    _validate_humanoid_reference_decode_context_abi(
+        humanoid_pb2.DESCRIPTOR,
+        humanoid_contracts,
     )
     _validate_descriptor_enums(
         humanoid_pb2.DESCRIPTOR,

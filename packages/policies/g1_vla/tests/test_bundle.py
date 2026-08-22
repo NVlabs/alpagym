@@ -12,15 +12,23 @@ import torch
 from alpagym_host.config import CosmosRLMode, TransportKind
 
 from alpagym_g1_vla.bundle import (
+    FLOW_SDE_TRAINING,
     MODEL_FAMILY,
+    NATIVE_ODE_QUALIFICATION,
+    QUALIFICATION_REPLAY_SCHEMA,
     REPLAY_SCHEMA,
     build_data_packer,
     build_model_inputs,
     get_bundle,
     load_inference_model,
+    vla_sampling_mode,
 )
 from alpagym_g1_vla.model import VlaPsiActorCritic
-from alpagym_g1_vla.provenance import MODEL_ID, RUN_CONFIG_SHA256
+from alpagym_g1_vla.provenance import (
+    MODEL_ID,
+    RUN_CONFIG_SHA256,
+    STAIRSBLOCKS_VLA_BUNDLE_PROFILE,
+)
 from alpagym_runtime.replay import (
     ActionSelection,
     PolicyReplayData,
@@ -34,17 +42,21 @@ def _run_config(
     *,
     expected_schedule_sha256: str = "a" * 64,
     model_path: Path | str = f"/test/models/{MODEL_ID}",
+    sampling_mode: str = FLOW_SDE_TRAINING,
+    return_trace_for_rl: bool = True,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         policy=SimpleNamespace(
             model=SimpleNamespace(
                 bundle_config={
+                    "sampling_mode": sampling_mode,
                     "expected_schedule_sha256": expected_schedule_sha256,
                     "expected_flow_noise_level": 0.4,
                     "expected_flow_ignore_last": True,
                 },
                 path=str(model_path),
-            )
+            ),
+            inference=SimpleNamespace(return_trace_for_rl=return_trace_for_rl),
         ),
         expected_valid_steps=2,
         transport=SimpleNamespace(kind=TransportKind.disk),
@@ -57,6 +69,7 @@ def _replay(
     input_ids: list[int] | None = None,
     image_grid_thw: torch.Tensor | None = None,
     include_pooling_metadata: bool = True,
+    run_config_sha256: str = RUN_CONFIG_SHA256,
 ) -> PolicyReplayData:
     if input_ids is None:
         input_ids = [101, 102, 103]
@@ -85,7 +98,8 @@ def _replay(
         "schedule_sha256": "a" * 64,
         "flow_noise_level": 0.4,
         "flow_ignore_last": True,
-        "run_config_sha256": RUN_CONFIG_SHA256,
+        "run_config_sha256": run_config_sha256,
+        "sampling_mode": FLOW_SDE_TRAINING,
         "humanoid": {"vla_raw_action_rows": wire_actions.clone()},
     }
     if include_pooling_metadata:
@@ -132,6 +146,49 @@ def test_bundle_uses_the_generic_vla_replay_identity() -> None:
     assert REPLAY_SCHEMA == "g1_vla.flow_sde.v1"
 
 
+def test_sampling_mode_is_explicit_and_paired_with_replay_trace_contract() -> None:
+    """Only Flow-SDE may request PPO traces; native ODE is qualification-only."""
+    assert vla_sampling_mode(_run_config()) == FLOW_SDE_TRAINING
+    assert (
+        vla_sampling_mode(
+            _run_config(
+                sampling_mode=NATIVE_ODE_QUALIFICATION,
+                return_trace_for_rl=False,
+            )
+        )
+        == NATIVE_ODE_QUALIFICATION
+    )
+
+    config = _run_config()
+    del config.policy.model.bundle_config["sampling_mode"]
+    with pytest.raises(ValueError, match="sampling_mode"):
+        vla_sampling_mode(config)
+    with pytest.raises(ValueError, match="return_trace_for_rl=true"):
+        vla_sampling_mode(_run_config(return_trace_for_rl=False))
+    with pytest.raises(ValueError, match="return_trace_for_rl=false"):
+        vla_sampling_mode(_run_config(sampling_mode=NATIVE_ODE_QUALIFICATION))
+
+
+def test_native_qualification_replay_cannot_enter_trainer() -> None:
+    """Both config construction and replay parsing reject ODE qualification."""
+    qualification_config = _run_config(
+        sampling_mode=NATIVE_ODE_QUALIFICATION,
+        return_trace_for_rl=False,
+    )
+    with pytest.raises(ValueError, match="trainer replay requires"):
+        build_model_inputs(qualification_config)
+    with pytest.raises(ValueError, match="trainer data packing requires"):
+        build_data_packer(qualification_config, cosmos_role="Controller")
+
+    qualification_replay = replace(
+        _replay(),
+        payload_schema=QUALIFICATION_REPLAY_SCHEMA,
+        old_logprob=None,
+    )
+    with pytest.raises(ValueError, match="payload_schema"):
+        build_model_inputs(_run_config())(qualification_replay)
+
+
 def test_parser_builds_full_chunk_density_and_action_replay() -> None:
     replay = _replay()
     model_inputs, old_logprob = build_model_inputs(_run_config())(replay)
@@ -139,6 +196,24 @@ def test_parser_builds_full_chunk_density_and_action_replay() -> None:
     torch.testing.assert_close(
         old_logprob, replay.payload["old_element_logprobs"].sum()
     )
+
+
+def test_parser_selects_replay_identity_from_registered_model_path() -> None:
+    profile = STAIRSBLOCKS_VLA_BUNDLE_PROFILE
+    config = _run_config(model_path=f"/test/models/{profile.model_id}")
+    replay = _replay(run_config_sha256=profile.run_config_sha256)
+
+    build_model_inputs(config)(replay)
+
+    wrong_payload = dict(replay.payload)
+    wrong_payload["run_config_sha256"] = RUN_CONFIG_SHA256
+    with pytest.raises(ValueError, match="attested checkpoint"):
+        build_model_inputs(config)(replace(replay, payload=wrong_payload))
+
+
+def test_parser_rejects_unknown_model_profile() -> None:
+    with pytest.raises(ValueError, match="unattested VLA model ID"):
+        build_model_inputs(_run_config(model_path="/test/models/unregistered-vla"))
 
 
 def test_parser_normalizes_uncompressed_visual_history_to_identity_pooling() -> None:
@@ -353,7 +428,7 @@ def test_pad_metadata_uses_only_resolved_model_path(tmp_path: Path) -> None:
     metadata = wrong_layout / "base_vlm" / "generation_config.json"
     metadata.parent.mkdir(parents=True)
     metadata.write_text('{"pad_token_id": 151643}', encoding="utf-8")
-    with pytest.raises(ValueError, match=r"models/qwen3vl"):
+    with pytest.raises(ValueError, match=r"models/<model_id>"):
         build_data_packer(
             _run_config(model_path=wrong_layout), cosmos_role="Controller"
         )

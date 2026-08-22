@@ -26,12 +26,18 @@ from alpagym_g1_vla.flow import (
     VLA_FLOW_IGNORE_LAST,
     VLA_FLOW_NOISE_LEVEL,
 )
-from alpagym_g1_vla.provenance import MODEL_ID, RUN_CONFIG_SHA256
+from alpagym_g1_vla.provenance import (
+    VlaBundleProfile,
+    vla_bundle_profile_for_model_root,
+)
 from alpagym_runtime.policies.registry import PolicyBundle
 from alpagym_runtime.replay import PolicyReplayData, require_payload_keys
 
 REPLAY_SCHEMA = "g1_vla.flow_sde.v1"
+QUALIFICATION_REPLAY_SCHEMA = "g1_vla.native_ode_qualification.v1"
 MODEL_FAMILY = "g1_vla"
+FLOW_SDE_TRAINING = "flow_sde_training"
+NATIVE_ODE_QUALIFICATION = "native_ode_qualification"
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -50,6 +56,10 @@ def setup_tokenizer(config: Any) -> Any:
 
 def build_data_packer(run_config: Any, cosmos_role: str | None) -> Any:
     """Build the generic replay packer with VLA's ragged collator."""
+    if vla_sampling_mode(run_config) != FLOW_SDE_TRAINING:
+        raise ValueError(
+            f"VLA trainer data packing requires sampling_mode={FLOW_SDE_TRAINING!r}"
+        )
     from alpagym_runtime.cosmos.packer import build_alpagym_data_packer
 
     bundle_config = _bundle_config(run_config)
@@ -96,8 +106,13 @@ def build_model_inputs(
     run_config: Any,
 ) -> Callable[[PolicyReplayData], tuple[dict[str, Any], torch.Tensor]]:
     """Return the strict parser for one VLA Flow-SDE replay row."""
+    if vla_sampling_mode(run_config) != FLOW_SDE_TRAINING:
+        raise ValueError(
+            f"VLA trainer replay requires sampling_mode={FLOW_SDE_TRAINING!r}"
+        )
     expected_schedule_sha256 = _expected_schedule_sha256(run_config)
     expected_noise_level, expected_ignore_last = _expected_flow_contract(run_config)
+    expected_run_config_sha256 = _selected_bundle_profile(run_config).run_config_sha256
 
     def _build(replay_data: PolicyReplayData) -> tuple[dict[str, Any], torch.Tensor]:
         if replay_data.replay_schema_version != 1:
@@ -140,9 +155,12 @@ def build_model_inputs(
                 "flow_ignore_last",
                 "run_config_sha256",
                 "old_element_logprobs",
+                "sampling_mode",
                 "humanoid",
             ),
         )
+        if replay_data.payload["sampling_mode"] != FLOW_SDE_TRAINING:
+            raise ValueError("VLA trainer replay requires Flow-SDE training samples")
         payload_schedule = _require_sha256(
             "schedule_sha256", replay_data.payload["schedule_sha256"]
         )
@@ -167,7 +185,7 @@ def build_model_inputs(
         replay_run_config_sha256 = _require_sha256(
             "run_config_sha256", replay_data.payload["run_config_sha256"]
         )
-        if replay_run_config_sha256 != RUN_CONFIG_SHA256:
+        if replay_run_config_sha256 != expected_run_config_sha256:
             raise ValueError(
                 "VLA replay run_config_sha256 does not match the attested checkpoint"
             )
@@ -404,6 +422,31 @@ def _bundle_config(run_config: Any) -> Mapping[str, Any]:
     return bundle_config
 
 
+def vla_sampling_mode(run_config: Any) -> str:
+    """Validate the bundle-owned rollout sampler and its replay contract.
+
+    Flow-SDE is the only trainable behavior distribution. Native ODE is a
+    rollout-only qualification path and must not request PPO replay traces.
+    """
+    bundle_config = _bundle_config(run_config)
+    mode = bundle_config.get("sampling_mode")
+    if mode not in {FLOW_SDE_TRAINING, NATIVE_ODE_QUALIFICATION}:
+        raise ValueError(
+            "VLA policy.model.bundle_config.sampling_mode must be "
+            f"{FLOW_SDE_TRAINING!r} or {NATIVE_ODE_QUALIFICATION!r}"
+        )
+    return_trace_for_rl = run_config.policy.inference.return_trace_for_rl
+    if not isinstance(return_trace_for_rl, bool):
+        raise TypeError("VLA policy.inference.return_trace_for_rl must be boolean")
+    if mode == FLOW_SDE_TRAINING and not return_trace_for_rl:
+        raise ValueError("VLA flow_sde_training requires return_trace_for_rl=true")
+    if mode == NATIVE_ODE_QUALIFICATION and return_trace_for_rl:
+        raise ValueError(
+            "VLA native_ode_qualification requires return_trace_for_rl=false"
+        )
+    return mode
+
+
 def _expected_schedule_sha256(run_config: Any) -> str:
     """Read and validate the mandatory behavior schedule identity."""
     bundle_config = _bundle_config(run_config)
@@ -439,10 +482,10 @@ def _expected_flow_contract(run_config: Any) -> tuple[float, bool]:
 
 
 def _attested_pad_token_id(run_config: Any) -> int:
-    """Read Qwen's pad token below the single resolved model root.
+    """Read Qwen's pad token below the selected registered model root.
 
     The model path is the only checkpoint-location authority.  Requiring the
-    exact ``models/<MODEL_ID>`` layout prevents an independently configured
+    exact ``models/<model_id>`` layout prevents an independently configured
     metadata root from silently describing a different checkpoint.
     """
     raw_model_path = Path(str(run_config.policy.model.path)).expanduser()
@@ -452,12 +495,9 @@ def _attested_pad_token_id(run_config: Any) -> int:
         raise FileNotFoundError(
             f"VLA policy.model.path does not exist: {raw_model_path}"
         ) from error
-    if (
-        not model_root.is_dir()
-        or model_root.name != MODEL_ID
-        or model_root.parent.name != "models"
-    ):
-        raise ValueError(f"VLA policy.model.path must resolve to .../models/{MODEL_ID}")
+    if not model_root.is_dir():
+        raise ValueError("VLA policy.model.path must resolve to a directory")
+    vla_bundle_profile_for_model_root(model_root)
     path = model_root / "base_vlm" / "generation_config.json"
     if not path.is_file() or path.is_symlink():
         raise FileNotFoundError(f"VLA generation metadata is missing: {path}")
@@ -465,6 +505,14 @@ def _attested_pad_token_id(run_config: Any) -> int:
     if not isinstance(raw, Mapping) or raw.get("pad_token_id") != 151643:
         raise ValueError("VLA base-VLM pad token identity changed")
     return 151643
+
+
+def _selected_bundle_profile(run_config: Any) -> VlaBundleProfile:
+    """Select immutable replay identity from the unique configured model path."""
+    model_root = (
+        Path(str(run_config.policy.model.path)).expanduser().resolve(strict=False)
+    )
+    return vla_bundle_profile_for_model_root(model_root)
 
 
 def _require_sha256(name: str, value: Any) -> str:

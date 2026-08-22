@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from alpagym_g1_vla.flow import VlaFlowSchedule
-from alpagym_g1_vla.model import VlaPsiActorCritic
+from alpagym_g1_vla.model import VlaPsiActorCritic, VlaQualificationSample
 from alpagym_g1_vla.normalization import VlaQ99Normalizer
 
 
@@ -116,6 +116,13 @@ def _schedule() -> VlaFlowSchedule:
     )
 
 
+def _qualification_schedule() -> VlaFlowSchedule:
+    return VlaFlowSchedule(
+        model_timesteps=torch.tensor([1000.0, 667.0, 334.0, 1.0]),
+        sigmas=torch.tensor([1.0, 0.667, 0.334, 0.001, 0.0]),
+    )
+
+
 def _normalizer() -> VlaQ99Normalizer:
     return VlaQ99Normalizer(
         state_q01=torch.zeros(29),
@@ -131,6 +138,8 @@ def _model() -> VlaPsiActorCritic:
     return VlaPsiActorCritic(
         psi_model=psi,
         schedule=_schedule(),
+        qualification_schedule=_qualification_schedule(),
+        qualification_clip_normalized_actions=False,
         noise_level=0.4,
         normalizer=_normalizer(),
         vlm_hidden_dim=8,
@@ -175,6 +184,8 @@ def test_constructor_requires_frozen_vlm_and_trainable_action_head() -> None:
         VlaPsiActorCritic(
             psi_model=psi,
             schedule=_schedule(),
+            qualification_schedule=_qualification_schedule(),
+            qualification_clip_normalized_actions=False,
             noise_level=0.4,
             normalizer=_normalizer(),
             vlm_hidden_dim=8,
@@ -188,6 +199,8 @@ def test_constructor_requires_frozen_vlm_and_trainable_action_head() -> None:
         VlaPsiActorCritic(
             psi_model=psi,
             schedule=_schedule(),
+            qualification_schedule=_qualification_schedule(),
+            qualification_clip_normalized_actions=False,
             noise_level=0.4,
             normalizer=_normalizer(),
             vlm_hidden_dim=8,
@@ -308,6 +321,64 @@ def test_rollout_sample_replays_exactly_under_the_same_weights() -> None:
         replayed["log_probs"], sample.old_log_probs, rtol=0, atol=0
     )
     torch.testing.assert_close(replayed["values"], sample.values, rtol=0, atol=0)
+
+
+def test_native_qualification_uses_only_initial_gaussian_and_returns_no_ppo() -> None:
+    """Native ODE consumes one latent draw and cannot expose trainer fields."""
+    model = _model().train()
+    inputs = _inputs(model)
+    prefix_actions = torch.zeros((2, 30, 38))
+    prefix_mask = torch.zeros((2, 30), dtype=torch.bool)
+    sample_kwargs = {
+        key: inputs[key]
+        for key in (
+            "input_ids",
+            "attention_mask",
+            "pixel_values",
+            "image_grid_thw",
+            "sequence_lengths",
+            "image_counts",
+            "image_offsets",
+            "image_patch_counts",
+            "patch_counts",
+            "patch_offsets",
+            "physical_states",
+        )
+    }
+    generator = torch.Generator().manual_seed(103)
+    expected_generator = torch.Generator().manual_seed(103)
+    torch.randn((2, 30, 38), generator=expected_generator)
+
+    sample = model.sample_actions_native_ode(
+        **sample_kwargs,
+        rtc_prefix_normalized_actions=prefix_actions,
+        rtc_prefix_mask=prefix_mask,
+        generator=generator,
+    )
+    replayed = model.sample_actions_native_ode(
+        **sample_kwargs,
+        rtc_prefix_normalized_actions=prefix_actions,
+        rtc_prefix_mask=prefix_mask,
+        generator=torch.Generator().manual_seed(103),
+    )
+
+    assert isinstance(sample, VlaQualificationSample)
+    assert torch.equal(generator.get_state(), expected_generator.get_state())
+    assert torch.equal(sample.density_latent, replayed.density_latent)
+    assert torch.equal(sample.clipped_normalized, replayed.clipped_normalized)
+    assert torch.equal(sample.denormalized_wire, replayed.denormalized_wire)
+    assert sample.schedule_sha256 == _qualification_schedule().sha256
+    assert sample.clip_normalized_actions is False
+    torch.testing.assert_close(
+        sample.denormalized_wire,
+        model.normalizer.denormalize_action(sample.density_latent),
+        rtol=0,
+        atol=0,
+    )
+    assert model.psi_model.action_header.calls == 8
+    for forbidden in ("trace", "old_element_logprobs", "old_log_probs", "values"):
+        assert not hasattr(sample, forbidden)
+    assert not model.psi_model.training
 
 
 def test_density_uses_preclip_chain_and_wire_views_fail_closed() -> None:

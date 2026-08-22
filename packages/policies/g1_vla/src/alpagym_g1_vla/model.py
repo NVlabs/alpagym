@@ -19,6 +19,7 @@ from alpagym_g1_vla.flow import (
     VlaFlowSchedule,
     VlaFlowTrace,
     replay_flow_transition_logprob,
+    sample_flow_ode,
     sample_flow_sde,
 )
 from alpagym_g1_vla.normalization import (
@@ -101,6 +102,29 @@ class VlaPolicySample:
         return self.old_element_logprobs.sum(dim=-1)
 
 
+@dataclass(frozen=True)
+class VlaQualificationSample:
+    """Native checkpoint action views without a trainable replay density."""
+
+    density_latent: torch.Tensor
+    clipped_normalized: torch.Tensor
+    denormalized_wire: torch.Tensor
+    schedule_sha256: str
+    clip_normalized_actions: bool
+
+    def __post_init__(self) -> None:
+        """Require all qualification views to describe the same ODE sample."""
+        VlaWireActions(
+            density_latent=self.density_latent,
+            clipped_normalized=self.clipped_normalized,
+            denormalized=self.denormalized_wire,
+        )
+        if len(self.schedule_sha256) != 64:
+            raise ValueError("VLA qualification schedule digest must be SHA-256")
+        if not isinstance(self.clip_normalized_actions, bool):
+            raise TypeError("VLA qualification clip flag must be boolean")
+
+
 class VlaPsiActorCritic(nn.Module):
     """Score native 30x38 Psi action chunks and estimate boundary values.
 
@@ -124,6 +148,8 @@ class VlaPsiActorCritic(nn.Module):
         *,
         psi_model: nn.Module,
         schedule: VlaFlowSchedule,
+        qualification_schedule: VlaFlowSchedule,
+        qualification_clip_normalized_actions: bool,
         noise_level: float,
         normalizer: VlaQ99Normalizer,
         vlm_hidden_dim: int,
@@ -138,7 +164,12 @@ class VlaPsiActorCritic(nn.Module):
                 already frozen. Its condition path and trainable action head
                 are called directly.
             schedule: Exact VLA model-timestep and sigma grid used during
-                rollout.
+                trainable Flow-SDE rollout.
+            qualification_schedule: Profile-owned deterministic ODE grid used
+                only by native rollout qualification.
+            qualification_clip_normalized_actions: Whether native
+                qualification clips its final flow output before q99 affine
+                denormalization.  This does not alter Flow-PPO dispatch.
             noise_level: Flow-SDE diffusion scale used during rollout.
             normalizer: Bundle-owned q01/q99 state and action transform.
             vlm_hidden_dim: Last-layer Qwen hidden width consumed by the critic.
@@ -162,6 +193,8 @@ class VlaPsiActorCritic(nn.Module):
                 "VLA RTC max_delay must be an integer in [2, 30] with an "
                 "exclusive upper bound"
             )
+        if not isinstance(qualification_clip_normalized_actions, bool):
+            raise TypeError("VLA qualification clip flag must be boolean")
         psi = cast(_PsiModelProtocol, psi_model)
         trainable_vlm = [
             name
@@ -180,6 +213,10 @@ class VlaPsiActorCritic(nn.Module):
 
         self.psi_model = psi_model
         self.schedule = schedule
+        self.qualification_schedule = qualification_schedule
+        self.qualification_clip_normalized_actions = (
+            qualification_clip_normalized_actions
+        )
         self.noise_level = float(noise_level)
         self.ignore_last = VLA_FLOW_IGNORE_LAST
         self.rtc_max_delay_exclusive = rtc_max_delay_exclusive
@@ -342,6 +379,122 @@ class VlaPsiActorCritic(nn.Module):
             denormalized_wire=wire.denormalized,
             trace=trace,
             values=values,
+        )
+
+    @torch.no_grad()
+    def sample_actions_native_ode(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        image_counts: torch.Tensor,
+        image_offsets: torch.Tensor,
+        image_patch_counts: torch.Tensor,
+        patch_counts: torch.Tensor,
+        patch_offsets: torch.Tensor,
+        physical_states: torch.Tensor,
+        rtc_prefix_normalized_actions: torch.Tensor,
+        rtc_prefix_mask: torch.Tensor,
+        generator: torch.Generator,
+        effective_image_grid_thw: torch.Tensor | None = None,
+        visual_pool_factors: torch.Tensor | None = None,
+        traj2ds: torch.Tensor | None = None,
+    ) -> VlaQualificationSample:
+        """Run the checkpoint's native qualification sampler.
+
+        This path consumes exactly one initial Gaussian latent and then applies
+        deterministic Euler integration on the selected bundle profile's
+        serving grid. It intentionally returns no Flow-SDE trace,
+        log-probability, or critic value and therefore cannot be used as a PPO
+        behavior sample.
+
+        Args:
+            input_ids: Right-padded Qwen prompt tokens with shape ``[B, S]``.
+            attention_mask: Prefix mask matching ``sequence_lengths``.
+            pixel_values: Ragged-packed Qwen image patches.
+            image_grid_thw: Ragged-packed per-image grid metadata.
+            sequence_lengths: Unpadded token count for each sample.
+            image_counts: Number of selected BATS images per sample.
+            image_offsets: Exclusive offsets into ``image_grid_thw``.
+            image_patch_counts: Patch rows contributed by each image.
+            patch_counts: Patch rows contributed by each sample.
+            patch_offsets: Exclusive offsets into ``pixel_values``.
+            physical_states: Physical 29-D joint positions.
+            rtc_prefix_normalized_actions: Deterministic normalized RTC rows.
+            rtc_prefix_mask: Rows fixed by RTC, shape ``[B, 30]``.
+            generator: Device-compatible generator for the initial latent.
+            effective_image_grid_thw: Optional pooled history image grids.
+            visual_pool_factors: Optional per-image history pooling factors.
+            traj2ds: Optional Psi trajectory-condition tensor.
+
+        Returns:
+            The native ODE latent and its clipped and denormalized action views.
+        """
+        self.psi_model.eval()
+        self._validate_rtc_inputs(
+            rtc_prefix_normalized_actions, rtc_prefix_mask, batch=input_ids.shape[0]
+        )
+        self._validate_packed_condition(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            sequence_lengths=sequence_lengths,
+            image_counts=image_counts,
+            image_offsets=image_offsets,
+            image_patch_counts=image_patch_counts,
+            patch_counts=patch_counts,
+            patch_offsets=patch_offsets,
+        )
+        batch = int(input_ids.shape[0])
+        if physical_states.ndim < 1 or int(physical_states.shape[0]) != batch:
+            raise ValueError("VLA physical_states batch differs from Qwen inputs")
+        vlm_hidden, vlm_attention_mask = self._encode_condition(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            effective_image_grid_thw=effective_image_grid_thw,
+            visual_pool_factors=visual_pool_factors,
+        )
+        normalized_states = self.normalizer.normalize_state(physical_states)
+
+        def velocity_fn(latent: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+            return self._action_velocity(
+                vlm_hidden=vlm_hidden,
+                vlm_attention_mask=vlm_attention_mask,
+                normalized_states=normalized_states,
+                latent=latent,
+                timestep=timestep,
+                traj2ds=traj2ds,
+            )
+
+        initial_noise = torch.randn(
+            (batch, 30, 38),
+            dtype=torch.float32,
+            device=normalized_states.device,
+            generator=generator,
+        )
+        density_latent = sample_flow_ode(
+            velocity_fn,
+            initial_noise,
+            self.qualification_schedule,
+            prefix_actions=rtc_prefix_normalized_actions,
+            prefix_mask=rtc_prefix_mask,
+        )
+        wire = self.normalizer.to_qualification_wire(
+            density_latent,
+            clip_normalized_actions=self.qualification_clip_normalized_actions,
+        )
+        return VlaQualificationSample(
+            density_latent=density_latent,
+            clipped_normalized=wire.clipped_normalized,
+            denormalized_wire=wire.denormalized,
+            schedule_sha256=self.qualification_schedule.sha256,
+            clip_normalized_actions=self.qualification_clip_normalized_actions,
         )
 
     def forward(

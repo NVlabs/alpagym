@@ -155,6 +155,7 @@ class HumanoidPolicyCameraProfile(StrEnum):
     """Atomic AlpaSim camera profiles supported by humanoid policies."""
 
     vla_d455 = "vla_d455"
+    vla_d435_native = "vla_d435_native"
 
     @property
     def wizard_config_group(self) -> str:
@@ -162,6 +163,33 @@ class HumanoidPolicyCameraProfile(StrEnum):
         match self:
             case HumanoidPolicyCameraProfile.vla_d455:
                 return "humanoid_vla_d455"
+            case HumanoidPolicyCameraProfile.vla_d435_native:
+                return "humanoid_vla_d435_native"
+
+
+class HumanoidReferenceControllerProfile(StrEnum):
+    """Dynamics-owned tracker selected for a motion-reference rollout."""
+
+    grail_heightmap = "grail_heightmap"
+    sonic_visual = "sonic_visual"
+
+    @property
+    def wizard_runtime_domain(self) -> str:
+        """Return the atomic AlpaSim runtime-domain config group."""
+
+        match self:
+            case HumanoidReferenceControllerProfile.grail_heightmap:
+                return "humanoid_reference"
+            case HumanoidReferenceControllerProfile.sonic_visual:
+                return "humanoid_reference_visual"
+
+
+HUMANOID_ROBOT_PHYSICS_PROFILES = frozenset(
+    {
+        "sonic.isaac_training.g1_cylinder_model_12.mujoco_port.v1",
+        "sonic_visual.mujoco_release.g1_29dof_rev_1_0.capsule_raft.v1",
+    }
+)
 
 
 @dataclass
@@ -244,8 +272,12 @@ class CosmosRLTrainPolicyConfig:
     ppo_gae_lambda: float = 0.95
     ppo_min_action_std: float = 0.02
     ppo_max_action_std: float = 2.0
-    # Number of flattened transition rows per PPO optimizer update. This is
-    # deliberately independent from Cosmos's rollout/shard ``mini_batch``.
+    # Optional pre/post-update KL guard against the behavior policy that
+    # generated the current PPO replay batch. This is distinct from
+    # fixed-reference KL.
+    ppo_target_behavior_kl: float | None = None
+    # Number of flattened transition rows per PPO forward/backward microbatch.
+    # This is deliberately independent from Cosmos's rollout/shard ``mini_batch``.
     step_mini_batch: int | None = None
 
 
@@ -446,6 +478,15 @@ class HumanoidAlpaSimConfig:
     reference_frame_count: int = 50
     # Required by the fixed GRAIL/SONIC controller image in reference mode.
     grail_root_path: str | None = None
+    reference_controller_profile: HumanoidReferenceControllerProfile = (
+        HumanoidReferenceControllerProfile.grail_heightmap
+    )
+    # Required only by the dynamics-owned NuRec visual SONIC tracker.
+    visual_controller_release_path: str | None = None
+    # Exact MuJoCo plant paired with the selected visual tracker/data lineage.
+    # This is deliberately independent of controller selection: silently
+    # choosing a different collision model changes the closed-loop trajectory.
+    robot_physics_profile: str | None = None
     # Selects an atomic AlpaSim cameras config group.  A null value preserves
     # motion-reference policies that do not consume rendered observations.
     policy_camera_profile: HumanoidPolicyCameraProfile | None = None
@@ -471,6 +512,13 @@ class HumanoidAlpaSimConfig:
     route_center_soft_m: float = 0.10
     route_progress_credit_m: float = 0.30
     route_corridor_half_width_m: float = 0.45
+    # Optional runtime-only reset pose for one-scene qualification runs.  The
+    # published scenario remains the source of route and support height; these
+    # values replace only root x/y/yaw at reset.  All three values are an
+    # atomic tuple and are forwarded through the trusted controller options.
+    runtime_spawn_root_x_m: float | None = None
+    runtime_spawn_root_y_m: float | None = None
+    runtime_spawn_root_yaw_rad: float | None = None
 
     def __post_init__(self) -> None:
         """Reject ambiguous scene routing and invalid centerline thresholds."""
@@ -491,6 +539,11 @@ class HumanoidAlpaSimConfig:
             raise ValueError(
                 "HumanoidAlpaSimConfig.grail_root_path is required for motion_reference"
             )
+        visual_reference_controller = (
+            self.execution_profile is HumanoidExecutionProfile.motion_reference
+            and self.reference_controller_profile
+            is HumanoidReferenceControllerProfile.sonic_visual
+        )
         if self.policy_camera_profile is not None:
             if self.execution_profile is not HumanoidExecutionProfile.motion_reference:
                 raise ValueError(
@@ -512,11 +565,51 @@ class HumanoidAlpaSimConfig:
                     "Open3D, Embree, gsplat, and MuJoCo-Warp; "
                     "alpasim-humanoid:local is dynamics-only"
                 )
-        elif self.scene_cache_path is not None:
+        elif self.scene_cache_path is not None and not visual_reference_controller:
             raise ValueError(
-                "HumanoidAlpaSimConfig.scene_cache_path requires policy_camera_profile"
+                "HumanoidAlpaSimConfig.scene_cache_path requires a policy camera "
+                "or visual reference controller"
             )
         if self.execution_profile is HumanoidExecutionProfile.motion_reference:
+            if visual_reference_controller:
+                if not self.visual_controller_release_path:
+                    raise ValueError(
+                        "sonic_visual reference controller requires "
+                        "visual_controller_release_path"
+                    )
+                if not Path(self.visual_controller_release_path).is_absolute():
+                    raise ValueError("visual_controller_release_path must be absolute")
+                if not self.scene_cache_path:
+                    raise ValueError(
+                        "sonic_visual reference controller requires scene_cache_path"
+                    )
+                if not Path(self.scene_cache_path).is_absolute():
+                    raise ValueError("scene_cache_path must be absolute")
+                if self.service_image == "alpasim-humanoid:local":
+                    raise ValueError(
+                        "sonic_visual reference controller requires the combined "
+                        "NuRec runtime image"
+                    )
+                if self.robot_physics_profile is None:
+                    raise ValueError(
+                        "sonic_visual reference controller requires an explicit "
+                        "robot_physics_profile"
+                    )
+                if self.robot_physics_profile not in HUMANOID_ROBOT_PHYSICS_PROFILES:
+                    raise ValueError(
+                        "robot_physics_profile must be one of "
+                        f"{sorted(HUMANOID_ROBOT_PHYSICS_PROFILES)}"
+                    )
+            elif self.visual_controller_release_path is not None:
+                raise ValueError(
+                    "visual_controller_release_path requires "
+                    "reference_controller_profile=sonic_visual"
+                )
+            elif self.robot_physics_profile is not None:
+                raise ValueError(
+                    "robot_physics_profile requires "
+                    "reference_controller_profile=sonic_visual"
+                )
             if not self.reward_profile_id:
                 raise ValueError(
                     "motion_reference requires an explicit reward_profile_id"
@@ -533,6 +626,15 @@ class HumanoidAlpaSimConfig:
                     "reference_route_centered.v2, or reference_route_centered.v3"
                 )
         else:
+            if (
+                self.reference_controller_profile
+                is not HumanoidReferenceControllerProfile.grail_heightmap
+                or self.visual_controller_release_path is not None
+                or self.robot_physics_profile is not None
+            ):
+                raise ValueError(
+                    "reference controller settings require motion_reference"
+                )
             if not self.reward_profile_id:
                 self.reward_profile_id = "direct_v9_shaped.v1"
             elif self.reward_profile_id != "direct_v9_shaped.v1":
@@ -563,6 +665,37 @@ class HumanoidAlpaSimConfig:
                 "Humanoid route thresholds must satisfy 0 < center_soft < "
                 "progress_credit < corridor_half_width"
             )
+        runtime_spawn_x = self.runtime_spawn_root_x_m
+        runtime_spawn_y = self.runtime_spawn_root_y_m
+        runtime_spawn_yaw = self.runtime_spawn_root_yaw_rad
+        runtime_spawn = (runtime_spawn_x, runtime_spawn_y, runtime_spawn_yaw)
+        if any(value is not None for value in runtime_spawn):
+            if self.execution_profile is not HumanoidExecutionProfile.motion_reference:
+                raise ValueError(
+                    "Humanoid runtime spawn override requires motion_reference"
+                )
+            if (
+                runtime_spawn_x is None
+                or runtime_spawn_y is None
+                or runtime_spawn_yaw is None
+            ):
+                raise ValueError(
+                    "Humanoid runtime spawn override requires root x, y, and yaw"
+                )
+            resolved_runtime_spawn = (
+                runtime_spawn_x,
+                runtime_spawn_y,
+                runtime_spawn_yaw,
+            )
+            if any(
+                isinstance(value, bool) or not math.isfinite(value)
+                for value in resolved_runtime_spawn
+            ):
+                raise ValueError("Humanoid runtime spawn override must be finite")
+            if abs(runtime_spawn_x) > 10_000.0 or abs(runtime_spawn_y) > 10_000.0:
+                raise ValueError("Humanoid runtime spawn x/y must be within 10 km")
+            if abs(runtime_spawn_yaw) > math.pi:
+                raise ValueError("Humanoid runtime spawn yaw must be in [-pi, pi]")
 
 
 @dataclass

@@ -38,12 +38,75 @@ from alpagym_g1_vla.provenance import (
 )
 
 
+class _TinyVisionRotaryEmbedding(nn.Module):
+    """Small non-persistent vision RoPE buffer matching Qwen3-VL."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, 4, 2, dtype=torch.float32) / 4.0))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+
+class _TinyTextRotaryEmbedding(nn.Module):
+    """Small non-persistent text RoPE buffer matching Qwen3-VL's API."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        inv_freq, _attention_scaling = self.rope_init_fn(None, None)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+        self.config = None
+
+    @staticmethod
+    def rope_init_fn(
+        config: object,
+        device: torch.device | None,
+    ) -> tuple[torch.Tensor, float]:
+        """Return deterministic inverse frequencies on the requested device."""
+        del config
+        return torch.tensor([1.0, 0.25, 0.0625], device=device), 1.0
+
+
+class _TinyVisionModel(nn.Module):
+    """Own the vision RoPE at Qwen3-VL's exact module path."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rotary_pos_emb = _TinyVisionRotaryEmbedding()
+
+
+class _TinyLanguageModel(nn.Module):
+    """Own the text RoPE at Qwen3-VL's exact module path."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rotary_emb = _TinyTextRotaryEmbedding()
+
+
+class _TinyVlmCore(nn.Module):
+    """Preserve Qwen3-VL's vision and language module layout."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.visual = _TinyVisionModel()
+        self.language_model = _TinyLanguageModel()
+
+
+class _TinyVlm(nn.Module):
+    """Small trainable VLM plus Qwen3-VL's nested model surface."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection = nn.Linear(4, 4)
+        self.model = _TinyVlmCore()
+
+
 class _TinyPsi(nn.Module):
     """Small stand-in preserving Psi's VLM/action ownership surface."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.vlm_model = nn.Linear(4, 4)
+        self.vlm_model = _TinyVlm()
         self.action_header = nn.Linear(4, 4)
 
 
@@ -148,6 +211,20 @@ def test_attested_run_config_pins_native_rtc_contract(
     assert cosmos_model._rtc_max_delay_exclusive(valid) == 8
 
 
+def test_training_contract_accepts_direct_finetune_transform_schema(
+    tmp_path: Path,
+) -> None:
+    run_config = _run_config()
+    transform = run_config["data"]["transform"]
+    assert isinstance(transform, dict)
+    action = transform.pop("action")
+    assert isinstance(action, dict)
+    action["model"] = {}
+    transform.update(action)
+
+    cosmos_model._validate_training_contract(run_config, _config(tmp_path))
+
+
 @pytest.fixture
 def tiny_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -192,7 +269,12 @@ def tiny_source(
     monkeypatch.setattr(
         cosmos_model.VlaSourceBundle,
         "verify",
-        classmethod(lambda cls, policy_eval_root: bundle),
+        classmethod(lambda cls, policy_eval_root, **kwargs: bundle),
+    )
+    monkeypatch.setattr(
+        cosmos_model.VlaSourceBundle,
+        "verify_model_root",
+        classmethod(lambda cls, model_root: bundle),
     )
     monkeypatch.setattr(
         cosmos_model,
@@ -261,6 +343,37 @@ def test_meta_lifecycle_strict_load_and_trainable_ownership(
     model.post_to_empty_hook(cosmos_config)
     for name, tensor in model.actor_critic.critic.state_dict().items():
         assert torch.equal(tensor, critic_after_first_hook[name])
+
+
+def test_post_to_empty_restores_nonpersistent_qwen_rotary_buffers(
+    tiny_source: tuple[Path, VlaSourceBundle, dict[str, torch.Tensor]],
+) -> None:
+    """Meta materialization cannot leave either Qwen3-VL RoPE table empty."""
+    root, bundle, _expected = tiny_source
+    model = _build_materialized(root)
+    vlm = model.actor_critic.psi_model.vlm_model
+    vision_rotary = vlm.model.visual.rotary_pos_emb
+    text_rotary = vlm.model.language_model.rotary_emb
+    with torch.no_grad():
+        vision_rotary.inv_freq.zero_()
+        text_rotary.inv_freq.zero_()
+    text_rotary.original_inv_freq = torch.full_like(text_rotary.inv_freq, -1.0)
+
+    model.post_to_empty_hook(
+        SimpleNamespace(
+            policy=SimpleNamespace(model_name_or_path=str(bundle.model_root)),
+        )
+    )
+
+    assert torch.equal(
+        vision_rotary.inv_freq,
+        torch.tensor([1.0, 0.01], dtype=vision_rotary.inv_freq.dtype),
+    )
+    assert torch.equal(
+        text_rotary.inv_freq,
+        torch.tensor([1.0, 0.25, 0.0625], dtype=text_rotary.inv_freq.dtype),
+    )
+    assert text_rotary.original_inv_freq is text_rotary.inv_freq
 
 
 def test_optimizer_parts_exactly_partition_trainable_parameters(

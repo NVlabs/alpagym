@@ -204,11 +204,31 @@ def install_alpasim_grpc_stubs() -> None:
         def __init__(self, **kwargs: object) -> None:
             self.__dict__.update(kwargs)
 
+    class HumanoidMotionReferenceSpec:
+        """Tiny stand-in for humanoid.HumanoidMotionReferenceSpec."""
+
+        def __init__(self, **kwargs: object) -> None:
+            self.__dict__.update(kwargs)
+
+    class HumanoidReferenceDecodeContext:
+        """Tiny stand-in for humanoid.HumanoidReferenceDecodeContext."""
+
+        def __init__(self, **kwargs: object) -> None:
+            self.__dict__.update(kwargs)
+
     class HumanoidPlanUpdate:
         """Tiny stand-in for humanoid.HumanoidPlanUpdate."""
 
         def __init__(self, **kwargs: object) -> None:
+            self.decode_context = kwargs.pop("decode_context", None)
+            self.reference_sha256 = kwargs.pop("reference_sha256", "")
             self.__dict__.update(kwargs)
+
+        def HasField(self, name: str) -> bool:
+            """Return protobuf-like message presence for decode_context."""
+            if name != "decode_context":
+                raise ValueError(name)
+            return self.decode_context is not None
 
     class HumanoidEnvValue:
         """Tiny stand-in for humanoid.HumanoidEnvValue."""
@@ -238,6 +258,11 @@ def install_alpasim_grpc_stubs() -> None:
     def humanoid_render_receipt_sha256(**_: object) -> str:
         """Return the fixture's shared combined receipt."""
         return "f" * 64
+
+    def humanoid_reference_sha256(spec: object, update: object) -> str:
+        """Expose distinct fixture identities for the shared v1/v2 branches."""
+        del update
+        return "2" * 64 if str(spec.decode_context_schema) else "1" * 64
 
     class HumanoidSessionCloseRequest:
         """Tiny stand-in for humanoid.HumanoidSessionCloseRequest."""
@@ -349,10 +374,12 @@ def install_alpasim_grpc_stubs() -> None:
     humanoid_pb2.HumanoidEnvState = HumanoidEnvState
     humanoid_pb2.HumanoidEnvValue = HumanoidEnvValue
     humanoid_pb2.HumanoidMotionFrame = HumanoidMotionFrame
+    humanoid_pb2.HumanoidMotionReferenceSpec = HumanoidMotionReferenceSpec
     humanoid_pb2.HumanoidPlanUpdate = HumanoidPlanUpdate
     humanoid_pb2.HumanoidPolicyRequest = HumanoidPolicyRequest
     humanoid_pb2.HumanoidPolicyResponse = HumanoidPolicyResponse
     humanoid_pb2.HumanoidPolicySessionRequest = HumanoidPolicySessionRequest
+    humanoid_pb2.HumanoidReferenceDecodeContext = HumanoidReferenceDecodeContext
     humanoid_pb2.HumanoidSessionCloseRequest = HumanoidSessionCloseRequest
     humanoid_pb2.HUMANOID_EXECUTION_MODE_DIRECT_ACTION = 1
     humanoid_pb2.HUMANOID_EXECUTION_MODE_MOTION_REFERENCE = 2
@@ -362,8 +389,16 @@ def install_alpasim_grpc_stubs() -> None:
     humanoid_pb2.HUMANOID_POLICY_REQUEST_KIND_FINALIZE_WITH_FEEDBACK = 4
     humanoid_contracts.HUMANOID_RENDER_STATE_SCHEMA = "humanoid_render_state_qpos.v1"
     humanoid_contracts.HUMANOID_RENDER_RECEIPT_SCHEMA = "humanoid_render_receipt.v1"
+    humanoid_contracts.HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA = (
+        "full_pelvis_rotation_local_xy_completed_z/v1"
+    )
+    humanoid_contracts.HUMANOID_REFERENCE_HASH_DOMAIN_V1 = b"motion-reference.v1\0"
+    humanoid_contracts.HUMANOID_REFERENCE_HASH_DOMAIN_V2 = (
+        b"motion-reference+decode-context.v2\0"
+    )
     humanoid_contracts.HumanoidRenderState = HumanoidRenderState
     humanoid_contracts.humanoid_image_sha256 = humanoid_image_sha256
+    humanoid_contracts.humanoid_reference_sha256 = humanoid_reference_sha256
     humanoid_contracts.humanoid_render_receipt_sha256 = humanoid_render_receipt_sha256
     humanoid_pb2_grpc.HumanoidPolicyServiceServicer = HumanoidPolicyServiceServicer
     humanoid_pb2_grpc.add_HumanoidPolicyServiceServicer_to_server = (
@@ -450,6 +485,20 @@ def install_alpasim_grpc_stubs() -> None:
                 "frames",
                 "reference_sha256",
                 "root_z_alignment_offset_m",
+                "decode_context",
+            ),
+            "HumanoidMotionReferenceSpec": _descriptor_message(
+                "schema",
+                "joint_names",
+                "frame_count",
+                "sample_period_us",
+                "control_ticks_per_policy_step",
+                "decode_context_schema",
+            ),
+            "HumanoidReferenceDecodeContext": _descriptor_message(
+                "schema",
+                "chunk_base_quaternion_wxyz",
+                "local_xy_from_frame_zero",
             ),
             "HumanoidRealizedControlTick": _descriptor_message(
                 "control_tick_offset",
@@ -505,6 +554,9 @@ def install_alpasim_grpc_stubs() -> None:
     humanoid_messages["HumanoidObservation"].fields_by_name[
         "camera_images"
     ].message_type = humanoid_messages["HumanoidCameraImage"]
+    humanoid_messages["HumanoidPlanUpdate"].fields_by_name[
+        "decode_context"
+    ].message_type = humanoid_messages["HumanoidReferenceDecodeContext"]
     runtime_pb2.DESCRIPTOR = SimpleNamespace(
         message_types_by_name={
             "RolloutSpec": _descriptor_message(

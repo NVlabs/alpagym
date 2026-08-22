@@ -25,10 +25,12 @@ from alpagym_runtime.alpasim.driver_server import (  # noqa: E402
     _Session,
 )
 from alpagym_runtime.alpasim.humanoid_policy_server import (  # noqa: E402
+    HUMANOID_FEEDBACK_STATE_CONTRACT_SCHEMA,
     MOTION_REFERENCE_JOINT_NAMES,
     HumanoidCameraFrameIdentity,
     HumanoidMotionReference,
     HumanoidMotionReferenceFrame,
+    HumanoidReferenceDecodeContext,
     HumanoidPolicyCameraContract,
     HumanoidCameraFrame,
     HumanoidPolicyGrpcServicer,
@@ -43,6 +45,7 @@ from alpagym_runtime.alpasim.humanoid_policy_server import (  # noqa: E402
     _route_camera_frames,
     _save_camera_images,
     _validate_motion_reference_session,
+    _plan_update_from_output,
 )
 from alpagym_runtime.inference.inference_engine import InferenceModelLease  # noqa: E402
 from alpagym_runtime.replay import ActionSelection, PolicyReplayData  # noqa: E402
@@ -61,6 +64,9 @@ from alpasim_grpc.v0.egodriver_pb2 import (  # noqa: E402
     GroundTruth as ProtoGroundTruth,
     RolloutCameraImage,
     Route,
+)
+from alpasim_grpc.v0.humanoid_contracts import (  # noqa: E402
+    HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA,
 )
 
 
@@ -1077,8 +1083,9 @@ def test_strict_policy_camera_requires_one_current_frame_per_lane() -> None:
 class _MotionReferencePolicy:
     """Deterministic reference planner used to exercise the full RPC lifecycle."""
 
-    def __init__(self, frame_count: int = 50) -> None:
+    def __init__(self, frame_count: int = 50, decode_context_schema: str = "") -> None:
         self.frame_count = frame_count
+        self.decode_context_schema = decode_context_schema
         self.calls = []
 
     def step(self, policy_inputs, *, sample_actions: bool = True):
@@ -1093,7 +1100,6 @@ class _MotionReferencePolicy:
                     )
                 )
                 continue
-            digest = ("a" if item.decision_id == 0 else "b") * 64
             root = item.qpos[:3].clone()
             root[2] += 0.125
             frames = tuple(
@@ -1106,12 +1112,23 @@ class _MotionReferencePolicy:
                 )
                 for index in range(self.frame_count)
             )
+            decode_context = None
+            if self.decode_context_schema:
+                local_xy = torch.zeros((self.frame_count, 2), dtype=torch.float32)
+                local_xy[:, 0] = (
+                    torch.arange(self.frame_count, dtype=torch.float32) * 0.01
+                )
+                decode_context = HumanoidReferenceDecodeContext(
+                    schema=self.decode_context_schema,
+                    chunk_base_quaternion_wxyz=item.qpos[3:7].clone(),
+                    local_xy_from_frame_zero=local_xy,
+                )
             reference = HumanoidMotionReference(
                 reference_id=100 + item.decision_id,
                 source_decision_id=item.decision_id,
                 frames=frames,
-                reference_sha256=digest,
                 root_z_alignment_offset_m=0.125,
+                decode_context=decode_context,
             )
             replay = PolicyReplayData(
                 replay_schema_version=1,
@@ -1290,6 +1307,7 @@ def test_motion_policy_receives_camera_frames_at_initial_replan_and_finalize() -
                 frame_count=50,
                 sample_period_us=20_000,
                 control_ticks_per_policy_step=25,
+                decode_context_schema="",
             ),
             policy_options={},
             attempt_id="attempt",
@@ -1445,6 +1463,7 @@ def test_motion_policy_records_37_tick_predecessor_to_source_interval(
                 frame_count=50,
                 sample_period_us=20_000,
                 control_ticks_per_policy_step=25,
+                decode_context_schema="",
             ),
             policy_options={},
             attempt_id="attempt",
@@ -1512,6 +1531,16 @@ def test_motion_policy_records_37_tick_predecessor_to_source_interval(
     record = servicer.pop_session_record("motion-session")
     assert record.final_bootstrap_values == expected_bootstrap
     trace = record.outputs[1].replay_data.payload["feedback_trace"]
+    assert trace["state_contract_schema"] == HUMANOID_FEEDBACK_STATE_CONTRACT_SCHEMA
+    assert tuple(trace["joint_names"]) == MOTION_REFERENCE_JOINT_NAMES
+    expected_joint_hash = hashlib.sha256(
+        json.dumps(
+            list(MOTION_REFERENCE_JOINT_NAMES),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert trace["ordered_joint_names_sha256"] == expected_joint_hash
     assert len(trace["ticks"]) == 37
     assert [tick["active_reference_id"] for tick in trace["ticks"]] == [
         first.reference_id
@@ -1616,10 +1645,11 @@ def test_h50_motion_reference_abi_accepts_native_replan_trigger(
             frame_count=50,
             sample_period_us=20_000,
             control_ticks_per_policy_step=control_ticks,
+            decode_context_schema="",
         ),
     )
 
-    joint_names, frame_count, sample_period_us, control_ticks = (
+    joint_names, frame_count, sample_period_us, control_ticks, decode_context_schema = (
         _validate_motion_reference_session(request)
     )
 
@@ -1629,10 +1659,231 @@ def test_h50_motion_reference_abi_accepts_native_replan_trigger(
         20_000,
         request.reference_spec.control_ticks_per_policy_step,
     )
+    assert decode_context_schema == ""
 
+    request.reference_spec.decode_context_schema = (
+        HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA
+    )
+    assert _validate_motion_reference_session(request)[-1] == (
+        HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA
+    )
+    request.reference_spec.decode_context_schema = "unknown/v1"
+    with pytest.raises(ValueError, match="unsupported decode_context_schema"):
+        _validate_motion_reference_session(request)
+
+    request.reference_spec.decode_context_schema = ""
     request.reference_spec.schema = "g1_motion_reference_29d_50hz_h70.v1"
     with pytest.raises(ValueError, match="requires the one-second H50"):
         _validate_motion_reference_session(request)
+
+
+def _motion_reference_wire_fixture(
+    *,
+    negotiated_schema: str,
+    decode_context: HumanoidReferenceDecodeContext | None,
+) -> tuple[HumanoidPolicyStepOutput, object, object]:
+    """Build one source plan, source observation, and negotiated session."""
+    policy_input = SimpleNamespace(
+        env_id=0,
+        decision_id=7,
+        timestamp_us=400_000,
+        qpos=torch.tensor(
+            [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0] + [0.0] * 29,
+            dtype=torch.float32,
+        ),
+        qvel=torch.zeros(35, dtype=torch.float32),
+        bootstrap_requested=False,
+    )
+    output = _MotionReferencePolicy().step((policy_input,))[0]
+    assert output.motion_reference is not None
+    output = replace(
+        output,
+        motion_reference=replace(
+            output.motion_reference,
+            decode_context=decode_context,
+        ),
+    )
+    session = SimpleNamespace(
+        reference_joint_names=MOTION_REFERENCE_JOINT_NAMES,
+        reference_frame_count=50,
+        reference_sample_period_us=20_000,
+        control_ticks_per_policy_step=25,
+        reference_decode_context_schema=negotiated_schema,
+    )
+    return output, policy_input, session
+
+
+def _valid_reference_decode_context() -> HumanoidReferenceDecodeContext:
+    """Return a nontrivial context anchored to the fixture source state."""
+    local_xy = torch.zeros((50, 2), dtype=torch.float32)
+    local_xy[:, 0] = torch.arange(50, dtype=torch.float32) * 0.01
+    local_xy[:, 1] = torch.arange(50, dtype=torch.float32) * -0.02
+    return HumanoidReferenceDecodeContext(
+        schema=HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA,
+        chunk_base_quaternion_wxyz=torch.tensor(
+            [1.0, 0.0, 0.0, 0.0], dtype=torch.float32
+        ),
+        local_xy_from_frame_zero=local_xy,
+    )
+
+
+def test_plan_update_wires_negotiated_decode_context_and_uses_v2_hash() -> None:
+    context = _valid_reference_decode_context()
+    output, policy_input, session = _motion_reference_wire_fixture(
+        negotiated_schema=HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA,
+        decode_context=context,
+    )
+
+    update = _plan_update_from_output(
+        output=output,
+        policy_input=policy_input,
+        session=session,
+    )
+
+    assert update.HasField("decode_context")
+    assert update.decode_context.schema == context.schema
+    assert (
+        update.decode_context.chunk_base_quaternion_wxyz.w,
+        update.decode_context.chunk_base_quaternion_wxyz.x,
+        update.decode_context.chunk_base_quaternion_wxyz.y,
+        update.decode_context.chunk_base_quaternion_wxyz.z,
+    ) == (1.0, 0.0, 0.0, 0.0)
+    assert update.decode_context.local_xy_from_frame_zero == pytest.approx(
+        context.local_xy_from_frame_zero.reshape(-1).tolist()
+    )
+    assert update.reference_sha256 == "2" * 64
+
+
+def test_plan_update_without_decode_context_retains_v1_hash() -> None:
+    output, policy_input, session = _motion_reference_wire_fixture(
+        negotiated_schema="",
+        decode_context=None,
+    )
+
+    update = _plan_update_from_output(
+        output=output,
+        policy_input=policy_input,
+        session=session,
+    )
+
+    assert not update.HasField("decode_context")
+    assert update.reference_sha256 == "1" * 64
+
+
+def test_motion_policy_rpc_records_the_context_bearing_wire_digest() -> None:
+    planner = _MotionReferencePolicy(
+        decode_context_schema=(HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA)
+    )
+    servicer = HumanoidPolicyGrpcServicer(
+        policy_factory=lambda session_uuid, request: planner
+    )
+    servicer.reserve_session("motion-session", behavior_policy_version=11)
+    servicer.start_session(
+        SimpleNamespace(
+            session_uuid="motion-session",
+            action_size=0,
+            execution_mode=2,
+            joint_names=list(MOTION_REFERENCE_JOINT_NAMES),
+            observation_schema="humanoid_motion_reference_navigation_xy.v1",
+            action_schema="g1_motion_reference_29d_50hz_h50.v1",
+            observation_terms=[SimpleNamespace(name="navigation_position_xy", size=2)],
+            reference_spec=SimpleNamespace(
+                schema="g1_motion_reference_29d_50hz_h50.v1",
+                joint_names=list(MOTION_REFERENCE_JOINT_NAMES),
+                frame_count=50,
+                sample_period_us=20_000,
+                control_ticks_per_policy_step=25,
+                decode_context_schema=(
+                    HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA
+                ),
+            ),
+            policy_options={},
+        ),
+        context=None,
+    )
+
+    response = servicer.act(
+        _motion_act_request(
+            decision_id=0,
+            timestamp_us=0,
+            request_kind=2,
+            feedback_traces=[],
+        ),
+        context=None,
+    )
+
+    update = response.plan_updates[0]
+    recorded = servicer._sessions["motion-session"].outputs[0]
+    assert update.HasField("decode_context")
+    assert update.reference_sha256 == "2" * 64
+    assert recorded.replay_data.payload["reference_sha256"] == (update.reference_sha256)
+    servicer.discard_session("motion-session")
+
+
+@pytest.mark.parametrize(
+    ("negotiated_schema", "context", "error"),
+    (
+        (
+            HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA,
+            None,
+            "missing its negotiated decode context",
+        ),
+        (
+            "",
+            _valid_reference_decode_context(),
+            "was not negotiated",
+        ),
+        (
+            HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA,
+            replace(_valid_reference_decode_context(), schema="wrong/v1"),
+            "schema does not match",
+        ),
+        (
+            HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA,
+            replace(
+                _valid_reference_decode_context(),
+                chunk_base_quaternion_wxyz=torch.tensor(
+                    [0.0, 1.0, 0.0, 0.0], dtype=torch.float32
+                ),
+            ),
+            "does not match the policy input",
+        ),
+        (
+            HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA,
+            replace(
+                _valid_reference_decode_context(),
+                local_xy_from_frame_zero=torch.zeros((49, 2)),
+            ),
+            r"finite \[50,2\] matrix",
+        ),
+        (
+            HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA,
+            replace(
+                _valid_reference_decode_context(),
+                local_xy_from_frame_zero=torch.cat(
+                    (torch.ones((1, 2)), torch.zeros((49, 2)))
+                ),
+            ),
+            "row zero must be exact zero",
+        ),
+    ),
+)
+def test_plan_update_decode_context_validation_fails_closed(
+    negotiated_schema: str,
+    context: HumanoidReferenceDecodeContext | None,
+    error: str,
+) -> None:
+    output, policy_input, session = _motion_reference_wire_fixture(
+        negotiated_schema=negotiated_schema,
+        decode_context=context,
+    )
+
+    with pytest.raises(ValueError, match=error):
+        _plan_update_from_output(
+            output=output,
+            policy_input=policy_input,
+            session=session,
+        )
 
 
 def test_humanoid_policy_session_registers_and_releases_model_lease() -> None:
@@ -1727,6 +1978,7 @@ def test_motion_reference_finalize_records_terminal_k_prefix_without_replan(
                 frame_count=50,
                 sample_period_us=20_000,
                 control_ticks_per_policy_step=25,
+                decode_context_schema="",
             ),
             policy_options={},
             attempt_id="attempt",
@@ -1812,6 +2064,7 @@ def test_policy_server_accepts_stable_runtime_applied_reference_hash() -> None:
                 frame_count=frame_count,
                 sample_period_us=20_000,
                 control_ticks_per_policy_step=control_ticks,
+                decode_context_schema="",
             ),
             policy_options={},
             attempt_id="attempt",
