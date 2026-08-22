@@ -217,6 +217,15 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
             train_batch_per_replica=int(self.config.train.train_batch_per_replica),
             allowed_outdated_steps=self._allowed_outdated_steps,
         )
+        if self._on_policy:
+            expected_behavior_version = max(current_step - 1, 0)
+            kept_versions = [int(rollout.weight_version) for rollout in rollouts]
+            if any(version != expected_behavior_version for version in kept_versions):
+                raise ValueError(
+                    "On-policy AlpaGym training requires the exact behavior "
+                    f"version {expected_behavior_version} for optimizer update "
+                    f"{current_step}, got {kept_versions}"
+                )
         samples, advantages = self._prepare_training_data(rollouts)
         if not samples:
             raise ValueError(
@@ -250,7 +259,15 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         lr_scheduler = self.lr_schedulers
         if lr_scheduler is None:
             raise RuntimeError("Cosmos trainer did not initialize its LR scheduler")
-        lr_scheduler.step()
+        optimizer_steps_applied = self._optimizer_steps_applied_in_training_step
+        if optimizer_steps_applied:
+            lr_scheduler.step()
+        else:
+            logger.warning(
+                "AlpaGym trainer applied no optimizer step at current_step=%d; "
+                "leaving the LR scheduler unchanged",
+                current_step,
+            )
         checkpoint_config = getattr(self.config.train, "ckpt", None)
         checkpoint_enabled = bool(
             getattr(checkpoint_config, "enable_checkpoint", False)
@@ -297,6 +314,7 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
             "train/num_micro_batches": int(
                 getattr(self, "_last_micro_batches", num_batches)
             ),
+            "train/optimizer_steps_applied": optimizer_steps_applied,
             "train/ratio_max": ratio_max,
             "train/ratio_min": ratio_min,
             "train/clip_fraction": clip_fraction_sum / num_batches
@@ -414,6 +432,7 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
             ratio_min, clip_fraction_sum, grad_norm_sum)``.
         """
         self._ensure_reference_model()
+        self._optimizer_steps_applied_in_training_step = 0
 
         num_steps = len(samples)
         mini_batch_size = min(self._mini_batch, num_steps)
@@ -653,6 +672,7 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
             # advance on no signal.
             if grad_norm_value != 0.0:
                 self.optimizers.step()
+                self._optimizer_steps_applied_in_training_step += 1
             self.optimizers.zero_grad()
         return grad_norm_value
 
@@ -770,9 +790,18 @@ def _require_ppo_signal(tensor: torch.Tensor | None, field_name: str) -> torch.T
     return tensor
 
 
-def _ppo_actor_valid_mask(signal: TrainingSignal) -> torch.Tensor:
+def _ppo_actor_valid_mask(
+    signal: TrainingSignal,
+    *,
+    required: bool = False,
+) -> torch.Tensor:
     """Return rows whose sampled policy action reached the controller."""
     if signal.actor_valid is None:
+        if required:
+            raise ValueError(
+                "Flow-PPO replay requires TrainingSignal.actor_valid so "
+                "unexecuted sampled references cannot enter the actor loss"
+            )
         return torch.ones_like(signal.is_padding, dtype=torch.bool)
     return signal.actor_valid
 
@@ -872,6 +901,7 @@ def _summarize_behavior_log_ratios(
             f"{prefix}_ratio_p99": 1.0,
             f"{prefix}_clip_fraction": 0.0,
             f"{prefix}_approx_kl": 0.0,
+            f"{prefix}_max_abs_log_ratio": 0.0,
         }
     if not torch.isfinite(flattened).all():
         raise FloatingPointError(
@@ -903,6 +933,7 @@ def _summarize_behavior_log_ratios(
         f"{prefix}_ratio_p99": float(quantiles[2].item()),
         f"{prefix}_clip_fraction": float(clipped.float().mean().item()),
         f"{prefix}_approx_kl": float(approx_kl.mean().item()),
+        f"{prefix}_max_abs_log_ratio": float(raw_log_ratios.abs().max().item()),
     }
 
 
@@ -1085,7 +1116,12 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                     padding_rows_dropped += 1
                     continue
                 actor_valid = (
-                    bool(_ppo_actor_valid_mask(step.training_signal).item())
+                    bool(
+                        _ppo_actor_valid_mask(
+                            step.training_signal,
+                            required=self._flow_chunk_density,
+                        ).item()
+                    )
                     and not is_padding
                 )
                 actor_advantage = advantage if actor_valid else 0.0
@@ -1141,6 +1177,7 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         mean objective.
         """
         self._ensure_reference_model()
+        self._optimizer_steps_applied_in_training_step = 0
         if not samples:
             return (0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0)
         if len(advantages) != len(samples):
@@ -1158,7 +1195,12 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                 if is_padding:
                     continue
                 value_rows += 1
-                if bool(_ppo_actor_valid_mask(signal).item()):
+                if bool(
+                    _ppo_actor_valid_mask(
+                        signal,
+                        required=self._flow_chunk_density,
+                    ).item()
+                ):
                     actor_rows += 1
             return actor_rows, value_rows
 
@@ -1223,7 +1265,11 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                     update_clip_fraction += actor_loss_scale * batch_clip_fraction
                 self._last_micro_batches += 1
 
+            optimizer_steps_before = self._optimizer_steps_applied_in_training_step
             grad_norm = self.all_reduce_states(inter_policy_nccl)
+            optimizer_step_applied = (
+                self._optimizer_steps_applied_in_training_step > optimizer_steps_before
+            )
             if total_actor_rows:
                 ratio_max = max(ratio_max, update_ratio_max)
                 ratio_min = min(ratio_min, update_ratio_min)
@@ -1231,13 +1277,15 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             total_kl += update_kl
             clip_fraction_sum += update_clip_fraction
             grad_norm_sum += grad_norm
-            num_updates += 1
+            if optimizer_step_applied:
+                num_updates += 1
             logger.info(
                 "AlpaGym PPO effective optimizer update rows=%d actor_rows=%d "
-                "micro_batches=%d loss=%.6f kl=%.6f grad_norm=%.6f",
+                "micro_batches=%d applied=%s loss=%.6f kl=%.6f grad_norm=%.6f",
                 total_value_rows,
                 total_actor_rows,
                 num_micro_batches,
+                optimizer_step_applied,
                 update_loss,
                 update_kl,
                 grad_norm,
@@ -1292,6 +1340,7 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             raise RuntimeError(f"PPO {phase} diagnostics require a data packer")
 
         valid_log_ratios: list[torch.Tensor] = []
+        valid_value_deltas: list[torch.Tensor] = []
         diagnostic_batch_size = min(self._mini_batch, len(samples))
         was_training = self.model.training
         self.model.eval()
@@ -1303,12 +1352,19 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                     )
                     signal = minibatch.training_signal
                     is_padding = signal.is_padding.to(self.device)
-                    actor_valid = _ppo_actor_valid_mask(signal).to(self.device)
+                    actor_valid = _ppo_actor_valid_mask(
+                        signal,
+                        required=self._flow_chunk_density,
+                    ).to(self.device)
                     old_logprobs = signal.old_logprobs.to(self.device)
+                    old_values = _require_ppo_signal(
+                        signal.old_values,
+                        "old_values",
+                    ).to(self.device)
                     (
                         new_logprobs,
                         _kl_div,
-                        _values,
+                        values,
                         new_element_logprobs,
                         old_element_logprobs,
                     ) = self._forward_with_reference_and_value(minibatch.model_inputs)
@@ -1326,6 +1382,19 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                     if not torch.isfinite(old_logprobs).all():
                         raise FloatingPointError(
                             f"PPO {phase} replay has non-finite old log-probabilities"
+                        )
+                    if tuple(values.shape) != tuple(old_values.shape):
+                        raise ValueError(
+                            f"PPO {phase} current/old value shapes differ: "
+                            f"{tuple(values.shape)} != {tuple(old_values.shape)}"
+                        )
+                    if not torch.isfinite(values).all():
+                        raise FloatingPointError(
+                            f"PPO {phase} model returned non-finite values"
+                        )
+                    if not torch.isfinite(old_values).all():
+                        raise FloatingPointError(
+                            f"PPO {phase} replay has non-finite old values"
                         )
 
                     if self._flow_chunk_density:
@@ -1366,6 +1435,14 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                         valid_log_ratios.append(
                             selected.detach().to(device="cpu", dtype=torch.float32)
                         )
+                    selected_value_deltas = (values - old_values).abs()[~is_padding]
+                    if selected_value_deltas.numel() > 0:
+                        valid_value_deltas.append(
+                            selected_value_deltas.detach().to(
+                                device="cpu",
+                                dtype=torch.float32,
+                            )
+                        )
         finally:
             self.model.train(was_training)
 
@@ -1376,10 +1453,20 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             ratio_clip_high=self._grpo_ratio_clip_high,
         )
         prefix = f"train/{phase}"
+        value_deltas = (
+            torch.cat(valid_value_deltas)
+            if valid_value_deltas
+            else torch.empty(0, dtype=torch.float32)
+        )
+        metrics[f"{prefix}_value_valid_rows"] = int(value_deltas.numel())
+        metrics[f"{prefix}_value_max_abs_delta"] = (
+            float(value_deltas.max().item()) if value_deltas.numel() else 0.0
+        )
         logger.info(
             "AlpaGym PPO %s diagnostics valid_rows=%d "
             "ratio_p01=%.6f ratio_p50=%.6f ratio_p99=%.6f "
-            "clip_fraction=%.6f approx_kl=%.6f",
+            "clip_fraction=%.6f approx_kl=%.6f max_abs_log_ratio=%.6f "
+            "value_rows=%d value_max_abs_delta=%.6f",
             phase,
             int(metrics[f"{prefix}_valid_rows"]),
             float(metrics[f"{prefix}_ratio_p01"]),
@@ -1387,6 +1474,9 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             float(metrics[f"{prefix}_ratio_p99"]),
             float(metrics[f"{prefix}_clip_fraction"]),
             float(metrics[f"{prefix}_approx_kl"]),
+            float(metrics[f"{prefix}_max_abs_log_ratio"]),
+            int(metrics[f"{prefix}_value_valid_rows"]),
+            float(metrics[f"{prefix}_value_max_abs_delta"]),
         )
         return metrics
 
@@ -1397,6 +1487,35 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         phase: str,
     ) -> None:
         """Fail closed when calibrated behavior-policy KL exceeds its guard."""
+        if phase == "pre_update" and self._on_policy:
+            valid_rows = int(metrics["train/pre_update_valid_rows"])
+            max_abs_log_ratio = float(metrics["train/pre_update_max_abs_log_ratio"])
+            if valid_rows > 0 and (
+                not math.isfinite(max_abs_log_ratio) or max_abs_log_ratio > 1.0e-4
+            ):
+                raise FloatingPointError(
+                    "On-policy PPO pre-update replay differs from its behavior "
+                    "policy: max_abs_log_ratio="
+                    f"{max_abs_log_ratio:.6g} exceeds 0.0001"
+                )
+            if self._flow_chunk_density:
+                value_rows = int(metrics["train/pre_update_value_valid_rows"])
+                max_abs_value_delta = float(
+                    metrics["train/pre_update_value_max_abs_delta"]
+                )
+                if value_rows <= 0:
+                    raise FloatingPointError(
+                        "On-policy Flow-PPO pre-update replay has no value rows"
+                    )
+                if (
+                    not math.isfinite(max_abs_value_delta)
+                    or max_abs_value_delta > 1.0e-4
+                ):
+                    raise FloatingPointError(
+                        "On-policy Flow-PPO pre-update replay differs from its "
+                        "behavior critic: max_abs_value_delta="
+                        f"{max_abs_value_delta:.6g} exceeds 0.0001"
+                    )
         target = getattr(self, "_target_behavior_kl", None)
         if target is None:
             return
@@ -1407,6 +1526,10 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         valid_rows = int(metrics[f"{prefix}_valid_rows"])
         approx_kl = float(metrics[f"{prefix}_approx_kl"])
         if valid_rows <= 0:
+            if self._flow_chunk_density:
+                # Flow actor and critic parameters are disjoint, so a
+                # critic-only batch cannot move the behavior density.
+                return
             raise FloatingPointError(
                 f"PPO {phase_label} behavior-KL guard has no actor-valid replay rows"
             )
@@ -1510,7 +1633,10 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         minibatch = data_packer.policy_collate_fn(minibatch_samples)
         signal = minibatch.training_signal
         is_padding = signal.is_padding.to(self.device)
-        actor_valid = _ppo_actor_valid_mask(signal).to(self.device)
+        actor_valid = _ppo_actor_valid_mask(
+            signal,
+            required=self._flow_chunk_density,
+        ).to(self.device)
         actor_is_padding = is_padding | ~actor_valid
         old_logprobs = signal.old_logprobs.to(self.device)
         advantages = minibatch_advantages.to(device=self.device, dtype=torch.float32)
@@ -1587,9 +1713,13 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             value_clip_range=self._value_clip_range,
             huber_delta=self._value_huber_delta,
         )
-        loss = actor_loss_scale * (policy_loss + kl_loss) + (
-            self._value_loss_coef * value_loss_scale * value_loss
-        )
+        loss = self._value_loss_coef * value_loss_scale * value_loss
+        has_actor_rows = bool(((~is_padding) & actor_valid).any().item())
+        if actor_loss_scale > 0.0 and has_actor_rows:
+            # Do not attach an all-zero actor objective to critic-only batches.
+            # A zero-but-non-None AdamW gradient would still apply weight decay
+            # and advance actor optimizer state when the critic steps.
+            loss = loss + actor_loss_scale * (policy_loss + kl_loss)
 
         if apply_optimizer:
             self.optimizers.zero_grad()

@@ -507,6 +507,66 @@ def test_ppo_std_clamp_is_ordered_on_optimizer_cuda_stream(
     ]
 
 
+def test_zero_reduced_gradient_skips_adam_state_and_weight_decay(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A no-signal batch cannot mutate parameters or initialize Adam moments."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+
+    class _FakeStream:
+        def wait_stream(self, other: object) -> None:
+            del other
+
+    class _StreamContext:
+        def __init__(self, stream: object) -> None:
+            self._stream = stream
+
+        def __enter__(self) -> object:
+            return self._stream
+
+        def __exit__(self, *exc: object) -> None:
+            del exc
+
+    monkeypatch.setattr(torch.cuda, "current_stream", _FakeStream)
+    monkeypatch.setattr(torch.cuda, "stream", _StreamContext)
+    monkeypatch.setattr(
+        trainer_module.dist_util,
+        "gradient_reduce_across_dp_replicas_",
+        lambda *args, **kwargs: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        trainer_module.dist_util,
+        "gradient_norm_clipping",
+        lambda *args, **kwargs: torch.tensor(0.0),
+        raising=False,
+    )
+
+    trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
+    trainer.train_stream = _FakeStream()
+    trainer.model = torch.nn.Linear(1, 1, bias=False)
+    trainer.model.weight.data.fill_(2.0)
+    trainer.model.weight.grad = torch.zeros_like(trainer.model.weight)
+    trainer.optimizers = torch.optim.AdamW(
+        trainer.model.parameters(),
+        lr=0.1,
+        weight_decay=0.1,
+    )
+    trainer.parallel_dims = SimpleNamespace(pp_enabled=False)
+    trainer.config = SimpleNamespace(train=SimpleNamespace(optm_grad_norm_clip=1.0))
+    trainer._optimizer_steps_applied_in_training_step = 0
+    before = trainer.model.weight.detach().clone()
+
+    grad_norm = trainer.all_reduce_states(object())
+
+    assert grad_norm == 0.0
+    torch.testing.assert_close(trainer.model.weight, before)
+    assert trainer.optimizers.state == {}
+    assert trainer._optimizer_steps_applied_in_training_step == 0
+
+
 def test_ppo_smoke_rl_training_step_with_mlp_actor_and_value_network(
     cosmos_stubs: None,
 ) -> None:
@@ -659,6 +719,37 @@ def test_ppo_actor_invalid_rows_train_value_but_not_actor_or_kl(
     metrics = trainer._post_update_diagnostics([object(), object()])
     assert metrics["train/post_update_valid_rows"] == 0
     assert metrics["train/post_update_ratio_p50"] == 1.0
+    assert metrics["train/post_update_value_valid_rows"] == 2
+    assert metrics["train/post_update_value_max_abs_delta"] > 0.0
+
+
+def test_ppo_critic_only_adamw_does_not_decay_or_advance_actor(
+    cosmos_stubs: None,
+) -> None:
+    """Critic-only replay leaves actor parameters and AdamW state untouched."""
+    del cosmos_stubs
+    model = _ActorCriticValueModel()
+    model.logprob_bias.data.fill_(2.0)
+    trainer = _trainer_for_ppo_replay_test(model)
+    trainer.data_packer = _ActorInvalidPpoPacker()
+    trainer.optimizers = torch.optim.AdamW(
+        trainer.model.parameters(),
+        lr=0.1,
+        weight_decay=0.1,
+    )
+    actor_before = model.logprob_bias.detach().clone()
+    critic_before = model.value_bias.detach().clone()
+
+    trainer._train_minibatch(
+        minibatch_samples=[object(), object()],
+        minibatch_advantages=torch.tensor([5.0, -3.0]),
+        inter_policy_nccl=object(),
+    )
+
+    torch.testing.assert_close(model.logprob_bias, actor_before)
+    assert not torch.equal(model.value_bias.detach(), critic_before)
+    assert model.logprob_bias not in trainer.optimizers.state
+    assert model.value_bias in trainer.optimizers.state
 
 
 # ---------------------------------------------------------------------------
@@ -840,6 +931,7 @@ def test_step_training_no_samples_fails_before_scheduler_step(
     trainer._mini_batch = 1
     trainer._grpo_optimization_iterations = 1
     trainer._allowed_outdated_steps = 100
+    trainer._on_policy = True
     trainer.config = SimpleNamespace(train=SimpleNamespace(train_batch_per_replica=1))
     monkeypatch.setattr(
         trainer_module, "filter_trainable_rollouts", lambda rollouts, **kwargs: rollouts
@@ -881,6 +973,7 @@ def test_step_training_success_reports_scalar_scheduler_lr(
     trainer._mini_batch = 1
     trainer._grpo_optimization_iterations = 1
     trainer._allowed_outdated_steps = 100
+    trainer._on_policy = True
     trainer.config = SimpleNamespace(train=SimpleNamespace(train_batch_per_replica=1))
     monkeypatch.setattr(
         trainer_module, "filter_trainable_rollouts", lambda rollouts, **kwargs: rollouts
@@ -889,19 +982,21 @@ def test_step_training_success_reports_scalar_scheduler_lr(
         [object()],
         torch.tensor([0.5], dtype=torch.float32),
     )
-    trainer._run_training_loop = lambda samples, advantages, nccl: (
-        2.0,
-        0.25,
-        2,
-        1.1,
-        0.9,
-        0.5,
-        0.0,
-    )
+
+    def _successful_training_loop(
+        samples: list[Any],
+        advantages: torch.Tensor,
+        nccl: object,
+    ) -> tuple[float, float, int, float, float, float, float]:
+        del samples, advantages, nccl
+        trainer._optimizer_steps_applied_in_training_step = 2
+        return (2.0, 0.25, 2, 1.1, 0.9, 0.5, 0.0)
+
+    trainer._run_training_loop = _successful_training_loop
     trainer._reference_reset = lambda current_step: None
 
     metrics = trainer.step_training(
-        rollouts=[object()],
+        rollouts=[SimpleNamespace(weight_version=7)],
         current_step=8,
         total_steps=10,
         remain_samples_num=0,
@@ -913,7 +1008,102 @@ def test_step_training_success_reports_scalar_scheduler_lr(
     assert metrics["train/loss_avg"] == 1.0
     assert metrics["train/kl_avg"] == 0.125
     assert metrics["train/clip_fraction"] == 0.25
+    assert metrics["train/optimizer_steps_applied"] == 2
     assert scheduler.steps == 1
+
+
+def test_step_training_rejects_uniformly_stale_on_policy_batch_before_unpack(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An all-stale batch cannot bypass the mixed-version replay guard."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
+    trainer._group_size = 1
+    trainer._mini_batch = 1
+    trainer._grpo_optimization_iterations = 1
+    trainer._allowed_outdated_steps = 0
+    trainer._on_policy = True
+    trainer.config = SimpleNamespace(train=SimpleNamespace(train_batch_per_replica=2))
+    monkeypatch.setattr(
+        trainer_module, "filter_trainable_rollouts", lambda rollouts, **kwargs: rollouts
+    )
+    unpacked = False
+
+    def _unexpected_unpack(rollouts: list[Any]) -> Any:
+        del rollouts
+        nonlocal unpacked
+        unpacked = True
+        raise AssertionError("stale replay reached artifact unpack")
+
+    trainer._prepare_training_data = _unexpected_unpack
+
+    with pytest.raises(ValueError, match="exact behavior version 2"):
+        trainer.step_training(
+            rollouts=[
+                SimpleNamespace(weight_version=1),
+                SimpleNamespace(weight_version=1),
+            ],
+            current_step=3,
+            total_steps=3,
+            remain_samples_num=0,
+            inter_policy_nccl=object(),
+            is_master_replica=True,
+        )
+
+    assert not unpacked
+
+
+def test_step_training_does_not_advance_scheduler_without_optimizer_step(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero-gradient PPO pass leaves both Adam and LR clocks unchanged."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
+    scheduler = _ListLRScheduler(0.05)
+    trainer.lr_schedulers = scheduler
+    trainer.parallel_dims = SimpleNamespace(
+        dp_replicate_enabled=False,
+        dp_shard_enabled=False,
+        cp_enabled=False,
+    )
+    trainer._group_size = 1
+    trainer._mini_batch = 1
+    trainer._grpo_optimization_iterations = 1
+    trainer._allowed_outdated_steps = 0
+    trainer._on_policy = True
+    trainer.config = SimpleNamespace(train=SimpleNamespace(train_batch_per_replica=1))
+    monkeypatch.setattr(
+        trainer_module, "filter_trainable_rollouts", lambda rollouts, **kwargs: rollouts
+    )
+    trainer._prepare_training_data = lambda rollouts: (
+        [object()],
+        torch.tensor([0.0], dtype=torch.float32),
+    )
+
+    def _zero_gradient_pass(
+        *args: Any,
+    ) -> tuple[float, float, int, float, float, float, float]:
+        del args
+        trainer._optimizer_steps_applied_in_training_step = 0
+        return (0.0, 0.0, 0, 1.0, 1.0, 0.0, 0.0)
+
+    trainer._run_training_loop = _zero_gradient_pass
+
+    metrics = trainer.step_training(
+        rollouts=[SimpleNamespace(weight_version=0)],
+        current_step=1,
+        total_steps=2,
+        remain_samples_num=0,
+        inter_policy_nccl=object(),
+        is_master_replica=True,
+    )
+
+    assert metrics["train/optimizer_steps_applied"] == 0
+    assert scheduler.steps == 0
 
 
 def test_ppo_pre_update_behavior_kl_guard_rejects_before_training(
@@ -957,6 +1147,136 @@ def test_ppo_pre_update_behavior_kl_guard_rejects_before_training(
     assert events == []
     assert trainer.lr_schedulers.steps == 0
     assert trainer.saved_checkpoints == []
+
+
+def test_on_policy_ppo_rejects_same_version_with_wrong_behavior_density(
+    cosmos_stubs: None,
+) -> None:
+    """Version labels cannot hide a trace scored under different weights."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer._on_policy = True
+    trainer._target_behavior_kl = None
+
+    with pytest.raises(FloatingPointError, match="differs from its behavior policy"):
+        trainer._validate_update_diagnostics(
+            {
+                "train/pre_update_valid_rows": 30,
+                "train/pre_update_max_abs_log_ratio": 1.0e-3,
+            },
+            phase="pre_update",
+        )
+
+
+def test_on_policy_ppo_accepts_exact_pre_update_behavior_density(
+    cosmos_stubs: None,
+) -> None:
+    """Exact same-weight replay passes independently of the optional KL target."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer._on_policy = True
+    trainer._target_behavior_kl = None
+
+    trainer._validate_update_diagnostics(
+        {
+            "train/pre_update_valid_rows": 30,
+            "train/pre_update_max_abs_log_ratio": 0.0,
+        },
+        phase="pre_update",
+    )
+
+
+def test_on_policy_ppo_accepts_critic_only_batch_without_density_rows(
+    cosmos_stubs: None,
+) -> None:
+    """An all-unexecuted batch may still train the detached value head."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer._on_policy = True
+    trainer._target_behavior_kl = None
+
+    trainer._validate_update_diagnostics(
+        {
+            "train/pre_update_valid_rows": 0,
+            "train/pre_update_max_abs_log_ratio": 0.0,
+        },
+        phase="pre_update",
+    )
+
+
+def test_on_policy_flow_ppo_rejects_wrong_behavior_critic_value(
+    cosmos_stubs: None,
+) -> None:
+    """Actor equality cannot hide a stale or partially synced behavior critic."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymFlowPPOTrainer)
+    trainer._on_policy = True
+    trainer._target_behavior_kl = None
+
+    with pytest.raises(FloatingPointError, match="behavior critic"):
+        trainer._validate_update_diagnostics(
+            {
+                "train/pre_update_valid_rows": 30,
+                "train/pre_update_max_abs_log_ratio": 0.0,
+                "train/pre_update_value_valid_rows": 30,
+                "train/pre_update_value_max_abs_delta": 1.0e-3,
+            },
+            phase="pre_update",
+        )
+
+
+def test_on_policy_flow_ppo_accepts_exact_behavior_critic_value(
+    cosmos_stubs: None,
+) -> None:
+    """Exact actor and critic replay passes the complete on-policy gate."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymFlowPPOTrainer)
+    trainer._on_policy = True
+    trainer._target_behavior_kl = None
+
+    trainer._validate_update_diagnostics(
+        {
+            "train/pre_update_valid_rows": 30,
+            "train/pre_update_max_abs_log_ratio": 0.0,
+            "train/pre_update_value_valid_rows": 30,
+            "train/pre_update_value_max_abs_delta": 0.0,
+        },
+        phase="pre_update",
+    )
+
+
+def test_flow_ppo_optional_kl_guard_allows_critic_only_batch(
+    cosmos_stubs: None,
+) -> None:
+    """No actor rows means no Flow policy density moved for the KL guard."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymFlowPPOTrainer)
+    trainer._on_policy = True
+    trainer._target_behavior_kl = 0.1
+
+    trainer._validate_update_diagnostics(
+        {
+            "train/pre_update_valid_rows": 0,
+            "train/pre_update_max_abs_log_ratio": 0.0,
+            "train/pre_update_value_valid_rows": 2,
+            "train/pre_update_value_max_abs_delta": 0.0,
+            "train/pre_update_approx_kl": 0.0,
+        },
+        phase="pre_update",
+    )
+    trainer._validate_update_diagnostics(
+        {
+            "train/post_update_valid_rows": 0,
+            "train/post_update_approx_kl": 0.0,
+        },
+        phase="post_update",
+    )
 
 
 def test_ppo_post_update_behavior_kl_guard_precedes_scheduler_and_checkpoint(
@@ -1321,6 +1641,9 @@ def _step_without_distributed(self: Any, inter_policy_nccl: Any) -> float:
     """Apply optimizer updates without distributed collectives."""
     del inter_policy_nccl
     self.optimizers.step()
+    self._optimizer_steps_applied_in_training_step = (
+        int(getattr(self, "_optimizer_steps_applied_in_training_step", 0)) + 1
+    )
     self.optimizers.zero_grad()
     return 0.0
 
@@ -1499,6 +1822,7 @@ def _ppo_step_guard_trainer(trainer_module: Any) -> Any:
     trainer._mini_batch = 1
     trainer._grpo_optimization_iterations = 1
     trainer._allowed_outdated_steps = 100
+    trainer._on_policy = False
     trainer._target_behavior_kl = 0.1
     trainer.config = SimpleNamespace(
         train=SimpleNamespace(
@@ -2099,6 +2423,7 @@ def test_step_training_honors_requested_and_final_checkpoint_fallbacks(
     trainer._mini_batch = 1
     trainer._grpo_optimization_iterations = 1
     trainer._allowed_outdated_steps = 100
+    trainer._on_policy = False
     trainer.config = SimpleNamespace(
         train=SimpleNamespace(
             train_batch_per_replica=1,
@@ -2112,15 +2437,17 @@ def test_step_training_honors_requested_and_final_checkpoint_fallbacks(
         [object()],
         torch.tensor([0.5], dtype=torch.float32),
     )
-    trainer._run_training_loop = lambda samples, advantages, nccl: (
-        1.0,
-        0.0,
-        1,
-        1.0,
-        1.0,
-        0.0,
-        0.0,
-    )
+
+    def _successful_training_loop(
+        samples: list[Any],
+        advantages: torch.Tensor,
+        nccl: object,
+    ) -> tuple[float, float, int, float, float, float, float]:
+        del samples, advantages, nccl
+        trainer._optimizer_steps_applied_in_training_step = 1
+        return (1.0, 0.0, 1, 1.0, 1.0, 0.0, 0.0)
+
+    trainer._run_training_loop = _successful_training_loop
     saves: list[tuple[int, int, int]] = []
 
     def _record_save(step: int, steps: int, remaining: int) -> None:

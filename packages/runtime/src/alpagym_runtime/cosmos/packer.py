@@ -337,6 +337,8 @@ def _extract_transition_training_signal(
         raise TypeError("PolicyReplayData payload['transition'] must be a mapping")
 
     signals: dict[str, torch.Tensor] = {}
+    actor_valid_raw: object | None = None
+    duration_ticks_raw: object | None = None
     for field_name, aliases in _FLOAT_TRANSITION_SIGNAL_ALIASES.items():
         for alias in aliases:
             if alias in transition_payload:
@@ -351,6 +353,8 @@ def _extract_transition_training_signal(
             if alias in transition_payload:
                 value = transition_payload[alias]
                 if value is not None:
+                    if field_name == "actor_valid":
+                        actor_valid_raw = value
                     signals[field_name] = torch.as_tensor(
                         value, dtype=torch.bool
                     ).reshape(1)
@@ -375,10 +379,45 @@ def _extract_transition_training_signal(
         if alias in transition_payload:
             value = transition_payload[alias]
             if value is not None:
+                duration_ticks_raw = value
                 signals["duration_ticks"] = torch.as_tensor(
                     value, dtype=torch.int64
                 ).reshape(1)
             break
+    if replay_data.model_family == "g1_vla" and "duration_ticks" in signals:
+        if "actor_valid" not in signals:
+            raise ValueError(
+                "g1_vla motion-reference replay is missing transition.actor_valid"
+            )
+        if not isinstance(actor_valid_raw, bool):
+            raise ValueError(
+                "g1_vla motion-reference replay requires boolean transition.actor_valid"
+            )
+        if isinstance(duration_ticks_raw, bool) or not isinstance(
+            duration_ticks_raw, int
+        ):
+            raise ValueError(
+                "g1_vla motion-reference replay requires integer "
+                "transition.duration_ticks"
+            )
+        owning_ticks_raw = transition_payload.get("owning_reference_executed_ticks")
+        if isinstance(owning_ticks_raw, bool) or not isinstance(owning_ticks_raw, int):
+            raise ValueError(
+                "g1_vla motion-reference replay requires integer "
+                "transition.owning_reference_executed_ticks"
+            )
+        duration = int(signals["duration_ticks"].item())
+        if not 0 <= owning_ticks_raw <= duration:
+            raise ValueError(
+                "g1_vla owning_reference_executed_ticks must be within "
+                f"[0, duration_ticks], got {owning_ticks_raw} and {duration}"
+            )
+        actor_valid = bool(signals["actor_valid"].item())
+        if actor_valid != (owning_ticks_raw > 0):
+            raise ValueError(
+                "g1_vla transition.actor_valid must equal "
+                "(owning_reference_executed_ticks > 0)"
+            )
     return signals
 
 

@@ -157,6 +157,109 @@ def test_replay_packer_extracts_transition_signal_and_zero_pads_it(
     assert torch.equal(batch.weight_versions, torch.full((3,), 7, dtype=torch.int64))
 
 
+@pytest.mark.parametrize(
+    ("drop_key", "overrides", "error_match"),
+    (
+        ("actor_valid", {}, "missing transition.actor_valid"),
+        (
+            "owning_reference_executed_ticks",
+            {},
+            "requires integer transition.owning_reference_executed_ticks",
+        ),
+        (
+            None,
+            {"owning_reference_executed_ticks": 26},
+            "must be within \\[0, duration_ticks\\]",
+        ),
+        (
+            None,
+            {"owning_reference_executed_ticks": 0, "actor_valid": True},
+            "actor_valid must equal",
+        ),
+        (
+            None,
+            {"actor_valid": 1},
+            "requires boolean transition.actor_valid",
+        ),
+        (
+            None,
+            {"duration_ticks": 25.9},
+            "requires integer transition.duration_ticks",
+        ),
+        (
+            None,
+            {"duration_ticks": True},
+            "requires integer transition.duration_ticks",
+        ),
+    ),
+)
+def test_g1_motion_replay_fails_closed_on_invalid_actor_ownership(
+    cosmos_stubs: None,
+    drop_key: str | None,
+    overrides: dict[str, object],
+    error_match: str,
+) -> None:
+    """Corrupt motion ownership cannot silently become a Flow actor row."""
+    del cosmos_stubs
+    packer_module = importlib.import_module("alpagym_runtime.cosmos.packer")
+    transition: dict[str, object] = {
+        "reward": 0.0,
+        "terminated": False,
+        "truncated": False,
+        "old_value": 0.0,
+        "primitive_rewards": [0.0] * 25,
+        "primitive_reward_mask": [True] * 25,
+        "duration_ticks": 25,
+        "owning_reference_executed_ticks": 25,
+        "actor_valid": True,
+    }
+    if drop_key is not None:
+        transition.pop(drop_key)
+    transition.update(overrides)
+    replay = PolicyReplayData(
+        replay_schema_version=1,
+        payload_schema="g1_vla.flow_sde.v1",
+        payload_schema_version=1,
+        model_family="g1_vla",
+        action_selection=ActionSelection(set_ix=0, sample_ix=0),
+        old_logprob=torch.tensor(0.0),
+        payload={"transition": transition},
+    )
+
+    with pytest.raises(ValueError, match=error_match):
+        packer_module._extract_transition_training_signal(replay)
+
+
+def test_g1_motion_replay_accepts_consistent_actor_ownership(
+    cosmos_stubs: None,
+) -> None:
+    """Executed source ticks and actor_valid agree on a valid replay row."""
+    del cosmos_stubs
+    packer_module = importlib.import_module("alpagym_runtime.cosmos.packer")
+    replay = PolicyReplayData(
+        replay_schema_version=1,
+        payload_schema="g1_vla.flow_sde.v1",
+        payload_schema_version=1,
+        model_family="g1_vla",
+        action_selection=ActionSelection(set_ix=0, sample_ix=0),
+        old_logprob=torch.tensor(0.0),
+        payload={
+            "transition": {
+                "primitive_rewards": [0.0] * 25,
+                "primitive_reward_mask": [True] * 25,
+                "duration_ticks": 25,
+                "owning_reference_executed_ticks": 25,
+                "actor_valid": True,
+            }
+        },
+    )
+
+    signals = packer_module._extract_transition_training_signal(replay)
+
+    assert bool(signals["actor_valid"].item())
+    assert int(signals["duration_ticks"].item()) == 25
+
+
 def test_replay_packer_exact_t_pack_has_no_padding(
     tmp_path: Path,
     cosmos_stubs: None,

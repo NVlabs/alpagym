@@ -13,6 +13,7 @@ from alpagym_runtime.cosmos.replay_objective import (
     compute_flow_ppo_surrogate,
     compute_value_loss,
 )
+from alpagym_runtime.replay import TrainingSignal
 
 
 def test_flow_ppo_uses_one_joint_chunk_ratio(cosmos_stubs: None) -> None:
@@ -170,6 +171,20 @@ def test_flow_ppo_actor_mask_excludes_unexecuted_chunk(cosmos_stubs: None) -> No
 
     torch.testing.assert_close(ratios, torch.tensor([0.0, 1.1]))
     torch.testing.assert_close(loss, torch.tensor(-2.2))
+
+
+def test_flow_ppo_requires_explicit_actor_valid(cosmos_stubs: None) -> None:
+    """A missing ownership bit cannot default a Flow chunk into actor training."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    signal = TrainingSignal(
+        old_logprobs=torch.zeros(1, dtype=torch.float32),
+        actor_valid=None,
+        is_padding=torch.zeros(1, dtype=torch.bool),
+    )
+
+    with pytest.raises(ValueError, match="requires TrainingSignal.actor_valid"):
+        trainer_module._ppo_actor_valid_mask(signal, required=True)
 
 
 def test_flow_ppo_value_loss_uses_clipped_huber(cosmos_stubs: None) -> None:

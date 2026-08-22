@@ -17,6 +17,7 @@ from PIL import Image
 from alpagym_host.config import SamplingParamsConfig
 
 from alpagym_g1_vla.cosmos_model import load_vla_rollout_model
+from alpagym_g1_vla.humanoid_policy import G1VlaHumanoidPolicy
 from alpagym_g1_vla.inference_model import VlaNativeInferenceModel
 from alpagym_g1_vla.model import VlaPolicySample, VlaPsiActorCritic
 from alpagym_runtime.cosmos.replay_objective import (
@@ -51,12 +52,22 @@ def _build_model_inputs(
     device: torch.device,
 ) -> dict[str, Any]:
     """Build one deterministic real-processor observation for the smoke."""
-    image = Image.new("RGB", (224, 224), color=(32, 48, 64))
+    image = Image.new("RGB", (640, 480), color=(32, 48, 64))
+    prepared: tuple[Any, ...] = ()
     try:
         psi = cast(Any, core.psi_model)
-        built = psi._build_vlm_batch([[image]], [instruction])
+        prepared = G1VlaHumanoidPolicy._apply_checkpoint_eval_image_transform(
+            psi,
+            (image,),
+        )
+        built = G1VlaHumanoidPolicy._build_training_compatible_vlm_batch(
+            psi,
+            [list(prepared)],
+            [instruction],
+        )
     finally:
-        image.close()
+        for candidate in (image, *prepared):
+            candidate.close()
     if not isinstance(built, tuple) or len(built) != 6:
         raise TypeError("Psi _build_vlm_batch returned an unexpected contract")
     converted = tuple(
@@ -197,6 +208,7 @@ def main() -> None:
     trainer_values_before = trainer_before["values"]
     old_elements_before = old_before["element_log_probs"]
     old_joint_before = old_before["log_probs"]
+    old_values_before = old_before["values"]
     if any(
         item is None
         for item in (
@@ -205,6 +217,7 @@ def main() -> None:
             trainer_values_before,
             old_elements_before,
             old_joint_before,
+            old_values_before,
         )
     ):
         raise RuntimeError("VLA replay omitted PPO outputs")
@@ -213,6 +226,7 @@ def main() -> None:
     assert isinstance(trainer_values_before, torch.Tensor)
     assert isinstance(old_elements_before, torch.Tensor)
     assert isinstance(old_joint_before, torch.Tensor)
+    assert isinstance(old_values_before, torch.Tensor)
     if _max_delta(trainer_elements_before, sample0.old_element_logprobs) != 0.0:
         raise RuntimeError("pre-update trainer replay differs from behavior policy")
     if _max_delta(old_elements_before, sample0.old_element_logprobs) != 0.0:
@@ -221,8 +235,13 @@ def main() -> None:
         raise RuntimeError("pre-update trainer joint density differs from behavior")
     if _max_delta(old_joint_before, sample0.old_log_probs) != 0.0:
         raise RuntimeError("version-0 lease joint density differs from behavior")
+    if _max_delta(trainer_values_before, sample0.values) != 0.0:
+        raise RuntimeError("pre-update trainer value differs from behavior critic")
+    if _max_delta(old_values_before, sample0.values) != 0.0:
+        raise RuntimeError("version-0 lease value differs from behavior critic")
 
-    action_parameters = tuple(trainer.actor_critic.psi_model.action_header.parameters())
+    action_header = cast(Any, trainer.actor_critic.psi_model.action_header)
+    action_parameters = tuple(action_header.parameters())
     critic_parameters = tuple(trainer.actor_critic.critic.parameters())
     action_parameter_ids = {id(parameter) for parameter in action_parameters}
     critic_parameter_ids = {id(parameter) for parameter in critic_parameters}
@@ -233,7 +252,7 @@ def main() -> None:
         raise RuntimeError("VLA optimizer groups do not cover trainable parameters")
     action_optimizer = torch.optim.AdamW(
         action_parameters,
-        lr=5.0e-6,
+        lr=1.0e-6,
         betas=(0.9, 0.999),
         eps=1.0e-8,
         weight_decay=0.01,
@@ -313,22 +332,30 @@ def main() -> None:
     old_after = _replay(core0, inputs, sample0)
     new_after = _replay(core1, inputs, sample0)
     old_elements_after = old_after["element_log_probs"]
+    old_values_after = old_after["values"]
     new_elements_after = new_after["element_log_probs"]
     new_values_after = new_after["values"]
     if any(
         item is None
-        for item in (old_elements_after, new_elements_after, new_values_after)
+        for item in (
+            old_elements_after,
+            old_values_after,
+            new_elements_after,
+            new_values_after,
+        )
     ):
         raise RuntimeError("lease replay omitted PPO outputs")
     assert isinstance(old_elements_after, torch.Tensor)
+    assert isinstance(old_values_after, torch.Tensor)
     assert isinstance(new_elements_after, torch.Tensor)
     assert isinstance(new_values_after, torch.Tensor)
     old_immutability_delta = _max_delta(
         old_elements_after, sample0.old_element_logprobs
     )
+    old_value_immutability_delta = _max_delta(old_values_after, sample0.values)
     new_element_sync_delta = _max_delta(new_elements_after, trainer_elements_after)
     new_value_sync_delta = _max_delta(new_values_after, trainer_values_after)
-    if old_immutability_delta != 0.0:
+    if old_immutability_delta != 0.0 or old_value_immutability_delta != 0.0:
         raise RuntimeError("open version-0 lease changed during weight sync")
     if new_element_sync_delta != 0.0 or new_value_sync_delta != 0.0:
         raise RuntimeError("version-1 lease differs from the updated trainer")
@@ -362,13 +389,14 @@ def main() -> None:
         "versions": [lease0.behavior_policy_version, lease1.behavior_policy_version],
         "trainable_parameter_tensors": len(trainable_names),
         "finite_nonzero_gradient_tensors": finite_nonzero_gradients,
-        "action_learning_rate": 5.0e-6,
+        "action_learning_rate": 1.0e-6,
         "critic_learning_rate": 1.0e-4,
         "valid_ratio_before_min": float(valid_ratios.detach().min().cpu()),
         "valid_ratio_before_max": float(valid_ratios.detach().max().cpu()),
         "post_update_element_logprob_max_delta": element_update_delta,
         "post_update_value_max_delta": value_update_delta,
         "old_lease_immutability_max_delta": old_immutability_delta,
+        "old_lease_value_immutability_max_delta": old_value_immutability_delta,
         "new_lease_vs_trainer_element_max_delta": new_element_sync_delta,
         "new_lease_vs_trainer_value_max_delta": new_value_sync_delta,
         "new_lease_sample_replay_max_delta": new_sample_replay_delta,
