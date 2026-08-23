@@ -198,7 +198,6 @@ def test_wizard_command_selects_visual_sonic_as_atomic_tracker_profile(
         scene_store_path="/workspace/scenes",
         scenario_ids_by_scene={"hq_stairs": "ascend"},
         execution_profile=HumanoidExecutionProfile.motion_reference,
-        grail_root_path="/workspace/GRAIL",
         reference_controller_profile=(HumanoidReferenceControllerProfile.sonic_visual),
         visual_controller_release_path="/workspace/visual-sonic-release",
         robot_physics_profile=(
@@ -221,6 +220,9 @@ def test_wizard_command_selects_visual_sonic_as_atomic_tracker_profile(
     )
 
     assert "runtime_domain=humanoid_reference_visual" in command
+    assert not any(
+        item.startswith("defines.humanoid_grail_root=") for item in command
+    )
     assert (
         "defines.humanoid_visual_controller_release=/workspace/visual-sonic-release"
     ) in command

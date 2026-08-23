@@ -232,10 +232,6 @@ def _build_wizard_command(
                 + json.dumps(fingerprint_json)
             )
         if reference_mode:
-            assert config.humanoid.grail_root_path is not None
-            argv.append(
-                f"defines.humanoid_grail_root={config.humanoid.grail_root_path}"
-            )
             if (
                 config.humanoid.reference_controller_profile
                 is HumanoidReferenceControllerProfile.sonic_visual
@@ -250,6 +246,11 @@ def _build_wizard_command(
                 argv.append(
                     "defines.humanoid_robot_physics_profile="
                     + json.dumps(config.humanoid.robot_physics_profile)
+                )
+            else:
+                assert config.humanoid.grail_root_path is not None
+                argv.append(
+                    f"defines.humanoid_grail_root={config.humanoid.grail_root_path}"
                 )
     extra_overrides = shlex.split(wizard_args.extra_overrides)
     if reference_mode:

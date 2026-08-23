@@ -515,7 +515,7 @@ class HumanoidAlpaSimConfig:
     execution_profile: HumanoidExecutionProfile = HumanoidExecutionProfile.direct_action
     # Selects the exact AlpaSim motion-reference wire profile.
     reference_frame_count: int = 50
-    # Required by the fixed GRAIL/SONIC controller image in reference mode.
+    # Required only by the legacy privileged-heightmap GRAIL controller.
     grail_root_path: str | None = None
     reference_controller_profile: HumanoidReferenceControllerProfile = (
         HumanoidReferenceControllerProfile.grail_heightmap
@@ -576,10 +576,13 @@ class HumanoidAlpaSimConfig:
             )
         if (
             self.execution_profile is HumanoidExecutionProfile.motion_reference
+            and self.reference_controller_profile
+            is HumanoidReferenceControllerProfile.grail_heightmap
             and not self.grail_root_path
         ):
             raise ValueError(
-                "HumanoidAlpaSimConfig.grail_root_path is required for motion_reference"
+                "HumanoidAlpaSimConfig.grail_root_path is required for "
+                "grail_heightmap motion_reference"
             )
         visual_reference_controller = (
             self.execution_profile is HumanoidExecutionProfile.motion_reference

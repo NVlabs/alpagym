@@ -1031,11 +1031,6 @@ def test_humanoid_policy_camera_requires_disjoint_runtime_cache() -> None:
         ),
         (
             "/tmp/humanoid-cache",
-            "/tmp/GRAIL/native-cache",
-            "grail_root_path",
-        ),
-        (
-            "/tmp/humanoid-cache",
             "/tmp/visual-sonic-release/native-cache",
             "visual_controller_release_path",
         ),
@@ -1061,7 +1056,6 @@ def _visual_sonic_humanoid_config(**overrides: object) -> HumanoidAlpaSimConfig:
         "runtime_cache_path": "/tmp/humanoid-runtime-cache",
         "scenario_ids_by_scene": {"stairs": "ascend"},
         "execution_profile": HumanoidExecutionProfile.motion_reference,
-        "grail_root_path": "/tmp/GRAIL",
         "reference_controller_profile": (
             HumanoidReferenceControllerProfile.sonic_visual
         ),
@@ -1079,6 +1073,25 @@ def _visual_sonic_humanoid_config(**overrides: object) -> HumanoidAlpaSimConfig:
 def test_visual_sonic_requires_explicit_robot_physics_profile() -> None:
     with pytest.raises(ValueError, match="requires an explicit robot_physics_profile"):
         _visual_sonic_humanoid_config(robot_physics_profile=None)
+
+
+def test_visual_sonic_is_self_contained_without_grail_checkout() -> None:
+    config = _visual_sonic_humanoid_config()
+    assert config.grail_root_path is None
+
+
+def test_heightmap_sonic_still_requires_grail_checkout() -> None:
+    with pytest.raises(ValueError, match="grail_heightmap motion_reference"):
+        HumanoidAlpaSimConfig(
+            repo_path="/tmp/alpasim-humanoid",
+            scene_store_path="/tmp/humanoid-scenes",
+            scenario_ids_by_scene={"stairs": "ascend"},
+            execution_profile=HumanoidExecutionProfile.motion_reference,
+            reference_controller_profile=(
+                HumanoidReferenceControllerProfile.grail_heightmap
+            ),
+            reward_profile_id="reference_route_centered.v3",
+        )
 
 
 @pytest.mark.parametrize(
@@ -1726,6 +1739,55 @@ def test_vla_slurm_accepts_all_worker_mounts_and_local_needs_none(
         _validate_vla_slurm_worker_mounts(cast(RunConfig, config))
     config.execution.backend = ExecutionBackend.local_process
     config.execution.slurm.container_mounts = []
+    _validate_vla_slurm_worker_mounts(cast(RunConfig, config))
+
+
+def test_vla_visual_sonic_slurm_needs_no_grail_mount(tmp_path: Path) -> None:
+    policy_eval_root = tmp_path / "policy_eval"
+    model_root = policy_eval_root / "models" / "vla-model"
+    humanoid_repo = tmp_path / "humanoid_repo"
+    scene_store = tmp_path / "scene_store"
+    scene_cache = tmp_path / "scene_cache"
+    runtime_cache = tmp_path / "runtime_cache"
+    visual_release = tmp_path / "visual_release"
+    alpasim_repo = tmp_path / "alpasim_repo"
+    worker_paths = (
+        policy_eval_root,
+        humanoid_repo,
+        scene_store,
+        scene_cache,
+        runtime_cache,
+        visual_release,
+        alpasim_repo,
+    )
+    config = SimpleNamespace(
+        execution=SimpleNamespace(
+            backend=ExecutionBackend.slurm,
+            slurm=SimpleNamespace(
+                container_mounts=[f"{path}:{path}" for path in worker_paths]
+            ),
+        ),
+        policy=SimpleNamespace(
+            model=SimpleNamespace(kind="g1_vla", path=str(model_root))
+        ),
+        alpasim=SimpleNamespace(
+            repo_path=str(alpasim_repo),
+            checkout_cache_dir=None,
+            humanoid=SimpleNamespace(
+                execution_profile=HumanoidExecutionProfile.motion_reference,
+                reference_controller_profile=(
+                    HumanoidReferenceControllerProfile.sonic_visual
+                ),
+                repo_path=str(humanoid_repo),
+                scene_store_path=str(scene_store),
+                grail_root_path=None,
+                scene_cache_path=str(scene_cache),
+                runtime_cache_path=str(runtime_cache),
+                visual_controller_release_path=str(visual_release),
+            ),
+        ),
+    )
+
     _validate_vla_slurm_worker_mounts(cast(RunConfig, config))
 
 

@@ -1153,11 +1153,19 @@ def _validate_vla_slurm_worker_mounts(config: RunConfig) -> None:
         ("alpasim.humanoid.repo_path", Path(humanoid.repo_path)),
         ("alpasim.humanoid.scene_store_path", Path(humanoid.scene_store_path)),
     ]
-    if humanoid.grail_root_path is None:
-        raise ValueError("VLA motion_reference requires grail_root_path")
-    required_paths.append(
-        ("alpasim.humanoid.grail_root_path", Path(humanoid.grail_root_path))
-    )
+    if (
+        getattr(
+            humanoid,
+            "reference_controller_profile",
+            HumanoidReferenceControllerProfile.grail_heightmap,
+        )
+        is HumanoidReferenceControllerProfile.grail_heightmap
+    ):
+        if humanoid.grail_root_path is None:
+            raise ValueError("GRAIL heightmap motion_reference requires grail_root_path")
+        required_paths.append(
+            ("alpasim.humanoid.grail_root_path", Path(humanoid.grail_root_path))
+        )
     if humanoid.scene_cache_path is None:
         raise ValueError("VLA policy camera requires scene_cache_path")
     required_paths.append(

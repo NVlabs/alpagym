@@ -33,7 +33,6 @@ alpasim:
       hq_stairs: ascend
     execution_profile: motion_reference
     reference_frame_count: 50
-    grail_root_path: ???
     reference_controller_profile: sonic_visual
     visual_controller_release_path: ???
     # This checkpoint's successful teacher episode was generated against the
