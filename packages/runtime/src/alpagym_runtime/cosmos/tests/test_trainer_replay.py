@@ -1261,6 +1261,7 @@ def test_on_policy_ppo_rejects_same_version_with_wrong_behavior_density(
             {
                 "train/pre_update_valid_rows": 30,
                 "train/pre_update_max_abs_log_ratio": 1.0e-3,
+                "train/pre_update_max_abs_ratio_error": 1.0e-3,
             },
             phase="pre_update",
         )
@@ -1280,6 +1281,48 @@ def test_on_policy_ppo_accepts_exact_pre_update_behavior_density(
         {
             "train/pre_update_valid_rows": 30,
             "train/pre_update_max_abs_log_ratio": 0.0,
+            "train/pre_update_max_abs_ratio_error": 0.0,
+        },
+        phase="pre_update",
+    )
+
+
+def test_on_policy_ppo_rejects_same_weight_density_above_formal_tolerance(
+    cosmos_stubs: None,
+) -> None:
+    """The formal same-weight replay contract is 1e-5, not the old 1e-4."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer._on_policy = True
+    trainer._target_behavior_kl = None
+
+    with pytest.raises(FloatingPointError, match="exceeds 1e-05"):
+        trainer._validate_update_diagnostics(
+            {
+                "train/pre_update_valid_rows": 30,
+                "train/pre_update_max_abs_log_ratio": 5.0e-5,
+                "train/pre_update_max_abs_ratio_error": 5.0e-5,
+            },
+            phase="pre_update",
+        )
+
+
+def test_on_policy_ppo_accepts_formal_tolerance_boundary(
+    cosmos_stubs: None,
+) -> None:
+    """The documented 1e-5 same-weight boundary is inclusive."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer._on_policy = True
+    trainer._target_behavior_kl = None
+
+    trainer._validate_update_diagnostics(
+        {
+            "train/pre_update_valid_rows": 30,
+            "train/pre_update_max_abs_log_ratio": 1.0e-5,
+            "train/pre_update_max_abs_ratio_error": 1.0e-5,
         },
         phase="pre_update",
     )
@@ -1299,6 +1342,7 @@ def test_on_policy_ppo_accepts_critic_only_batch_without_density_rows(
         {
             "train/pre_update_valid_rows": 0,
             "train/pre_update_max_abs_log_ratio": 0.0,
+            "train/pre_update_max_abs_ratio_error": 0.0,
         },
         phase="pre_update",
     )
@@ -1319,6 +1363,7 @@ def test_on_policy_flow_ppo_rejects_wrong_behavior_critic_value(
             {
                 "train/pre_update_valid_rows": 30,
                 "train/pre_update_max_abs_log_ratio": 0.0,
+                "train/pre_update_max_abs_ratio_error": 0.0,
                 "train/pre_update_value_valid_rows": 30,
                 "train/pre_update_value_max_abs_delta": 1.0e-3,
             },
@@ -1340,8 +1385,54 @@ def test_on_policy_flow_ppo_accepts_exact_behavior_critic_value(
         {
             "train/pre_update_valid_rows": 30,
             "train/pre_update_max_abs_log_ratio": 0.0,
+            "train/pre_update_max_abs_ratio_error": 0.0,
             "train/pre_update_value_valid_rows": 30,
             "train/pre_update_value_max_abs_delta": 0.0,
+        },
+        phase="pre_update",
+    )
+
+
+def test_on_policy_flow_ppo_rejects_critic_delta_above_formal_tolerance(
+    cosmos_stubs: None,
+) -> None:
+    """The critic must satisfy the same 1e-5 pre-update replay contract."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymFlowPPOTrainer)
+    trainer._on_policy = True
+    trainer._target_behavior_kl = None
+
+    with pytest.raises(FloatingPointError, match="exceeds 1e-05"):
+        trainer._validate_update_diagnostics(
+            {
+                "train/pre_update_valid_rows": 30,
+                "train/pre_update_max_abs_log_ratio": 0.0,
+                "train/pre_update_max_abs_ratio_error": 0.0,
+                "train/pre_update_value_valid_rows": 30,
+                "train/pre_update_value_max_abs_delta": 5.0e-5,
+            },
+            phase="pre_update",
+        )
+
+
+def test_on_policy_flow_ppo_accepts_critic_formal_tolerance_boundary(
+    cosmos_stubs: None,
+) -> None:
+    """The documented 1e-5 critic replay boundary is inclusive."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymFlowPPOTrainer)
+    trainer._on_policy = True
+    trainer._target_behavior_kl = None
+
+    trainer._validate_update_diagnostics(
+        {
+            "train/pre_update_valid_rows": 30,
+            "train/pre_update_max_abs_log_ratio": 0.0,
+            "train/pre_update_max_abs_ratio_error": 0.0,
+            "train/pre_update_value_valid_rows": 30,
+            "train/pre_update_value_max_abs_delta": 1.0e-5,
         },
         phase="pre_update",
     )
@@ -1361,6 +1452,7 @@ def test_flow_ppo_optional_kl_guard_allows_critic_only_batch(
         {
             "train/pre_update_valid_rows": 0,
             "train/pre_update_max_abs_log_ratio": 0.0,
+            "train/pre_update_max_abs_ratio_error": 0.0,
             "train/pre_update_value_valid_rows": 2,
             "train/pre_update_value_max_abs_delta": 0.0,
             "train/pre_update_approx_kl": 0.0,

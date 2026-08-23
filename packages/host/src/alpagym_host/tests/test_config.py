@@ -182,6 +182,7 @@ def test_host_writes_and_loads_handoff_artifacts(
     assert "grpo_ratio_clip_high" not in cosmos_config["train"]["train_policy"]
     assert "grpo_optimization_iterations" not in cosmos_config["train"]["train_policy"]
     assert cosmos_config["train"]["train_batch_per_replica"] == 3
+    assert cosmos_config["train"]["sync_weight_interval"] == 1
     assert cosmos_config["train"]["ckpt"]["save_mode"] == "sync"
     assert cosmos_config["train"]["epoch"] == 5
     assert cosmos_config["train"]["seed"] == 12345
@@ -333,6 +334,37 @@ def test_training_policy_config_rejects_invalid_target_behavior_kl(
     run_config.cosmos.train.train_policy.ppo_target_behavior_kl = target_behavior_kl
 
     with pytest.raises(ValueError, match="ppo_target_behavior_kl"):
+        validate_run_config(run_config, "run")
+
+
+@pytest.mark.parametrize("interval", (0, -1, True, 1.5))
+def test_training_rejects_invalid_sync_weight_interval(
+    tmp_path: Path,
+    interval: object,
+) -> None:
+    """The generated Cosmos weight-sync interval must be an explicit integer."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        f"policy.model.path={model_path.as_posix()}",
+    )
+    run_config.cosmos.train.sync_weight_interval = interval
+
+    with pytest.raises(ValueError, match="sync_weight_interval"):
+        validate_run_config(run_config, "run")
+
+
+def test_on_policy_training_requires_every_step_weight_sync(tmp_path: Path) -> None:
+    """A fresh on-policy rollout must consume the latest published lease."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        f"policy.model.path={model_path.as_posix()}",
+    )
+    run_config.cosmos.train.train_policy.on_policy = True
+    run_config.cosmos.train.sync_weight_interval = 2
+
+    with pytest.raises(ValueError, match="requires.*sync_weight_interval == 1"):
         validate_run_config(run_config, "run")
 
 

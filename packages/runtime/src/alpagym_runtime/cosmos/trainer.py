@@ -2322,6 +2322,7 @@ def _summarize_behavior_log_ratios(
             f"{prefix}_clip_fraction": 0.0,
             f"{prefix}_approx_kl": 0.0,
             f"{prefix}_max_abs_log_ratio": 0.0,
+            f"{prefix}_max_abs_ratio_error": 0.0,
         }
     if not torch.isfinite(flattened).all():
         raise FloatingPointError(
@@ -2346,6 +2347,11 @@ def _summarize_behavior_log_ratios(
             f"PPO {phase.replace('_', '-')} approximate KL is non-finite "
             "for raw log-ratios"
         )
+    ratio_errors = torch.expm1(raw_log_ratios).abs()
+    if not torch.isfinite(ratio_errors).all():
+        raise FloatingPointError(
+            f"PPO {phase.replace('_', '-')} ratio errors are non-finite"
+        )
     return {
         f"{prefix}_valid_rows": int(ratios.numel()),
         f"{prefix}_ratio_p01": float(quantiles[0].item()),
@@ -2354,6 +2360,7 @@ def _summarize_behavior_log_ratios(
         f"{prefix}_clip_fraction": float(clipped.float().mean().item()),
         f"{prefix}_approx_kl": float(approx_kl.mean().item()),
         f"{prefix}_max_abs_log_ratio": float(raw_log_ratios.abs().max().item()),
+        f"{prefix}_max_abs_ratio_error": float(ratio_errors.max().item()),
     }
 
 
@@ -3248,6 +3255,7 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             "AlpaGym PPO %s diagnostics valid_rows=%d "
             "ratio_p01=%.6f ratio_p50=%.6f ratio_p99=%.6f "
             "clip_fraction=%.6f approx_kl=%.6f max_abs_log_ratio=%.6f "
+            "max_abs_ratio_error=%.6f "
             "value_rows=%d value_max_abs_delta=%.6f",
             phase,
             int(metrics[f"{prefix}_valid_rows"]),
@@ -3257,6 +3265,7 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             float(metrics[f"{prefix}_clip_fraction"]),
             float(metrics[f"{prefix}_approx_kl"]),
             float(metrics[f"{prefix}_max_abs_log_ratio"]),
+            float(metrics[f"{prefix}_max_abs_ratio_error"]),
             int(metrics[f"{prefix}_value_valid_rows"]),
             float(metrics[f"{prefix}_value_max_abs_delta"]),
         )
@@ -3271,14 +3280,17 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         """Fail closed when calibrated behavior-policy KL exceeds its guard."""
         if phase == "pre_update" and self._on_policy:
             valid_rows = int(metrics["train/pre_update_valid_rows"])
-            max_abs_log_ratio = float(metrics["train/pre_update_max_abs_log_ratio"])
+            max_abs_ratio_error = float(
+                metrics["train/pre_update_max_abs_ratio_error"]
+            )
             if valid_rows > 0 and (
-                not math.isfinite(max_abs_log_ratio) or max_abs_log_ratio > 1.0e-4
+                not math.isfinite(max_abs_ratio_error)
+                or max_abs_ratio_error > 1.0e-5
             ):
                 raise FloatingPointError(
                     "On-policy PPO pre-update replay differs from its behavior "
-                    "policy: max_abs_log_ratio="
-                    f"{max_abs_log_ratio:.6g} exceeds 0.0001"
+                    "policy: max_abs_ratio_error="
+                    f"{max_abs_ratio_error:.6g} exceeds 1e-05"
                 )
             if self._flow_chunk_density:
                 value_rows = int(metrics["train/pre_update_value_valid_rows"])
@@ -3291,12 +3303,12 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                     )
                 if (
                     not math.isfinite(max_abs_value_delta)
-                    or max_abs_value_delta > 1.0e-4
+                    or max_abs_value_delta > 1.0e-5
                 ):
                     raise FloatingPointError(
                         "On-policy Flow-PPO pre-update replay differs from its "
                         "behavior critic: max_abs_value_delta="
-                        f"{max_abs_value_delta:.6g} exceeds 0.0001"
+                        f"{max_abs_value_delta:.6g} exceeds 1e-05"
                     )
         target = getattr(self, "_target_behavior_kl", None)
         if target is None:

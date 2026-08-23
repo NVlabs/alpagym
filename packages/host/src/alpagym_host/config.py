@@ -342,6 +342,10 @@ class CosmosRLTrainConfig:
     optm_lr: float
     optm_warmup_steps: int
     train_policy: CosmosRLTrainPolicyConfig
+    # Cosmos-RL's on-policy contract requires every new rollout to consume the
+    # latest published lease.  Keep this explicit in the generated TOML rather
+    # than relying on an upstream default that cannot be attested pre-launch.
+    sync_weight_interval: int = 1
     optm_part_lrs: list[float] = field(default_factory=list)
     epsilon: float = 1.0e-6
     optm_weight_decay: float = 0.01

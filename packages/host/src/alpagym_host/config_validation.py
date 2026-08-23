@@ -849,6 +849,17 @@ def _validate_training_policy_config(config: RunConfig) -> None:
     if not math.isfinite(config.cosmos.train.optm_grad_norm_clip):
         raise ValueError("cosmos.train.optm_grad_norm_clip must be finite")
     train_policy = config.cosmos.train.train_policy
+    sync_weight_interval = config.cosmos.train.sync_weight_interval
+    if (
+        isinstance(sync_weight_interval, bool)
+        or not isinstance(sync_weight_interval, int)
+        or sync_weight_interval <= 0
+    ):
+        raise ValueError("cosmos.train.sync_weight_interval must be a positive integer")
+    if train_policy.on_policy and sync_weight_interval != 1:
+        raise ValueError(
+            "on-policy training requires cosmos.train.sync_weight_interval == 1"
+        )
     if train_policy.trainer_type not in {
         "alpagym_grpo",
         "alpagym_ppo",
