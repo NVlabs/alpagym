@@ -173,7 +173,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "alpagym-plugins", editable = "packages/plugins" },
-    { name = "alpasim-grpc", git = "ssh://git@github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=626b02c2d0aae63c76474ed3957428f56118db90" },
+    { name = "alpasim-grpc", git = "ssh://git@github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=e4037334f062009c2fc41c9648625d291f68e5fb" },
     { name = "grpcio" },
     { name = "hydra-core", specifier = ">=1.3.2" },
     { name = "pyyaml", specifier = ">=6.0.2" },
@@ -214,7 +214,7 @@ requires-dist = [
     { name = "alpagym-host", editable = "packages/host" },
     { name = "alpagym-plugins", editable = "packages/plugins" },
     { name = "alpamayo-recipes", git = "https://github.com/NVlabs/alpamayo-recipes.git?subdirectory=src&rev=4bc76779739461a028ee8bb9008bc4082a3328dd" },
-    { name = "alpasim-grpc", git = "ssh://git@github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=626b02c2d0aae63c76474ed3957428f56118db90" },
+    { name = "alpasim-grpc", git = "ssh://git@github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=e4037334f062009c2fc41c9648625d291f68e5fb" },
     { name = "cosmos-rl", extras = ["rl", "wfm"], git = "https://github.com/thomasrantian/cosmos-rl.git?rev=c64a08ff40b3652a4cee0790fe21d7188b11114c" },
     { name = "einops" },
     { name = "flash-attn", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" },
@@ -296,7 +296,7 @@ dependencies = [
 [[package]]
 name = "alpasim-grpc"
 version = "0.55.0"
-source = { git = "ssh://git@github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=626b02c2d0aae63c76474ed3957428f56118db90#626b02c2d0aae63c76474ed3957428f56118db90" }
+source = { git = "ssh://git@github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=e4037334f062009c2fc41c9648625d291f68e5fb#e4037334f062009c2fc41c9648625d291f68e5fb" }
 dependencies = [
     { name = "dataclasses-json" },
     { name = "grpcio" },
