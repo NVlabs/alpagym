@@ -16,6 +16,7 @@ import tomli_w
 import yaml
 from omegaconf import DictConfig, OmegaConf
 
+from alpagym_host.checkpoint_resume import cosmos_resume_value
 from alpagym_host.config import ArtifactPaths, RunConfig, merge_run_config_schema
 
 
@@ -103,6 +104,8 @@ def _build_cosmos_config(config: RunConfig) -> dict[str, Any]:
     artifact_paths = config.artifact_paths
     cosmos = cast(dict[str, Any], _to_plain_data(asdict(config.cosmos)))
     train = dict(cosmos["train"])
+    train.pop("resume")
+    train["resume"] = cosmos_resume_value(config.cosmos.train.resume)
     part_learning_rates = train.pop("optm_part_lrs")
     if part_learning_rates:
         train["optm_lr"] = part_learning_rates
@@ -122,6 +125,13 @@ def _build_cosmos_config(config: RunConfig) -> dict[str, Any]:
         "min_action_std": train_policy.pop("ppo_min_action_std", 0.02),
         "max_action_std": train_policy.pop("ppo_max_action_std", 2.0),
         "target_behavior_kl": train_policy.pop("ppo_target_behavior_kl", None),
+        "behavior_kl_backtrack": train_policy.pop("ppo_behavior_kl_backtrack", False),
+        "behavior_kl_backtrack_margin": train_policy.pop(
+            "ppo_behavior_kl_backtrack_margin", 0.9
+        ),
+        "behavior_kl_backtrack_max_attempts": train_policy.pop(
+            "ppo_behavior_kl_backtrack_max_attempts", 4
+        ),
     }
     step_mini_batch = train_policy.pop("step_mini_batch", None)
     if step_mini_batch is not None:

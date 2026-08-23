@@ -73,6 +73,12 @@ class TrainingSignal:
         semi-Markov action may additionally carry the controller-tick rewards
         it committed as ``primitive_rewards`` plus a same-shaped validity mask
         ``[BT, K]`` and an integer ``duration_ticks`` vector ``[BT]``.
+        ``actor_primitive_rewards`` is a same-shaped causal actor view. It can
+        remove a dense support-certification increment whose five-tick evidence
+        is majority-owned by the predecessor while leaving the chronological
+        critic rewards unchanged. ``actor_primitive_reward_mask`` excludes the
+        predecessor-plan prefix that elapsed before the sampled plan reached
+        the controller. Both actor tensors retain the original tick positions.
         ``old_values`` and ``bootstrap_values`` are rollout-policy value
         estimates at macro decision boundaries.
         ``actor_valid`` is ``[BT]`` and is false when a sampled action never
@@ -93,6 +99,8 @@ class TrainingSignal:
     bootstrap_values: torch.Tensor | None = None
     primitive_rewards: torch.Tensor | None = None
     primitive_reward_mask: torch.Tensor | None = None
+    actor_primitive_rewards: torch.Tensor | None = None
+    actor_primitive_reward_mask: torch.Tensor | None = None
     duration_ticks: torch.Tensor | None = None
     actor_valid: torch.Tensor | None = None
 
@@ -168,6 +176,39 @@ class TrainingSignal:
                     "TrainingSignal primitive_reward_mask dtype must be bool, got "
                     f"{self.primitive_reward_mask.dtype}"
                 )
+            if self.actor_primitive_rewards is not None:
+                if self.actor_primitive_rewards.shape != self.primitive_rewards.shape:
+                    raise ValueError(
+                        "TrainingSignal actor_primitive_rewards shape must match "
+                        "primitive_rewards"
+                    )
+                if not torch.isfinite(self.actor_primitive_rewards).all():
+                    raise ValueError(
+                        "TrainingSignal actor_primitive_rewards must be finite"
+                    )
+            if self.actor_primitive_reward_mask is not None:
+                if (
+                    self.actor_primitive_reward_mask.shape
+                    != self.primitive_rewards.shape
+                ):
+                    raise ValueError(
+                        "TrainingSignal actor_primitive_reward_mask shape must "
+                        "match primitive_rewards"
+                    )
+                if self.actor_primitive_reward_mask.dtype != torch.bool:
+                    raise ValueError(
+                        "TrainingSignal actor_primitive_reward_mask dtype must be "
+                        f"bool, got {self.actor_primitive_reward_mask.dtype}"
+                    )
+                if bool(
+                    (
+                        self.actor_primitive_reward_mask & ~self.primitive_reward_mask
+                    ).any()
+                ):
+                    raise ValueError(
+                        "TrainingSignal actor_primitive_reward_mask must be a "
+                        "subset of primitive_reward_mask"
+                    )
             _validate_optional_signal_tensor(
                 "duration_ticks", self.duration_ticks, expected
             )
@@ -256,6 +297,12 @@ class TrainerReplayDataBatch:
                 primitive_rewards=_cat_optional_signal(samples, "primitive_rewards"),
                 primitive_reward_mask=_cat_optional_signal(
                     samples, "primitive_reward_mask"
+                ),
+                actor_primitive_rewards=_cat_optional_signal(
+                    samples, "actor_primitive_rewards"
+                ),
+                actor_primitive_reward_mask=_cat_optional_signal(
+                    samples, "actor_primitive_reward_mask"
                 ),
                 duration_ticks=_cat_optional_signal(samples, "duration_ticks"),
                 actor_valid=_cat_optional_signal(samples, "actor_valid"),

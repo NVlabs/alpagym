@@ -2,14 +2,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import subprocess
 from pathlib import Path
 from subprocess import CompletedProcess
+from types import SimpleNamespace
 
 import pytest
 import yaml
 from alpagym_host.config import ExecutionBackend, RunConfig, register_config_schema
 from alpagym_host.run_artifacts import build_artifact_paths, build_run_config
-from alpagym_host.run_lifecycle import execute_run, validate_local_process_config
+from alpagym_host.run_lifecycle import (
+    _cleanup_wizard_processes,
+    _raise_lifecycle_failures,
+    execute_run,
+    validate_local_process_config,
+)
 from hydra import compose, initialize_config_module
 
 
@@ -74,6 +81,8 @@ def test_execute_run_runs_local_process_lifecycle(
     # sources, even when the selected runtime domain is humanoid.
     config.alpasim.simulation_domain = "humanoid"
     monkeypatch.delenv("ALPASIM_GRPC_ROOT", raising=False)
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+    config.cosmos.train.deterministic = True
     commands: list[list[str]] = []
     captured_paths: dict[str, Path] = {}
 
@@ -125,6 +134,9 @@ def test_execute_run_runs_local_process_lifecycle(
 
     def fake_start_wizard(**kwargs: object) -> FakePopen:
         captured_paths["alpasim_run_dir"] = kwargs["alpasim_run_dir"]
+        (Path(kwargs["alpasim_run_dir"]) / "docker-compose.yaml").write_text(
+            "services: {}\n", encoding="utf-8"
+        )
         return FakePopen()
 
     monkeypatch.setattr(run_lifecycle, "start_wizard", fake_start_wizard)
@@ -132,14 +144,15 @@ def test_execute_run_runs_local_process_lifecycle(
     def fake_run(command: list[str], **kwargs: object) -> CompletedProcess[str]:
         del kwargs
         commands.append(command)
-        # Mimic Cosmos-RL writing its flat per-role logs while the launcher runs,
-        # so the organize_role_logs wrapper around this call has something to link.
-        cosmos_logs = artifact_paths.log_dir / "logs_20260101-000000"
-        cosmos_logs.mkdir(parents=True, exist_ok=True)
-        (cosmos_logs / "controller.log").write_text("ctrl", encoding="utf-8")
-        (cosmos_logs / "policy_0.log").write_text("p0", encoding="utf-8")
-        (cosmos_logs / "rollout_0.log").write_text("r0", encoding="utf-8")
-        return CompletedProcess(args=command, returncode=0)
+        if command[0] == "uv":
+            assert run_lifecycle.os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+            # Mimic Cosmos-RL writing its flat per-role logs while the launcher runs.
+            cosmos_logs = artifact_paths.log_dir / "logs_20260101-000000"
+            cosmos_logs.mkdir(parents=True, exist_ok=True)
+            (cosmos_logs / "controller.log").write_text("ctrl", encoding="utf-8")
+            (cosmos_logs / "policy_0.log").write_text("p0", encoding="utf-8")
+            (cosmos_logs / "rollout_0.log").write_text("r0", encoding="utf-8")
+        return CompletedProcess(args=command, returncode=0, stdout="")
 
     monkeypatch.setattr(run_lifecycle.subprocess, "run", fake_run)
 
@@ -157,35 +170,56 @@ def test_execute_run_runs_local_process_lifecycle(
     )
     scene_ids = yaml.safe_load(artifact_paths.alpasim_scene_ids_path.read_text())
     assert scene_ids == {"scene_ids": ["scene_b", "scene_a"]}
-    assert commands == [
-        [
-            "uv",
-            "run",
-            "--project",
-            str(run_lifecycle.alpagym_project_root()),
-            "--package",
-            "alpagym-runtime",
-            "python",
-            "-m",
-            "cosmos_rl.launcher.launch_all",
-            "--config",
-            str(config.artifact_paths.cosmos_config_path),
-            "--policy",
-            "1",
-            "--rollout",
-            "3",
-            "--num-workers",
-            "1",
-            "--worker-idx",
-            "0",
-            "--port",
-            "29500",
-            "--log-dir",
-            str(config.artifact_paths.log_dir),
-            "alpagym_runtime.cosmos.entrypoint",
-        ]
+    cosmos_command = [
+        "uv",
+        "run",
+        "--no-sync",
+        "--project",
+        str(run_lifecycle.alpagym_project_root()),
+        "--package",
+        "alpagym-runtime",
+        "python",
+        "-m",
+        "cosmos_rl.launcher.launch_all",
+        "--config",
+        str(config.artifact_paths.cosmos_config_path),
+        "--policy",
+        "1",
+        "--rollout",
+        "3",
+        "--num-workers",
+        "1",
+        "--worker-idx",
+        "0",
+        "--port",
+        "29500",
+        "--log-dir",
+        str(config.artifact_paths.log_dir),
+        "alpagym_runtime.cosmos.entrypoint",
     ]
-    assert f"Starting Cosmos launcher command: {commands[0]}" in caplog.messages
+    compose_path = artifact_paths.alpasim_log_dir / "wizard_0" / "docker-compose.yaml"
+    compose_project = run_lifecycle.wizard_compose_project(compose_path.parent)
+    assert commands == [
+        cosmos_command,
+        [
+            "docker",
+            "compose",
+            "--project-name",
+            compose_project,
+            "--file",
+            str(compose_path),
+            "down",
+        ],
+        [
+            "docker",
+            "ps",
+            "--all",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={compose_project}",
+        ],
+    ]
+    assert f"Starting Cosmos launcher command: {cosmos_command}" in caplog.messages
 
     # organize_role_logs wraps the Cosmos launch: its exit-path final pass must have
     # linked the flat per-role logs into the role-grouped layout by the time execute_run
@@ -446,6 +480,237 @@ def test_execute_run_resolves_relative_slurm_wizard_paths(
     assert captured_paths["alpasim_run_dir"].is_absolute()
     assert captured_paths["log_path"].is_absolute()
     assert captured_paths["runtime_server_path"].is_absolute()
+
+
+def test_local_wizard_cleanup_downs_only_exact_generated_compose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Successful local cleanup uses the exact this-run Compose file and a bound."""
+    from alpagym_host import run_lifecycle
+
+    config = _cleanup_test_config(tmp_path)
+    compose_path = _write_cleanup_compose(config)
+    compose_project = run_lifecycle.wizard_compose_project(compose_path.parent)
+    other_project = run_lifecycle.wizard_compose_project(
+        tmp_path / "other-run" / "alpasim" / "wizard_0"
+    )
+    process = object()
+    terminated: list[object] = []
+    commands: list[tuple[list[str], dict[str, object]]] = []
+    monkeypatch.setattr(
+        run_lifecycle,
+        "ensure_process_terminated",
+        lambda candidate: terminated.append(candidate),
+    )
+
+    def fake_run(command: list[str], **kwargs: object) -> CompletedProcess[str]:
+        commands.append((command, kwargs))
+        return CompletedProcess(args=command, returncode=0)
+
+    monkeypatch.setattr(run_lifecycle.subprocess, "run", fake_run)
+
+    _cleanup_wizard_processes(
+        config=config,
+        execution_backend=ExecutionBackend.local_process,
+        wizard_processes=[process],
+    )
+
+    assert terminated == [process]
+    assert commands == [
+        (
+            [
+                "docker",
+                "compose",
+                "--project-name",
+                compose_project,
+                "--file",
+                str(compose_path),
+                "down",
+            ],
+            {
+                "check": True,
+                "text": True,
+                "capture_output": True,
+                "timeout": run_lifecycle._LOCAL_COMPOSE_DOWN_TIMEOUT_S,
+            },
+        ),
+        (
+            [
+                "docker",
+                "ps",
+                "--all",
+                "--quiet",
+                "--filter",
+                f"label=com.docker.compose.project={compose_project}",
+            ],
+            {
+                "check": True,
+                "text": True,
+                "capture_output": True,
+                "timeout": run_lifecycle._LOCAL_COMPOSE_DOWN_TIMEOUT_S,
+            },
+        ),
+    ]
+    assert other_project not in repr(commands)
+
+
+def test_local_wizard_cleanup_downs_compose_after_keyboard_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Interrupted process cleanup cannot skip exact Compose teardown."""
+    from alpagym_host import run_lifecycle
+
+    config = _cleanup_test_config(tmp_path)
+    compose_path = _write_cleanup_compose(config)
+    compose_project = run_lifecycle.wizard_compose_project(compose_path.parent)
+    commands: list[list[str]] = []
+
+    def interrupt(_process: object) -> None:
+        raise KeyboardInterrupt("interrupted termination")
+
+    monkeypatch.setattr(run_lifecycle, "ensure_process_terminated", interrupt)
+
+    def fake_run(command: list[str], **kwargs: object) -> CompletedProcess[str]:
+        del kwargs
+        commands.append(command)
+        return CompletedProcess(args=command, returncode=0)
+
+    monkeypatch.setattr(run_lifecycle.subprocess, "run", fake_run)
+
+    with pytest.raises(KeyboardInterrupt, match="interrupted termination"):
+        _cleanup_wizard_processes(
+            config=config,
+            execution_backend=ExecutionBackend.local_process,
+            wizard_processes=[object()],
+        )
+
+    assert commands == [
+        [
+            "docker",
+            "compose",
+            "--project-name",
+            compose_project,
+            "--file",
+            str(compose_path),
+            "down",
+        ],
+        [
+            "docker",
+            "ps",
+            "--all",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={compose_project}",
+        ],
+    ]
+
+
+def test_local_wizard_cleanup_missing_exact_compose_is_explicit_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A started local Wizard can never turn a missing Compose file into success."""
+    from alpagym_host import run_lifecycle
+
+    config = _cleanup_test_config(tmp_path)
+    compose_project = run_lifecycle.wizard_compose_project(
+        Path(config.artifact_paths.alpasim_log_dir) / "wizard_0"
+    )
+    monkeypatch.setattr(
+        run_lifecycle, "ensure_process_terminated", lambda _process: None
+    )
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> CompletedProcess[str]:
+        del kwargs
+        commands.append(command)
+        return CompletedProcess(args=command, returncode=0, stdout="")
+
+    monkeypatch.setattr(run_lifecycle.subprocess, "run", fake_run)
+
+    with pytest.raises(FileNotFoundError, match="no exact generated Compose file"):
+        _cleanup_wizard_processes(
+            config=config,
+            execution_backend=ExecutionBackend.local_process,
+            wizard_processes=[object()],
+        )
+
+    assert commands[0][-1] == "down"
+    assert commands[1] == [
+        "docker",
+        "ps",
+        "--all",
+        "--quiet",
+        "--filter",
+        f"label=com.docker.compose.project={compose_project}",
+    ]
+
+
+def test_local_wizard_cleanup_preserves_termination_and_compose_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A termination failure and exact Compose failure remain independently visible."""
+    from alpagym_host import run_lifecycle
+
+    config = _cleanup_test_config(tmp_path)
+    compose_path = _write_cleanup_compose(config)
+    termination_error = RuntimeError("termination failed")
+    compose_error = subprocess.TimeoutExpired(
+        ["docker", "compose", "--file", str(compose_path), "down"],
+        timeout=30.0,
+    )
+
+    def fail_termination(_process: object) -> None:
+        raise termination_error
+
+    def fail_down(command: list[str], **kwargs: object) -> CompletedProcess[str]:
+        del kwargs
+        if command[:2] == ["docker", "compose"]:
+            raise compose_error
+        return CompletedProcess(args=command, returncode=0, stdout="")
+
+    monkeypatch.setattr(run_lifecycle, "ensure_process_terminated", fail_termination)
+    monkeypatch.setattr(run_lifecycle.subprocess, "run", fail_down)
+
+    with pytest.raises(BaseExceptionGroup) as captured:
+        _cleanup_wizard_processes(
+            config=config,
+            execution_backend=ExecutionBackend.local_process,
+            wizard_processes=[object()],
+        )
+
+    assert captured.value.exceptions == (termination_error, compose_error)
+
+
+def test_lifecycle_preserves_cleanup_and_provenance_dual_failure() -> None:
+    """Provenance failure cannot hide cleanup failure or vice versa."""
+    cleanup_error = RuntimeError("cleanup failed")
+    provenance_error = RuntimeError("provenance failed")
+
+    with pytest.raises(BaseExceptionGroup) as captured:
+        _raise_lifecycle_failures(
+            run_error=None,
+            cleanup_error=cleanup_error,
+            provenance_error=provenance_error,
+        )
+
+    assert captured.value.exceptions == (cleanup_error, provenance_error)
+
+
+def _cleanup_test_config(tmp_path: Path):
+    """Return the minimal structural config required by exact local cleanup."""
+    return SimpleNamespace(
+        artifact_paths=SimpleNamespace(alpasim_log_dir=tmp_path / "alpasim")
+    )
+
+
+def _write_cleanup_compose(config) -> Path:
+    """Create one exact Wizard-owned Compose path for cleanup tests."""
+    compose_path = (
+        Path(config.artifact_paths.alpasim_log_dir) / "wizard_0" / "docker-compose.yaml"
+    ).resolve()
+    compose_path.parent.mkdir(parents=True)
+    compose_path.write_text("services: {}\n", encoding="utf-8")
+    return compose_path
 
 
 def _write_model_bundle_dir(tmp_path: Path) -> Path:

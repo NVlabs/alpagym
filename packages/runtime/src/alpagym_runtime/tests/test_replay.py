@@ -130,6 +130,27 @@ def test_training_signal_requires_bool_actor_valid_mask() -> None:
         )
 
 
+def test_training_signal_requires_actor_reward_mask_to_be_bool_subset() -> None:
+    """The actor view cannot claim ticks absent from the critic chronology."""
+    base = {
+        "old_logprobs": torch.zeros(1),
+        "is_padding": torch.zeros(1, dtype=torch.bool),
+        "primitive_rewards": torch.zeros((1, 2)),
+        "primitive_reward_mask": torch.tensor([[True, False]]),
+        "duration_ticks": torch.tensor([1], dtype=torch.int64),
+    }
+    with pytest.raises(ValueError, match="dtype must be bool"):
+        TrainingSignal(
+            **base,
+            actor_primitive_reward_mask=torch.ones((1, 2)),
+        )
+    with pytest.raises(ValueError, match="must be a subset"):
+        TrainingSignal(
+            **base,
+            actor_primitive_reward_mask=torch.tensor([[False, True]]),
+        )
+
+
 def test_shared_replay_schema_does_not_validate_family_payload_fields() -> None:
     """Family-required fields are checked by the family packer, not replay.py."""
     replay = PolicyReplayData(

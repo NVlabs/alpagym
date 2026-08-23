@@ -10,6 +10,7 @@ no AlpaSim runtime, gRPC channel, disk I/O, or reward computation runs.
 """
 
 import hashlib
+import logging
 import threading
 from concurrent.futures import Future
 from pathlib import Path
@@ -610,6 +611,329 @@ def test_retry_exhaustion_resolves_future_with_empty_list(tmp_path: Path) -> Non
         assert payload_state.permanently_failed is True
         # initial attempt + 2 retries = 3 dispatched uuids; the 3rd failure exhausts.
         assert len(worker._call_log) == 3
+    finally:
+        _drain_pool(worker)
+
+
+def test_simulate_failure_retries_when_failed_policy_close_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Policy-close diagnostics cannot replace a simulate failure or lose its retry."""
+
+    class _RuntimeStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def simulate(self, request, timeout):
+            del request, timeout
+            self.calls += 1
+            return SimpleNamespace(
+                rollout_returns=[
+                    SimpleNamespace(success=False, error="simulate primary")
+                ]
+            )
+
+    class _Policy:
+        def close(self) -> None:
+            raise RuntimeError("policy close failed")
+
+    class _Servicer:
+        def __init__(self) -> None:
+            self.sessions: dict[str, _Policy] = {}
+            self.records: dict[str, object] = {}
+
+        def reserve_session(
+            self,
+            session_uuid: str,
+            behavior_policy_version: int,
+            model_lease: InferenceModelLease | None = None,
+        ) -> None:
+            del behavior_policy_version, model_lease
+            self.sessions[session_uuid] = _Policy()
+
+        def discard_session(self, session_uuid: str) -> None:
+            policy = self.sessions.pop(session_uuid, None)
+            self.records.pop(session_uuid, None)
+            if policy is not None:
+                policy.close()
+
+    runtime_stub = _RuntimeStub()
+    servicer = _Servicer()
+    policy_server = SimpleNamespace(
+        topology_endpoint=SimpleNamespace(host="localhost", port=0),
+        servicer=servicer,
+    )
+    worker = StreamingRolloutWorker(
+        alpasim_runtime_stub=runtime_stub,
+        driver_server=None,
+        humanoid_policy_server=policy_server,
+        simulation_domain="humanoid",
+        simulation_timeout_s=10.0,
+        reward_config=SimpleNamespace(),
+        max_concurrent_rollouts=1,
+        rollouts_per_payload=1,
+        scene_id_resolver=_resolve_scene,
+        scenario_id_resolver=lambda scene_id: "ascend",
+        max_scene_retries=1,
+    )
+    try:
+        with caplog.at_level(logging.WARNING):
+            payload_state = worker.submit_payload(
+                _payload(0), behavior_policy_version=7
+            )
+            assert payload_state.future.result(timeout=5.0) == []
+
+        assert runtime_stub.calls == 2
+        assert payload_state.retries_left == -1
+        assert payload_state.permanently_failed is True
+        assert servicer.sessions == {}
+        assert servicer.records == {}
+        assert "simulate primary" in caplog.text
+        assert "policy close failed" in caplog.text
+    finally:
+        _drain_pool(worker)
+
+
+def test_retry_reservation_failure_drops_payload_and_cleans_partial_uuid(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A partially allocated retry UUID cannot strand the payload future."""
+
+    class _RuntimeStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def simulate(self, request, timeout):
+            del request, timeout
+            self.calls += 1
+            return SimpleNamespace(
+                rollout_returns=[
+                    SimpleNamespace(success=False, error="simulate primary")
+                ]
+            )
+
+    class _Servicer:
+        def __init__(self) -> None:
+            self.reserve_calls: list[str] = []
+            self.sessions: dict[str, object] = {}
+            self.records: dict[str, object] = {}
+
+        def reserve_session(
+            self,
+            session_uuid: str,
+            behavior_policy_version: int,
+            model_lease: InferenceModelLease | None = None,
+        ) -> None:
+            del behavior_policy_version, model_lease
+            self.reserve_calls.append(session_uuid)
+            self.sessions[session_uuid] = object()
+            self.records[session_uuid] = object()
+            if len(self.reserve_calls) == 2:
+                raise RuntimeError("retry reserve failed after partial allocation")
+
+        def discard_session(self, session_uuid: str) -> None:
+            self.sessions.pop(session_uuid, None)
+            self.records.pop(session_uuid, None)
+
+    runtime_stub = _RuntimeStub()
+    servicer = _Servicer()
+    worker = StreamingRolloutWorker(
+        alpasim_runtime_stub=runtime_stub,
+        driver_server=None,
+        humanoid_policy_server=SimpleNamespace(
+            topology_endpoint=SimpleNamespace(host="localhost", port=0),
+            servicer=servicer,
+        ),
+        simulation_domain="humanoid",
+        simulation_timeout_s=10.0,
+        reward_config=SimpleNamespace(),
+        max_concurrent_rollouts=1,
+        rollouts_per_payload=1,
+        scene_id_resolver=_resolve_scene,
+        scenario_id_resolver=lambda scene_id: "ascend",
+        max_scene_retries=1,
+    )
+    try:
+        with caplog.at_level(logging.WARNING):
+            payload_state = worker.submit_payload(
+                _payload(0), behavior_policy_version=7
+            )
+            assert payload_state.future.result(timeout=5.0) == []
+
+        assert runtime_stub.calls == 1
+        assert len(servicer.reserve_calls) == 2
+        assert len(set(servicer.reserve_calls)) == 2
+        assert servicer.sessions == {}
+        assert servicer.records == {}
+        assert payload_state.permanently_failed is True
+        assert payload_state.future_resolved is True
+        assert 0 not in worker._active_payload_states
+        assert worker._rollout_workers[0].is_alive()
+        assert "simulate primary" in caplog.text
+        assert "retry reserve failed after partial allocation" in caplog.text
+    finally:
+        _drain_pool(worker)
+
+
+def test_retry_reservation_failure_cannot_poison_concurrent_success() -> None:
+    """A sibling success remains final while a failed retry reservation drains."""
+
+    retry_reserve_started = threading.Event()
+    release_retry_reserve = threading.Event()
+
+    class _RuntimeStub:
+        def simulate(self, request, timeout):
+            del request, timeout
+            return SimpleNamespace(
+                rollout_returns=[
+                    SimpleNamespace(success=False, error="simulate primary")
+                ]
+            )
+
+    class _Servicer:
+        def __init__(self) -> None:
+            self.reserve_calls: list[str] = []
+            self.sessions: set[str] = set()
+
+        def reserve_session(
+            self,
+            session_uuid: str,
+            behavior_policy_version: int,
+            model_lease: InferenceModelLease | None = None,
+        ) -> None:
+            del behavior_policy_version, model_lease
+            self.reserve_calls.append(session_uuid)
+            self.sessions.add(session_uuid)
+            if len(self.reserve_calls) == 2:
+                retry_reserve_started.set()
+                assert release_retry_reserve.wait(timeout=5.0)
+                raise RuntimeError("retry reserve lost race with sibling success")
+
+        def discard_session(self, session_uuid: str) -> None:
+            self.sessions.discard(session_uuid)
+
+    servicer = _Servicer()
+    worker = StreamingRolloutWorker(
+        alpasim_runtime_stub=_RuntimeStub(),
+        driver_server=None,
+        humanoid_policy_server=SimpleNamespace(
+            topology_endpoint=SimpleNamespace(host="localhost", port=0),
+            servicer=servicer,
+        ),
+        simulation_domain="humanoid",
+        simulation_timeout_s=10.0,
+        reward_config=SimpleNamespace(),
+        max_concurrent_rollouts=1,
+        rollouts_per_payload=1,
+        scene_id_resolver=_resolve_scene,
+        scenario_id_resolver=lambda scene_id: "ascend",
+        max_scene_retries=1,
+    )
+    try:
+        payload_state = worker.submit_payload(_payload(0), behavior_policy_version=7)
+        assert retry_reserve_started.wait(timeout=5.0)
+        accepted = _make_episode("scene-0", "concurrent-sibling")
+        with worker._lock:
+            payload_state.collected.append(accepted)
+            payload_state.future_resolved = True
+            worker._active_payload_states.pop(0, None)
+        payload_state.future.set_result([accepted])
+        release_retry_reserve.set()
+
+        assert payload_state.future.result(timeout=5.0) == [accepted]
+        for _ in range(200):
+            if len(servicer.reserve_calls) == 2 and not servicer.sessions:
+                break
+            threading.Event().wait(0.01)
+        assert payload_state.permanently_failed is False
+        assert payload_state.future_resolved is True
+        assert servicer.sessions == set()
+        assert worker._rollout_workers[0].is_alive()
+    finally:
+        release_retry_reserve.set()
+        _drain_pool(worker)
+
+
+def test_retry_enqueue_failure_drops_payload_and_cleans_reserved_uuid(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry queue failure invalidates its reservation and resolves empty."""
+
+    class _RuntimeStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def simulate(self, request, timeout):
+            del request, timeout
+            self.calls += 1
+            return SimpleNamespace(
+                rollout_returns=[
+                    SimpleNamespace(success=False, error="simulate primary")
+                ]
+            )
+
+    class _Servicer:
+        def __init__(self) -> None:
+            self.reserve_calls: list[str] = []
+            self.sessions: dict[str, object] = {}
+
+        def reserve_session(
+            self,
+            session_uuid: str,
+            behavior_policy_version: int,
+            model_lease: InferenceModelLease | None = None,
+        ) -> None:
+            del behavior_policy_version, model_lease
+            self.reserve_calls.append(session_uuid)
+            self.sessions[session_uuid] = object()
+
+        def discard_session(self, session_uuid: str) -> None:
+            self.sessions.pop(session_uuid, None)
+
+    runtime_stub = _RuntimeStub()
+    servicer = _Servicer()
+    worker = StreamingRolloutWorker(
+        alpasim_runtime_stub=runtime_stub,
+        driver_server=None,
+        humanoid_policy_server=SimpleNamespace(
+            topology_endpoint=SimpleNamespace(host="localhost", port=0),
+            servicer=servicer,
+        ),
+        simulation_domain="humanoid",
+        simulation_timeout_s=10.0,
+        reward_config=SimpleNamespace(),
+        max_concurrent_rollouts=1,
+        rollouts_per_payload=1,
+        scene_id_resolver=_resolve_scene,
+        scenario_id_resolver=lambda scene_id: "ascend",
+        max_scene_retries=1,
+    )
+    original_put = worker._rollout_job_queue.put
+
+    def _fail_retry_enqueue(item, *args, **kwargs) -> None:
+        if item[0] == 0:
+            raise RuntimeError("retry enqueue failed")
+        original_put(item, *args, **kwargs)
+
+    monkeypatch.setattr(worker._rollout_job_queue, "put", _fail_retry_enqueue)
+    try:
+        with caplog.at_level(logging.WARNING):
+            payload_state = worker.submit_payload(
+                _payload(0), behavior_policy_version=7
+            )
+            assert payload_state.future.result(timeout=5.0) == []
+
+        assert runtime_stub.calls == 1
+        assert len(servicer.reserve_calls) == 2
+        assert len(set(servicer.reserve_calls)) == 2
+        assert servicer.sessions == {}
+        assert payload_state.permanently_failed is True
+        assert payload_state.future_resolved is True
+        assert 0 not in worker._active_payload_states
+        assert worker._rollout_workers[0].is_alive()
+        assert "simulate primary" in caplog.text
+        assert "retry enqueue failed" in caplog.text
     finally:
         _drain_pool(worker)
 

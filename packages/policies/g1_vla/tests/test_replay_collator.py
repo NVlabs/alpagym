@@ -132,6 +132,10 @@ def test_collator_right_pads_mixed_primitive_reward_durations() -> None:
             first.training_signal,
             primitive_rewards=torch.arange(25, dtype=torch.float32).reshape(1, 25),
             primitive_reward_mask=torch.ones((1, 25), dtype=torch.bool),
+            actor_primitive_rewards=torch.arange(25, dtype=torch.float32).reshape(
+                1, 25
+            ),
+            actor_primitive_reward_mask=torch.ones((1, 25), dtype=torch.bool),
             duration_ticks=torch.tensor([25], dtype=torch.int64),
             actor_valid=torch.tensor([True], dtype=torch.bool),
         ),
@@ -142,8 +146,14 @@ def test_collator_right_pads_mixed_primitive_reward_durations() -> None:
             second.training_signal,
             primitive_rewards=torch.arange(37, dtype=torch.float32).reshape(1, 37),
             primitive_reward_mask=torch.ones((1, 37), dtype=torch.bool),
+            actor_primitive_rewards=(
+                torch.arange(37, dtype=torch.float32) - 0.5
+            ).reshape(1, 37),
+            actor_primitive_reward_mask=torch.tensor(
+                [[False] * 12 + [True] * 25], dtype=torch.bool
+            ),
             duration_ticks=torch.tensor([37], dtype=torch.int64),
-            actor_valid=torch.tensor([False], dtype=torch.bool),
+            actor_valid=torch.tensor([True], dtype=torch.bool),
         ),
     )
 
@@ -152,13 +162,27 @@ def test_collator_right_pads_mixed_primitive_reward_durations() -> None:
     ).training_signal
     assert signal.primitive_rewards.shape == (2, 37)
     torch.testing.assert_close(signal.primitive_rewards[0, 25:], torch.zeros(12))
+    assert signal.actor_primitive_rewards.shape == (2, 37)
+    torch.testing.assert_close(signal.actor_primitive_rewards[0, 25:], torch.zeros(12))
+    torch.testing.assert_close(
+        signal.actor_primitive_rewards[1],
+        torch.arange(37, dtype=torch.float32) - 0.5,
+    )
     torch.testing.assert_close(
         signal.primitive_reward_mask[0],
         torch.tensor([True] * 25 + [False] * 12),
     )
     assert bool(signal.primitive_reward_mask[1].all())
+    torch.testing.assert_close(
+        signal.actor_primitive_reward_mask[0],
+        torch.tensor([True] * 25 + [False] * 12),
+    )
+    torch.testing.assert_close(
+        signal.actor_primitive_reward_mask[1],
+        torch.tensor([False] * 12 + [True] * 25),
+    )
     torch.testing.assert_close(signal.duration_ticks, torch.tensor([25, 37]))
-    torch.testing.assert_close(signal.actor_valid, torch.tensor([True, False]))
+    torch.testing.assert_close(signal.actor_valid, torch.tensor([True, True]))
 
 
 def test_collator_rejects_pixel_rows_that_do_not_match_original_grid() -> None:

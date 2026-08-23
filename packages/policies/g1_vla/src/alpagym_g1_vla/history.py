@@ -202,9 +202,84 @@ def select_bats_history_indices(
 class _HistoryCapture:
     """One owned camera capture and its strong producer receipt identity."""
 
-    timestamp_us: int
-    receipt_sha256: str
+    source_identity: VlaImageSourceIdentity
     image: Image.Image
+
+
+@dataclass(frozen=True)
+class VlaImageSourceIdentity:
+    """Immutable renderer evidence for one decoded VLA source JPEG."""
+
+    env_id: int
+    frame_start_us: int
+    frame_end_us: int
+    logical_id: str
+    byte_length: int
+    render_timestamp_us: int
+    observation_decision_id: int
+    render_state_sha256: str
+    camera_contract_sha256: str
+    image_sha256: str
+    render_receipt_sha256: str
+    scene_fingerprint: str
+    model_signature_sha256: str
+    camera_to_world_sha256: str
+    renderer_binding_sha256: str
+
+    def __post_init__(self) -> None:
+        """Reject incomplete or non-canonical source evidence."""
+
+        if (
+            self.env_id < 0
+            or self.frame_start_us < 0
+            or self.frame_end_us < 0
+            or self.render_timestamp_us < 0
+            or self.observation_decision_id < 0
+            or self.byte_length <= 0
+        ):
+            raise ValueError("VLA source image identity has an invalid scalar")
+        if not self.logical_id:
+            raise ValueError("VLA source image logical_id must be non-empty")
+        if not (self.frame_start_us == self.frame_end_us == self.render_timestamp_us):
+            raise ValueError("VLA source image must be one zero-shutter capture")
+        for name, digest in (
+            ("render_state_sha256", self.render_state_sha256),
+            ("camera_contract_sha256", self.camera_contract_sha256),
+            ("image_sha256", self.image_sha256),
+            ("render_receipt_sha256", self.render_receipt_sha256),
+            ("scene_fingerprint", self.scene_fingerprint),
+            ("model_signature_sha256", self.model_signature_sha256),
+            ("camera_to_world_sha256", self.camera_to_world_sha256),
+            ("renderer_binding_sha256", self.renderer_binding_sha256),
+        ):
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError(f"VLA source image {name} must be lowercase SHA256")
+
+    def manifest_entry(self, *, role: str) -> dict[str, object]:
+        """Return one JSON-compatible ordered visual-manifest entry."""
+
+        if role not in {"history", "current"}:
+            raise ValueError("VLA source image role must be history or current")
+        return {
+            "role": role,
+            "env_id": self.env_id,
+            "frame_start_us": self.frame_start_us,
+            "frame_end_us": self.frame_end_us,
+            "logical_id": self.logical_id,
+            "byte_length": self.byte_length,
+            "render_timestamp_us": self.render_timestamp_us,
+            "observation_decision_id": self.observation_decision_id,
+            "render_state_sha256": self.render_state_sha256,
+            "camera_contract_sha256": self.camera_contract_sha256,
+            "image_sha256": self.image_sha256,
+            "render_receipt_sha256": self.render_receipt_sha256,
+            "scene_fingerprint": self.scene_fingerprint,
+            "model_signature_sha256": self.model_signature_sha256,
+            "camera_to_world_sha256": self.camera_to_world_sha256,
+            "renderer_binding_sha256": self.renderer_binding_sha256,
+        }
 
 
 @dataclass
@@ -216,13 +291,13 @@ class VlaImageHistory:
     _pending: _HistoryCapture | None = None
     _last_timestamp_us: int | None = None
     last_selected_indices: tuple[int, ...] = ()
+    last_selected_source_identities: tuple[VlaImageSourceIdentity, ...] = ()
 
     def select_with_current(
         self,
         current: Image.Image,
         *,
-        timestamp_us: int,
-        capture_receipt_sha256: str,
+        source_identity: VlaImageSourceIdentity,
     ) -> tuple[Image.Image, ...]:
         """Commit one fresh elapsed capture and append the current image last.
 
@@ -232,11 +307,8 @@ class VlaImageHistory:
         appears in both history and current. Returned images are owned copies
         ordered oldest-to-current.
         """
-        timestamp_us = int(timestamp_us)
-        if timestamp_us < 0:
-            raise ValueError("VLA image timestamp must be non-negative")
-        if not isinstance(capture_receipt_sha256, str) or not capture_receipt_sha256:
-            raise ValueError("VLA image capture receipt must be non-empty")
+        timestamp_us = source_identity.render_timestamp_us
+        capture_receipt_sha256 = source_identity.render_receipt_sha256
         if (
             self._last_timestamp_us is not None
             and timestamp_us < self._last_timestamp_us
@@ -244,18 +316,21 @@ class VlaImageHistory:
             raise ValueError("VLA image history timestamps moved backwards")
         if self._pending is None:
             self._pending = _HistoryCapture(
-                timestamp_us=timestamp_us,
-                receipt_sha256=capture_receipt_sha256,
+                source_identity=source_identity,
                 image=current.copy(),
             )
-        elif timestamp_us - self._pending.timestamp_us >= 500_000:
-            if self._pending.receipt_sha256 != capture_receipt_sha256:
+        elif (
+            timestamp_us - self._pending.source_identity.render_timestamp_us >= 500_000
+        ):
+            if (
+                self._pending.source_identity.render_receipt_sha256
+                != capture_receipt_sha256
+            ):
                 # Transfer ownership of the old pending image into committed
                 # history, then own one copy of the new boundary capture.
                 self._frames.append(self._pending)
                 self._pending = _HistoryCapture(
-                    timestamp_us=timestamp_us,
-                    receipt_sha256=capture_receipt_sha256,
+                    source_identity=source_identity,
                     image=current.copy(),
                 )
 
@@ -263,7 +338,8 @@ class VlaImageHistory:
         selected = tuple(
             index
             for index in selected
-            if self._frames[index].receipt_sha256 != capture_receipt_sha256
+            if self._frames[index].source_identity.render_receipt_sha256
+            != capture_receipt_sha256
         )
         if any(index >= len(self._frames) for index in selected):
             raise AssertionError("BATS selected outside retained history")
@@ -271,6 +347,9 @@ class VlaImageHistory:
             current.copy(),
         )
         self.last_selected_indices = selected
+        self.last_selected_source_identities = tuple(
+            self._frames[index].source_identity for index in selected
+        ) + (source_identity,)
         self._last_timestamp_us = timestamp_us
         return result
 
@@ -282,6 +361,9 @@ class VlaImageHistory:
         if self._pending is not None:
             self._pending.image.close()
         self._pending = None
+        self._last_timestamp_us = None
+        self.last_selected_indices = ()
+        self.last_selected_source_identities = ()
 
 
 def image_array(image: Image.Image) -> np.ndarray:

@@ -321,8 +321,11 @@ class VlaPsiPPOModel(BaseModel):
         psi_runtime = cast(_PsiRuntimeProtocol, psi_model)
         for parameter in psi_runtime.vlm_model.parameters():
             parameter.requires_grad_(False)
-        for parameter in psi_runtime.action_header.parameters():
-            parameter.requires_grad_(True)
+        if not any(
+            parameter.requires_grad
+            for parameter in psi_runtime.action_header.parameters()
+        ):
+            raise RuntimeError("VLA Psi action header has no trainable parameters")
         if any(parameter.device.type != "meta" for parameter in psi_model.parameters()):
             raise RuntimeError(
                 "VLA Psi must be constructed inside Cosmos's meta init context"
@@ -447,8 +450,11 @@ class VlaPsiPPOModel(BaseModel):
         psi_runtime = cast(_PsiRuntimeProtocol, self.actor_critic.psi_model)
         for parameter in psi_runtime.vlm_model.parameters():
             parameter.requires_grad_(False)
-        for parameter in psi_runtime.action_header.parameters():
-            parameter.requires_grad_(True)
+        if not any(
+            parameter.requires_grad
+            for parameter in psi_runtime.action_header.parameters()
+        ):
+            raise RuntimeError("VLA Psi action header has no trainable parameters")
         for parameter in self.actor_critic.critic.parameters():
             parameter.requires_grad_(True)
         self.actor_critic.psi_model.device = self.current_device()

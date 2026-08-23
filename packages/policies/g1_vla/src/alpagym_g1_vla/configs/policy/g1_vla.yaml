@@ -19,6 +19,12 @@ model:
     humanoid_policy_factory: alpagym_g1_vla.humanoid_policy:build_humanoid_policy_factory
     require_policy_camera: true
     sampling_mode: flow_sde_training
+    # Qualification must choose its weight source explicitly. Candidate runs
+    # override this and pin both candidate_overlay_path and its manifest digest;
+    # a missing/replaced candidate never falls back to the attested base.
+    qualification_model_source: base_attested
+    candidate_overlay_path: null
+    expected_candidate_sha256: null
     expected_schedule_sha256: d01fcb068a81712b78f9b72ff95877e332ae03245a2d1aba518c83354cf7ad12
     expected_flow_noise_level: 0.4
     expected_flow_ignore_last: true

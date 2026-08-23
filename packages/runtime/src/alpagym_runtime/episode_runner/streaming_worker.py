@@ -520,66 +520,157 @@ class StreamingRolloutWorker:
         """Retry the payload until the per-payload budget is exhausted; otherwise drain + drop."""
         payload_state = rollout_job.shared_payload_state
         should_drop = False
+        retry_job: _RolloutJob | None = None
+        retry_retries_left = -1
         with self._lock:
-            if payload_state.permanently_failed:
-                # This job was already in flight when a sibling failed
-                # permanently (or shutdown began). It owns its session until
-                # this failure callback, so only now is it safe to discard it.
-                self._discard_humanoid_session(rollout_job.session_uuid)
-                return
-            payload_state.retries_left -= 1
-            if payload_state.retries_left >= 0:
-                retry_session_uuid = uuid.uuid4().hex
-                if self._humanoid_policy_server is not None:
-                    self._humanoid_policy_server.servicer.discard_session(
-                        rollout_job.session_uuid
+            if not (payload_state.permanently_failed or payload_state.future_resolved):
+                payload_state.retries_left -= 1
+                if payload_state.retries_left >= 0:
+                    retry_session_uuid = uuid.uuid4().hex
+                    retry_job = _RolloutJob(
+                        shared_payload_state=payload_state,
+                        session_uuid=retry_session_uuid,
+                        scene_id=rollout_job.scene_id,
+                        random_seed=rollout_job.random_seed,
+                        attempts=rollout_job.attempts + 1,
                     )
-                    self._humanoid_policy_server.servicer.reserve_session(
-                        retry_session_uuid,
-                        payload_state.behavior_policy_version,
-                        payload_state.model_lease,
+                    retry_retries_left = payload_state.retries_left
+                else:
+                    should_drop = self._mark_payload_permanently_failed_locked(
+                        payload_state
                     )
-                self._rollout_job_queue.put(
-                    (
-                        0,  # retry priority: jumps ahead of fresh dispatch
-                        next(self._rollout_job_seq),
-                        _RolloutJob(
-                            shared_payload_state=payload_state,
-                            session_uuid=retry_session_uuid,
-                            scene_id=rollout_job.scene_id,
-                            random_seed=rollout_job.random_seed,
-                            attempts=rollout_job.attempts + 1,
-                        ),
-                    )
-                )
-                logger.warning(
-                    "Retrying payload uuid=%s scene=%s attempt=%d retries_left=%d: %s",
-                    rollout_job.session_uuid,
-                    rollout_job.scene_id,
-                    rollout_job.attempts + 1,
-                    payload_state.retries_left,
-                    exc,
-                )
-            else:
-                if self._humanoid_policy_server is not None:
-                    self._humanoid_policy_server.servicer.discard_session(
-                        rollout_job.session_uuid
-                    )
-                payload_state.permanently_failed = True
-                if not payload_state.future_resolved:
-                    payload_state.future_resolved = True
-                    should_drop = True
-                    self._active_payload_states.pop(
-                        payload_state.payload.prompt_idx, None
-                    )
+
+        # The servicer invalidates its session/record before closing the policy
+        # and releasing the model lease. Keep that potentially slow, fallible
+        # cleanup outside the shared payload lock and never let its diagnostic
+        # replace the rollout failure or re-enter this state machine.
+        self._discard_failed_humanoid_session(rollout_job.session_uuid, exc)
+
+        if retry_job is None:
+            if should_drop:
                 logger.error(
-                    "Dropping payload after exhausted retries: scene=%s last_uuid=%s: %s",
+                    "Dropping payload after exhausted retries: scene=%s "
+                    "last_uuid=%s: %s",
                     rollout_job.scene_id,
                     rollout_job.session_uuid,
                     exc,
                 )
-        if should_drop:
-            payload_state.future.set_result([])
+                payload_state.future.set_result([])
+            return
+
+        # Retry setup is a two-phase operation: reserve the new UUID outside
+        # the shared state lock, then atomically publish the queued job only if
+        # the payload is still live. A partial reservation or enqueue failure
+        # deterministically drops the payload and invalidates the new UUID.
+        retry_setup_error: BaseException | None = None
+        retry_abandoned = False
+        try:
+            if self._humanoid_policy_server is not None:
+                self._humanoid_policy_server.servicer.reserve_session(
+                    retry_job.session_uuid,
+                    payload_state.behavior_policy_version,
+                    payload_state.model_lease,
+                )
+        except BaseException as setup_error:  # noqa: BLE001
+            retry_setup_error = setup_error
+
+        if retry_setup_error is None:
+            with self._lock:
+                if (
+                    self._closed
+                    or payload_state.permanently_failed
+                    or payload_state.future_resolved
+                ):
+                    retry_abandoned = True
+                else:
+                    try:
+                        self._rollout_job_queue.put(
+                            (
+                                0,  # retry priority: preempts fresh dispatch
+                                next(self._rollout_job_seq),
+                                retry_job,
+                            )
+                        )
+                    except BaseException as setup_error:  # noqa: BLE001
+                        retry_setup_error = setup_error
+                        should_drop = self._mark_payload_permanently_failed_locked(
+                            payload_state
+                        )
+        else:
+            with self._lock:
+                if not (
+                    payload_state.permanently_failed or payload_state.future_resolved
+                ):
+                    should_drop = self._mark_payload_permanently_failed_locked(
+                        payload_state
+                    )
+
+        if retry_setup_error is not None or retry_abandoned:
+            self._discard_failed_humanoid_session(retry_job.session_uuid, exc)
+            if retry_setup_error is not None:
+                logger.warning(
+                    "Suppressed humanoid retry setup error for uuid=%s while "
+                    "preserving rollout failure %r",
+                    retry_job.session_uuid,
+                    exc,
+                    exc_info=(
+                        type(retry_setup_error),
+                        retry_setup_error,
+                        retry_setup_error.__traceback__,
+                    ),
+                )
+            if should_drop:
+                logger.error(
+                    "Dropping payload after retry setup failed: scene=%s "
+                    "last_uuid=%s: %s",
+                    rollout_job.scene_id,
+                    rollout_job.session_uuid,
+                    exc,
+                )
+                payload_state.future.set_result([])
+            return
+
+        logger.warning(
+            "Retrying payload uuid=%s scene=%s attempt=%d retries_left=%d: %s",
+            rollout_job.session_uuid,
+            rollout_job.scene_id,
+            rollout_job.attempts + 1,
+            retry_retries_left,
+            exc,
+        )
+
+    def _mark_payload_permanently_failed_locked(
+        self,
+        payload_state: SharedPayloadState,
+    ) -> bool:
+        """Mark one payload failed while ``self._lock`` is held."""
+        payload_state.permanently_failed = True
+        if payload_state.future_resolved:
+            return False
+        payload_state.future_resolved = True
+        self._active_payload_states.pop(payload_state.payload.prompt_idx, None)
+        return True
+
+    def _discard_failed_humanoid_session(
+        self,
+        session_uuid: str,
+        primary_exc: BaseException,
+    ) -> None:
+        """Invalidate failed session state without masking its primary failure."""
+        try:
+            self._discard_humanoid_session(session_uuid)
+        except BaseException as cleanup_exc:  # noqa: BLE001
+            logger.warning(
+                "Suppressed humanoid session cleanup error for uuid=%s while "
+                "preserving rollout failure %r",
+                session_uuid,
+                primary_exc,
+                exc_info=(
+                    type(cleanup_exc),
+                    cleanup_exc,
+                    cleanup_exc.__traceback__,
+                ),
+            )
 
     def _discard_humanoid_session(self, session_uuid: str) -> None:
         """Release one never-started or failed humanoid session reservation."""

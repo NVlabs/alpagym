@@ -11,14 +11,28 @@ through ``GrpoConfig``; the selected ``trainer_type`` determines the objective.
 """
 
 import copy
+import io
+import hashlib
+import json
 import logging
 import math
 import os
+import re
+import secrets
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
+from alpagym_host.checkpoint_resume import (
+    ValidatedCheckpointResumeSource,
+    canonical_json_sha256,
+    read_stable_regular_file,
+    validate_checkpoint_resume_source,
+    validate_disabled_checkpoint_resume_contract,
+)
 from alpagym_host.config import RunConfig, load_run_config
 from cosmos_rl.dispatcher.data import schema as _rollout_schema
 from cosmos_rl.policy import config as _cosmos_config
@@ -37,11 +51,235 @@ from alpagym_runtime.cosmos.rollout_filter import filter_trainable_rollouts
 from alpagym_runtime.perf.instrument.lifecycle import initialize_perf
 from alpagym_runtime.perf.instrument.marker import record_perf_marker
 from alpagym_runtime.perf.instrument.scope import measure_perf
-from alpagym_runtime.policies.registry import get_policy_bundle
+from alpagym_runtime.policies.registry import (
+    PolicyCheckpointExportContext,
+    get_policy_bundle,
+)
 from alpagym_runtime.replay import TrainingSignal
 from alpagym_runtime.tensor_utils import to_device_recursive
 
 logger = logging.getLogger(__name__)
+
+_FORMAL_RUN_ID = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}$")
+_COSMOS_TIMESTAMP = re.compile(r"^[0-9]{14}$")
+_PPO_UPDATE_RECEIPT_STATES = frozenset({"pre_rejected", "post_rejected", "accepted"})
+
+
+def _enforce_strict_training_determinism(config: Any) -> None:
+    """Make a requested deterministic trainer fail closed.
+
+    Cosmos enables deterministic algorithms with ``warn_only=True``.  That
+    still permits PyTorch's memory-efficient scaled-dot-product-attention
+    backward kernel to run nondeterministically, which makes controlled PPO
+    calibrations incomparable.  Formal AlpaGym trainers instead require the
+    deterministic variant of every selected kernel and reject any operation
+    without one.
+    """
+
+    if not bool(getattr(config.train, "deterministic", False)):
+        return
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(mode=True, warn_only=False)
+    if not torch.are_deterministic_algorithms_enabled():
+        raise RuntimeError("deterministic training algorithms were not enabled")
+    if torch.is_deterministic_algorithms_warn_only_enabled():
+        raise RuntimeError("deterministic training unexpectedly remained warn-only")
+
+
+def _assert_strict_training_determinism(config: Any) -> None:
+    """Fail if another runtime component relaxed the formal trainer contract."""
+
+    if not bool(getattr(config.train, "deterministic", False)):
+        return
+    if not torch.are_deterministic_algorithms_enabled():
+        raise RuntimeError("deterministic training algorithms became disabled")
+    if torch.is_deterministic_algorithms_warn_only_enabled():
+        raise RuntimeError("deterministic training became warn-only")
+
+
+def _optimizer_learning_rates_before_scheduler(optimizers: Any) -> list[float]:
+    """Read every leaf optimizer LR from a Cosmos optimizer container.
+
+    Cosmos's ``OptimizersContainer`` is itself a ``torch.optim.Optimizer`` so
+    it exposes a synthetic top-level ``param_groups`` entry.  For multi-part
+    models that entry contains only ``optimizers_args``; the actor/critic LRs
+    live in the nested leaf optimizers.  Reading the synthetic group therefore
+    both loses the per-part rates and raises ``KeyError('lr')`` in production.
+
+    Walk the nested container explicitly and fail closed if a leaf optimizer
+    cannot provide a finite, non-negative LR.  A plain PyTorch optimizer is a
+    leaf and follows the same validation path.
+    """
+
+    learning_rates: list[float] = []
+    active_container_ids: set[int] = set()
+
+    def visit(node: Any) -> None:
+        if node is None:
+            return
+        if isinstance(node, (list, tuple)):
+            for child in node:
+                visit(child)
+            return
+
+        nested = getattr(node, "optimizers", None)
+        if nested is not None:
+            node_id = id(node)
+            if node_id in active_container_ids:
+                raise ValueError("optimizer container contains a cycle")
+            active_container_ids.add(node_id)
+            try:
+                visit(nested)
+            finally:
+                active_container_ids.remove(node_id)
+            return
+
+        param_groups = getattr(node, "param_groups", None)
+        if not isinstance(param_groups, (list, tuple)) or not param_groups:
+            raise TypeError("leaf optimizer must expose non-empty param_groups")
+        for group in param_groups:
+            if not isinstance(group, dict):
+                raise TypeError("optimizer param group must be a mapping")
+            if "lr" not in group:
+                raise KeyError("leaf optimizer param group is missing lr")
+            raw_learning_rate = group["lr"]
+            if isinstance(raw_learning_rate, torch.Tensor):
+                if raw_learning_rate.numel() != 1:
+                    raise ValueError("optimizer learning-rate tensor must be scalar")
+                raw_learning_rate = raw_learning_rate.detach().cpu().item()
+            if isinstance(raw_learning_rate, bool):
+                raise TypeError("optimizer learning rate cannot be a boolean")
+            try:
+                learning_rate = float(raw_learning_rate)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise TypeError("optimizer learning rate must be numeric") from error
+            if not math.isfinite(learning_rate) or learning_rate < 0.0:
+                raise ValueError(
+                    "optimizer learning rate must be finite and non-negative"
+                )
+            learning_rates.append(learning_rate)
+
+    visit(optimizers)
+    if not learning_rates:
+        raise ValueError("optimizer container has no leaf learning rates")
+    return learning_rates
+
+
+def _optimizer_parameter_id_sets(optimizers: Any) -> list[set[int]]:
+    """Return each leaf optimizer's exact owned Parameter identities."""
+
+    parameter_sets: list[set[int]] = []
+    active_container_ids: set[int] = set()
+
+    def visit(node: Any) -> None:
+        if node is None:
+            return
+        if isinstance(node, (list, tuple)):
+            for child in node:
+                visit(child)
+            return
+        nested = getattr(node, "optimizers", None)
+        if nested is not None:
+            node_id = id(node)
+            if node_id in active_container_ids:
+                raise ValueError("optimizer container contains a cycle")
+            active_container_ids.add(node_id)
+            try:
+                visit(nested)
+            finally:
+                active_container_ids.remove(node_id)
+            return
+
+        param_groups = getattr(node, "param_groups", None)
+        if not isinstance(param_groups, (list, tuple)) or not param_groups:
+            raise TypeError("leaf optimizer must expose non-empty param_groups")
+        parameter_ids: set[int] = set()
+        for group in param_groups:
+            if not isinstance(group, dict):
+                raise TypeError("optimizer param group must be a mapping")
+            raw_parameters = group.get("params")
+            if not isinstance(raw_parameters, (list, tuple)):
+                raise TypeError(
+                    "optimizer param group params must be a concrete sequence"
+                )
+            for parameter in raw_parameters:
+                if not isinstance(parameter, torch.nn.Parameter):
+                    raise TypeError("optimizer params must contain torch Parameters")
+                parameter_id = id(parameter)
+                if parameter_id in parameter_ids:
+                    raise ValueError("leaf optimizer owns one Parameter more than once")
+                parameter_ids.add(parameter_id)
+        if not parameter_ids:
+            raise ValueError("leaf optimizer owns no Parameters")
+        parameter_sets.append(parameter_ids)
+
+    visit(optimizers)
+    if not parameter_sets:
+        raise ValueError("optimizer container has no leaf parameter sets")
+    return parameter_sets
+
+
+def _deterministic_optimizer_permutation(
+    *,
+    num_steps: int,
+    base_seed: int,
+    current_step: int,
+    optimization_iteration: int,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Build and fingerprint a restart-stable optimizer-row permutation.
+
+    The global PyTorch RNG is shared with model initialization and arbitrary
+    runtime bookkeeping.  Using it for ``randperm`` made two otherwise equal
+    PPO calibration runs consume an unobserved training order.  Derive a
+    private CPU generator seed from the immutable training coordinates so the
+    exact order is independent of unrelated RNG consumers and reproducible
+    after checkpoint resume.
+    """
+
+    coordinates = {
+        "schema_id": "alpagym.optimizer_permutation.v1",
+        "base_seed": base_seed,
+        "current_step": current_step,
+        "optimization_iteration": optimization_iteration,
+        "num_steps": num_steps,
+    }
+    for name, value in coordinates.items():
+        if name == "schema_id":
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"optimizer permutation {name} must be an integer")
+    if num_steps <= 0:
+        raise ValueError("optimizer permutation num_steps must be positive")
+    if not 0 <= base_seed <= 2**64 - 1:
+        raise ValueError("optimizer permutation base_seed must be uint64")
+    if current_step < 0 or optimization_iteration < 0:
+        raise ValueError("optimizer permutation step coordinates must be non-negative")
+
+    coordinate_bytes = json.dumps(
+        coordinates,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    coordinate_sha256 = hashlib.sha256(coordinate_bytes).hexdigest()
+    derived_seed = int.from_bytes(
+        bytes.fromhex(coordinate_sha256)[:8], byteorder="big", signed=False
+    )
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(derived_seed)
+    indices = torch.randperm(num_steps, generator=generator, device="cpu")
+    index_bytes = indices.to(dtype=torch.int64).numpy().tobytes(order="C")
+    record: dict[str, Any] = {
+        **coordinates,
+        "coordinate_sha256": coordinate_sha256,
+        "derived_seed": derived_seed,
+        "indices_sha256": hashlib.sha256(index_bytes).hexdigest(),
+        "indices_head": [int(index) for index in indices[:16]],
+        "indices_tail": [int(index) for index in indices[-16:]],
+        "torch_version": torch.__version__,
+    }
+    return indices, record
 
 
 def _fixed_reference_reset_interval(value: int | None) -> int:
@@ -72,6 +310,566 @@ def _load_run_config(config: _cosmos_config.Config) -> RunConfig:
             "AlpaGym run config. Production cosmos invocations set this via --config."
         )
     return load_run_config(resolved_config_path)
+
+
+def _policy_checkpoint_export_context(
+    *,
+    config: Any,
+    current_step: int,
+    total_steps: int,
+    optimizer_steps_applied: int,
+) -> PolicyCheckpointExportContext:
+    """Bind a policy-native export to the formal host run, not a leaf directory.
+
+    Cosmos appends its own timestamp directory to ``train.output_dir`` at load
+    time.  Neither that timestamp nor the authored ``cosmos`` directory is the
+    AlpaGym run identity.  The canonical identity is the generated host run
+    directory recorded in ``resolved_config.yaml``.
+    """
+    custom = getattr(config, "custom", None) or {}
+    resolved_config_value = (
+        custom.get("resolved_config_path") if hasattr(custom, "get") else None
+    )
+    if not isinstance(resolved_config_value, str) or not resolved_config_value:
+        raise ValueError(
+            "policy-native checkpoint export requires custom.resolved_config_path"
+        )
+    resolved_config_path = Path(resolved_config_value).expanduser()
+    if resolved_config_path.is_symlink() or not resolved_config_path.is_file():
+        raise ValueError(
+            "policy-native checkpoint export resolved config must be a regular file"
+        )
+    digest = hashlib.sha256()
+    with resolved_config_path.open("rb") as stream:
+        while block := stream.read(8 * 1024 * 1024):
+            digest.update(block)
+    run_config = _load_run_config(config)
+    formal_run_dir = Path(run_config.artifact_paths.run_dir).expanduser()
+    canonical_config_path = Path(
+        run_config.artifact_paths.resolved_config_path
+    ).expanduser()
+    if not formal_run_dir.is_absolute() or not canonical_config_path.is_absolute():
+        raise ValueError("policy-native checkpoint formal run paths must be absolute")
+    if not formal_run_dir.is_dir() or formal_run_dir.is_symlink():
+        raise ValueError(
+            "policy-native checkpoint formal run directory must be a regular directory"
+        )
+    if not canonical_config_path.is_file() or canonical_config_path.is_symlink():
+        raise ValueError(
+            "policy-native checkpoint canonical resolved config must be a regular file"
+        )
+    if not os.path.samefile(resolved_config_path, canonical_config_path):
+        raise ValueError(
+            "policy-native checkpoint resolved config differs from the canonical "
+            "formal-run config"
+        )
+    formal_run_id = formal_run_dir.name
+    if _FORMAL_RUN_ID.fullmatch(formal_run_id) is None:
+        raise ValueError(
+            "policy-native checkpoint canonical run_dir has no formal run ID"
+        )
+
+    output_dir = Path(str(config.train.output_dir)).expanduser()
+    if (
+        not output_dir.is_absolute()
+        or not output_dir.is_dir()
+        or output_dir.is_symlink()
+    ):
+        raise ValueError(
+            "policy-native checkpoint Cosmos output_dir must be an absolute regular "
+            "directory"
+        )
+    cosmos_timestamp = getattr(config.train, "timestamp", None)
+    if (
+        not isinstance(cosmos_timestamp, str)
+        or _COSMOS_TIMESTAMP.fullmatch(cosmos_timestamp) is None
+        or output_dir.name != cosmos_timestamp
+    ):
+        raise ValueError(
+            "policy-native checkpoint Cosmos output_dir must end in its runtime "
+            "timestamp"
+        )
+    expected_cosmos_root = formal_run_dir / "cosmos"
+    if output_dir.parent != expected_cosmos_root:
+        raise ValueError(
+            "policy-native checkpoint Cosmos output_dir is not owned by the "
+            "canonical formal run"
+        )
+    return PolicyCheckpointExportContext(
+        training_step=current_step,
+        total_training_steps=total_steps,
+        optimizer_steps_applied=optimizer_steps_applied,
+        resolved_config_sha256=digest.hexdigest(),
+        cosmos_run_id=formal_run_id,
+    )
+
+
+def _validated_runtime_resume_source(
+    *,
+    config: Any,
+    run_config: RunConfig,
+) -> ValidatedCheckpointResumeSource | None:
+    """Bind Cosmos's public string to the host-authored typed contract."""
+
+    contract = run_config.cosmos.train.resume
+    runtime_resume = getattr(config.train, "resume", False)
+    if not contract.enabled:
+        validate_disabled_checkpoint_resume_contract(contract)
+        if runtime_resume not in (False, None):
+            raise ValueError(
+                "Cosmos train.resume is set but the AlpaGym typed resume contract "
+                "is disabled"
+            )
+        return None
+    source = validate_checkpoint_resume_source(contract)
+    if not isinstance(runtime_resume, str):
+        raise ValueError(
+            "enabled AlpaGym checkpoint resume requires Cosmos train.resume to be "
+            "the exact policy-directory string"
+        )
+    if runtime_resume != str(source.checkpoint_path):
+        raise ValueError(
+            "Cosmos train.resume differs from the exact typed checkpoint path"
+        )
+    return source
+
+
+def _load_checkpoint_extra_info(
+    source: ValidatedCheckpointResumeSource,
+    *,
+    rank: int,
+    expected_step: int,
+    expected_next_step: int,
+) -> dict[str, Any]:
+    """Read and validate the rank-local native extra-info before mutation."""
+
+    if rank not in source.ranks:
+        raise ValueError(f"checkpoint tree has no complete state for rank {rank}")
+    filename = f"extra_info_rank_{rank}.pth"
+    expected_file = source.snapshot.file(filename)
+    data, metadata = read_stable_regular_file(source.checkpoint_path / filename)
+    if (
+        metadata.st_size != expected_file.size_bytes
+        or hashlib.sha256(data).hexdigest() != expected_file.sha256
+    ):
+        raise RuntimeError("checkpoint extra-info changed after tree validation")
+    payload = torch.load(io.BytesIO(data), weights_only=False, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError("native Cosmos checkpoint extra-info must be a mapping")
+    required = {"rng_state", "step", "total_steps", "remain_samples_num", "is_final"}
+    missing = required - set(payload)
+    if missing:
+        raise ValueError(
+            f"native Cosmos checkpoint extra-info is missing: {sorted(missing)}"
+        )
+    for field_name in ("step", "total_steps", "remain_samples_num"):
+        value = payload[field_name]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"checkpoint extra-info {field_name} must be an integer")
+    if payload["step"] != expected_step:
+        raise ValueError("checkpoint extra-info step differs from resume contract")
+    if expected_next_step != payload["step"] + 1:
+        raise ValueError("checkpoint extra-info does not precede expected next step")
+    if payload["total_steps"] < payload["step"]:
+        raise ValueError("checkpoint extra-info total_steps precedes its step")
+    if not isinstance(payload["is_final"], bool):
+        raise TypeError("checkpoint extra-info is_final must be a boolean")
+    rng_state = payload["rng_state"]
+    if not isinstance(rng_state, dict) or not {
+        "torch",
+        "numpy",
+        "python",
+    }.issubset(rng_state):
+        raise ValueError(
+            "checkpoint extra-info rng_state must contain torch, numpy, and python"
+        )
+    return payload
+
+
+def _nested_state_equal(first: Any, second: Any) -> bool:
+    """Compare nested RNG states without ambiguous tensor/array truth values."""
+
+    if isinstance(first, torch.Tensor) and isinstance(second, torch.Tensor):
+        return first.shape == second.shape and torch.equal(first.cpu(), second.cpu())
+    if isinstance(first, np.ndarray) and isinstance(second, np.ndarray):
+        return first.dtype == second.dtype and np.array_equal(first, second)
+    if isinstance(first, dict) and isinstance(second, dict):
+        return set(first) == set(second) and all(
+            _nested_state_equal(first[key], second[key]) for key in first
+        )
+    if isinstance(first, (tuple, list)) and isinstance(second, type(first)):
+        return len(first) == len(second) and all(
+            _nested_state_equal(left, right)
+            for left, right in zip(first, second, strict=True)
+        )
+    try:
+        result = first == second
+    except (TypeError, ValueError):
+        return False
+    return bool(result) if isinstance(result, (bool, np.bool_)) else False
+
+
+def _validate_native_resume_result(
+    *,
+    extra_info: dict[str, Any],
+    restored: Any,
+    current_rng_state: Any,
+) -> None:
+    """Prove that native load returned the exact step and restored RNG."""
+
+    if not isinstance(restored, dict):
+        raise TypeError("Cosmos native resume result must be a mapping")
+    for name in ("step", "total_steps", "remain_samples_num", "is_final"):
+        if restored.get(name) != extra_info[name]:
+            raise ValueError(f"Cosmos native resume result changed {name}")
+    if not _nested_state_equal(current_rng_state, extra_info["rng_state"]):
+        raise RuntimeError(
+            "Cosmos native resume did not restore the checkpoint RNG state"
+        )
+
+
+def _checkpoint_restore_receipt_path(
+    *,
+    config: Any,
+    run_config: RunConfig,
+    rank: int,
+) -> tuple[Path, str, str]:
+    """Resolve the current formal-run receipt path and immutable config identity."""
+
+    run_dir = Path(run_config.artifact_paths.run_dir)
+    resolved_config = Path(run_config.artifact_paths.resolved_config_path)
+    custom = getattr(config, "custom", None) or {}
+    configured_resolved = (
+        custom.get("resolved_config_path") if hasattr(custom, "get") else None
+    )
+    if not run_dir.is_absolute() or _FORMAL_RUN_ID.fullmatch(run_dir.name) is None:
+        raise ValueError("checkpoint restore receipt requires a formal current run")
+    if not run_dir.is_dir() or run_dir.is_symlink():
+        raise ValueError("checkpoint restore receipt current run_dir is invalid")
+    if (
+        not isinstance(configured_resolved, str)
+        or Path(configured_resolved) != resolved_config
+        or not resolved_config.is_file()
+        or resolved_config.is_symlink()
+    ):
+        raise ValueError(
+            "checkpoint restore receipt resolved config binding is invalid"
+        )
+    output_dir = Path(str(config.train.output_dir))
+    timestamp = getattr(config.train, "timestamp", None)
+    if (
+        not isinstance(timestamp, str)
+        or _COSMOS_TIMESTAMP.fullmatch(timestamp) is None
+        or output_dir != run_dir / "cosmos" / timestamp
+        or not output_dir.is_dir()
+        or output_dir.is_symlink()
+    ):
+        raise ValueError("checkpoint restore receipt Cosmos output binding is invalid")
+    config_data, _metadata = read_stable_regular_file(resolved_config)
+    receipt_dir = Path(run_config.artifact_paths.artifacts_dir) / (
+        "checkpoint_resume_receipts"
+    )
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    if receipt_dir.is_symlink() or receipt_dir.resolve(strict=True) != receipt_dir:
+        raise ValueError("checkpoint restore receipt directory is not canonical")
+    return (
+        receipt_dir / f"rank_{rank}.json",
+        run_dir.name,
+        hashlib.sha256(config_data).hexdigest(),
+    )
+
+
+def _write_checkpoint_restore_receipt(
+    *,
+    config: Any,
+    run_config: RunConfig,
+    source: ValidatedCheckpointResumeSource,
+    rank: int,
+    restored: dict[str, Any],
+) -> Path:
+    """Persist one exclusive per-rank receipt after every restore check passes."""
+
+    path, current_run_id, resolved_config_sha256 = _checkpoint_restore_receipt_path(
+        config=config,
+        run_config=run_config,
+        rank=rank,
+    )
+    contract = run_config.cosmos.train.resume
+    receipt = {
+        "schema_id": "alpagym.cosmos_checkpoint_restore.v1",
+        "captured_at_utc": datetime.now(UTC).isoformat(),
+        "current_formal_run_id": current_run_id,
+        "current_resolved_config_sha256": resolved_config_sha256,
+        "rank": rank,
+        "prior_formal_run_id": contract.prior_formal_run_id,
+        "prior_postrun_receipt_sha256": source.prior_postrun_receipt_sha256,
+        "checkpoint_path": str(source.checkpoint_path),
+        "checkpoint_step": contract.checkpoint_step,
+        "checkpoint_tree_sha256": source.snapshot.tree_sha256,
+        "checkpoint_file_count": source.snapshot.file_count,
+        "checkpoint_total_size_bytes": source.snapshot.total_size_bytes,
+        "restored_training_step": restored["step"],
+        "expected_next_training_step": contract.expected_next_training_step,
+        "restored_prior_total_steps": restored["total_steps"],
+        "restored_remain_samples_num": restored["remain_samples_num"],
+        "restored_prior_is_final": restored["is_final"],
+        "native_restore": {
+            "loader": "cosmos_rl.CheckpointMananger.load_checkpoint",
+            "loader_completed": True,
+            "model_state_restored": True,
+            "optimizer_state_restored": True,
+            "scheduler_state_restored": True,
+            "rng_state_restored_and_verified": True,
+            "training_step_restored_and_verified": True,
+            "checkpoint_tree_revalidated_after_load": True,
+        },
+    }
+    receipt["receipt_sha256"] = canonical_json_sha256(receipt)
+    payload = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(path, flags, 0o444)
+    try:
+        with os.fdopen(os.dup(descriptor), "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(descriptor)
+    return path
+
+
+def _ppo_update_receipt_context(
+    *,
+    config: Any,
+    run_config: RunConfig,
+    rank: int,
+    current_step: int,
+) -> tuple[Path, dict[str, Any]]:
+    """Resolve one formal-run-bound immutable PPO diagnostic destination."""
+
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+        raise ValueError("PPO update diagnostic receipt requires a valid global rank")
+    if (
+        isinstance(current_step, bool)
+        or not isinstance(current_step, int)
+        or current_step < 0
+    ):
+        raise ValueError("PPO update diagnostic receipt requires a valid trainer step")
+
+    run_dir = Path(run_config.artifact_paths.run_dir).expanduser()
+    artifacts_dir = Path(run_config.artifact_paths.artifacts_dir).expanduser()
+    resolved_config = Path(run_config.artifact_paths.resolved_config_path).expanduser()
+    if (
+        not run_dir.is_absolute()
+        or _FORMAL_RUN_ID.fullmatch(run_dir.name) is None
+        or not run_dir.is_dir()
+        or run_dir.is_symlink()
+        or run_dir.resolve(strict=True) != run_dir
+    ):
+        raise ValueError(
+            "PPO update diagnostic receipt requires a canonical formal run"
+        )
+    if (
+        artifacts_dir != run_dir / "artifacts"
+        or not artifacts_dir.is_dir()
+        or artifacts_dir.is_symlink()
+        or artifacts_dir.resolve(strict=True) != artifacts_dir
+    ):
+        raise ValueError("PPO update diagnostic artifact directory is invalid")
+
+    custom = getattr(config, "custom", None) or {}
+    configured_resolved = (
+        custom.get("resolved_config_path") if hasattr(custom, "get") else None
+    )
+    if (
+        not isinstance(configured_resolved, str)
+        or Path(configured_resolved).expanduser() != resolved_config
+        or not resolved_config.is_absolute()
+        or not resolved_config.is_file()
+        or resolved_config.is_symlink()
+        or resolved_config.resolve(strict=True) != resolved_config
+    ):
+        raise ValueError("PPO update diagnostic resolved-config binding is invalid")
+    resolved_config_data, resolved_config_metadata = read_stable_regular_file(
+        resolved_config
+    )
+
+    output_dir = Path(str(config.train.output_dir)).expanduser()
+    timestamp = getattr(config.train, "timestamp", None)
+    if (
+        not isinstance(timestamp, str)
+        or _COSMOS_TIMESTAMP.fullmatch(timestamp) is None
+        or output_dir != run_dir / "cosmos" / timestamp
+        or not output_dir.is_dir()
+        or output_dir.is_symlink()
+        or output_dir.resolve(strict=True) != output_dir
+    ):
+        raise ValueError("PPO update diagnostic Cosmos output binding is invalid")
+
+    receipt_dir = artifacts_dir / "ppo_update_diagnostics"
+    receipt_dir.mkdir(mode=0o755, parents=False, exist_ok=True)
+    if (
+        receipt_dir.is_symlink()
+        or not receipt_dir.is_dir()
+        or receipt_dir.resolve(strict=True) != receipt_dir
+    ):
+        raise ValueError("PPO update diagnostic receipt directory is invalid")
+    return (
+        receipt_dir / f"step_{current_step}_rank_{rank}.json",
+        {
+            "formal_run_id": run_dir.name,
+            "resolved_config_relative_path": resolved_config.relative_to(
+                run_dir
+            ).as_posix(),
+            "resolved_config_sha256": hashlib.sha256(resolved_config_data).hexdigest(),
+            "resolved_config_size_bytes": resolved_config_metadata.st_size,
+            "cosmos_output_relative_path": output_dir.relative_to(run_dir).as_posix(),
+        },
+    )
+
+
+def _write_bytes_atomic_immutable(path: Path, payload: bytes) -> None:
+    """Publish bytes once through an atomic no-replace hard-link operation.
+
+    The temporary inode is fully written, fsynced, and made read-only before it
+    becomes visible at ``path``. ``os.link`` is the atomic no-clobber publish
+    primitive: an existing final receipt makes the trainer fail closed.
+    """
+
+    temp_path = path.parent / (f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(temp_path, flags, 0o600)
+    published = False
+    try:
+        with os.fdopen(os.dup(descriptor), "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.fchmod(descriptor, 0o444)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+
+        os.link(temp_path, path, follow_symlinks=False)
+        published = True
+        temp_path.unlink()
+        directory_descriptor = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if os.path.lexists(temp_path):
+            temp_path.unlink()
+        if published:
+            metadata = os.lstat(path)
+            if metadata.st_nlink != 1 or metadata.st_mode & 0o222:
+                raise RuntimeError(
+                    "published PPO update diagnostic receipt is not immutable"
+                )
+
+
+def _write_ppo_update_diagnostic_receipt(
+    *,
+    config: Any,
+    run_config: RunConfig,
+    rank: int,
+    current_step: int,
+    total_steps: int,
+    state: str,
+    received_rollouts: int,
+    trainable_rollouts: int,
+    sample_rows: int,
+    behavior_weight_versions: list[int],
+    is_master_replica: bool,
+    do_save_checkpoint: bool,
+    pre_update_metrics: dict[str, float | int],
+    optimizer_metrics: dict[str, Any] | None,
+    post_update_metrics: dict[str, float | int] | None,
+    rejection: BaseException | None,
+) -> Path:
+    """Persist the terminal pre-reject, post-reject, or accepted update state."""
+
+    if state not in _PPO_UPDATE_RECEIPT_STATES:
+        raise ValueError(f"unsupported PPO update receipt state: {state!r}")
+    if state == "pre_rejected":
+        if optimizer_metrics is not None or post_update_metrics is not None:
+            raise ValueError("pre-rejected PPO receipt cannot contain post-update data")
+        if rejection is None:
+            raise ValueError("pre-rejected PPO receipt requires a rejection")
+    elif state == "post_rejected":
+        if optimizer_metrics is None:
+            raise ValueError("post-rejected PPO receipt requires optimizer data")
+        # A post-update diagnostic can itself fail after the optimizer has
+        # mutated parameters.  In that case there is intentionally no metric
+        # payload to pretend describes the live (restored) actor.
+        if rejection is None:
+            raise ValueError("post-rejected PPO receipt requires a rejection")
+    else:
+        if optimizer_metrics is None or post_update_metrics is None:
+            raise ValueError("accepted PPO receipt requires complete post-update data")
+        if rejection is not None:
+            raise ValueError("accepted PPO receipt cannot contain a rejection")
+
+    path, binding = _ppo_update_receipt_context(
+        config=config,
+        run_config=run_config,
+        rank=rank,
+        current_step=current_step,
+    )
+    receipt = {
+        "schema_id": "alpagym.ppo_update_diagnostic.v1",
+        "captured_at_utc": datetime.now(UTC).isoformat(),
+        **binding,
+        "rank": rank,
+        "current_step": current_step,
+        "total_steps": total_steps,
+        "state": state,
+        "received_rollouts": received_rollouts,
+        "trainable_rollouts": trainable_rollouts,
+        "sample_rows": sample_rows,
+        "behavior_weight_versions": sorted(behavior_weight_versions),
+        "is_master_replica": is_master_replica,
+        "checkpoint_requested": do_save_checkpoint,
+        "boundary": {
+            "optimizer_steps_applied": 0
+            if optimizer_metrics is None
+            else int(optimizer_metrics["train/optimizer_steps_applied"]),
+            "scheduler_advanced": False,
+            "checkpoint_started": False,
+            "weight_sync_started": False,
+        },
+        "pre_update_metrics": pre_update_metrics,
+        "optimizer_metrics": optimizer_metrics,
+        "post_update_metrics": post_update_metrics,
+        "rejection": None
+        if rejection is None
+        else {"type": type(rejection).__name__, "message": str(rejection)},
+    }
+    receipt["receipt_sha256"] = canonical_json_sha256(receipt)
+    payload = (
+        json.dumps(
+            receipt,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    _write_bytes_atomic_immutable(path, payload)
+    return path
 
 
 @_trainer_base.TrainerRegistry.register(trainer_type="alpagym_grpo")
@@ -130,11 +928,52 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         # ``setup_tokenizer`` handles both.
         bundle = get_policy_bundle(run_config.policy.model.kind)
         self._policy_bundle = bundle
+        if run_config.alpasim.simulation_domain == "humanoid":
+            scene_ids = run_config.dataset.scene_ids
+            if scene_ids is None or not scene_ids:
+                raise ValueError(
+                    "humanoid training requires explicit dataset.scene_ids"
+                )
+            self._global_train_batch_size = (
+                run_config.cosmos.train.train_batch_per_replica
+                * run_config.cosmos.launch.policy_replicas
+            )
+            logical_rollout_samples = (
+                len(scene_ids)
+                * run_config.cosmos.rollout.n_generation
+                * run_config.cosmos.train.num_epochs
+            )
+            if logical_rollout_samples % self._global_train_batch_size != 0:
+                raise ValueError(
+                    "humanoid training horizon is not divisible by the global batch"
+                )
+            self._logical_total_training_steps = (
+                logical_rollout_samples // self._global_train_batch_size
+            )
         bundle_tokenizer = bundle.setup_tokenizer(config)
         if bundle_tokenizer is not None:
             self.tokenizer = bundle_tokenizer
 
+        # Apply before Cosmos constructs the model so attention backend
+        # selection is deterministic during any initialization forwards.
+        _enforce_strict_training_determinism(config)
         super().__init__(config=config, parallel_dims=parallel_dims, **kwargs)
+        # Cosmos's LLMTrainer currently resets this to warn_only=True.  Restore
+        # the formal fail-closed contract before the first rollout replay and
+        # backward pass.
+        _enforce_strict_training_determinism(config)
+        if bool(getattr(config.train, "deterministic", False)):
+            logger.info(
+                "Strict deterministic training enabled: algorithms=true warn_only=false"
+            )
+
+        # A final real trainer step and Cosmos's synthetic
+        # TrainingCompleteCommand can both save the same step.  Candidate
+        # overlays are immutable, so remember exports completed by this exact
+        # trainer instance and never invoke an exporter twice for that step.
+        self._completed_policy_native_exports: dict[
+            int, tuple[Path, PolicyCheckpointExportContext]
+        ] = {}
 
         grpo_config = config.train.train_policy
         if not isinstance(grpo_config, _cosmos_config.GrpoConfig):
@@ -198,6 +1037,8 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
             Dict of training metrics for Cosmos to log.
         """
         del kwargs
+        _assert_strict_training_determinism(self.config)
+        received_rollout_count = len(rollouts)
         logger.info(
             "AlpaGym trainer step start current_step=%d total_steps=%d received_rollouts=%d "
             "group_size=%d mini_batch=%d grpo_optimization_iterations=%d "
@@ -233,33 +1074,317 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
                 f"current_step={current_step}"
             )
 
+        write_ppo_receipt = bool(
+            getattr(self, "_write_ppo_update_diagnostic_receipts", False)
+        )
+        receipt_run_config: RunConfig | None = None
+        receipt_rank: int | None = None
+        behavior_weight_versions: list[int] = []
+        optimizer_learning_rates_before_scheduler: list[float] | None = None
+        behavior_kl_backtrack = bool(getattr(self, "_behavior_kl_backtrack", False))
+        if write_ppo_receipt:
+            behavior_weight_versions = [
+                int(rollout.weight_version) for rollout in rollouts
+            ]
+            receipt_run_config = _load_run_config(self.config)
+            candidate_rank = getattr(self.ckpt_manager, "global_rank", None)
+            if (
+                isinstance(candidate_rank, bool)
+                or not isinstance(candidate_rank, int)
+                or candidate_rank < 0
+            ):
+                raise ValueError(
+                    "PPO update diagnostic receipt requires a valid global rank"
+                )
+            receipt_rank = candidate_rank
+            receipt_path, _receipt_binding = _ppo_update_receipt_context(
+                config=self.config,
+                run_config=receipt_run_config,
+                rank=receipt_rank,
+                current_step=current_step,
+            )
+            if os.path.lexists(receipt_path):
+                raise FileExistsError(
+                    "PPO update diagnostic receipt already exists before optimizer "
+                    f"entry: {receipt_path}"
+                )
+        if write_ppo_receipt or behavior_kl_backtrack:
+            # Audit the real leaf optimizer topology before any parameter can
+            # mutate.  A new or malformed container must fail at the entry
+            # boundary, never after an otherwise successful optimizer step.
+            optimizer_learning_rates_before_scheduler = (
+                _optimizer_learning_rates_before_scheduler(self.optimizers)
+            )
+
         pre_update_metrics = self._pre_update_diagnostics(samples)
-        self._validate_update_diagnostics(
-            pre_update_metrics,
-            phase="pre_update",
+        actor_snapshot: tuple[list[torch.nn.Parameter], list[torch.Tensor]] | None = (
+            None
         )
-        (
-            total_loss,
-            total_kl,
-            num_batches,
-            ratio_max,
-            ratio_min,
-            clip_fraction_sum,
-            grad_norm_sum,
-        ) = self._run_training_loop(samples, advantages, inter_policy_nccl)
-        # PPO overrides this hook with a no-grad replay pass against the final
-        # post-update policy.  The minibatch diagnostics above are measured
-        # before each individual optimizer step, so they cannot describe one
-        # coherent final policy when a trainer step contains multiple updates.
-        post_update_metrics = self._post_update_diagnostics(samples)
-        self._validate_update_diagnostics(
-            post_update_metrics,
-            phase="post_update",
-        )
+        try:
+            self._validate_update_diagnostics(
+                pre_update_metrics,
+                phase="pre_update",
+            )
+            if behavior_kl_backtrack:
+                actor_snapshot = self._snapshot_actor_for_kl_backtracking()
+        except Exception as guard_failure:
+            if write_ppo_receipt:
+                assert receipt_run_config is not None
+                assert receipt_rank is not None
+                try:
+                    receipt_path = _write_ppo_update_diagnostic_receipt(
+                        config=self.config,
+                        run_config=receipt_run_config,
+                        rank=receipt_rank,
+                        current_step=current_step,
+                        total_steps=total_steps,
+                        state="pre_rejected",
+                        received_rollouts=received_rollout_count,
+                        trainable_rollouts=len(rollouts),
+                        sample_rows=len(samples),
+                        behavior_weight_versions=behavior_weight_versions,
+                        is_master_replica=is_master_replica,
+                        do_save_checkpoint=do_save_checkpoint,
+                        pre_update_metrics=pre_update_metrics,
+                        optimizer_metrics=None,
+                        post_update_metrics=None,
+                        rejection=guard_failure,
+                    )
+                    logger.error(
+                        "PPO pre-update guard rejection receipt: %s", receipt_path
+                    )
+                except Exception as receipt_failure:
+                    raise ExceptionGroup(
+                        "PPO pre-update guard and diagnostic receipt both failed",
+                        [guard_failure, receipt_failure],
+                    ) from None
+            raise
+        self._active_optimizer_step = current_step
+        try:
+            (
+                total_loss,
+                total_kl,
+                num_batches,
+                ratio_max,
+                ratio_min,
+                clip_fraction_sum,
+                grad_norm_sum,
+            ) = self._run_training_loop(samples, advantages, inter_policy_nccl)
+        finally:
+            del self._active_optimizer_step
+        optimizer_steps_applied = self._optimizer_steps_applied_in_training_step
+        optimizer_metrics: dict[str, Any] | None = None
+        if write_ppo_receipt:
+            assert optimizer_learning_rates_before_scheduler is not None
+            optimizer_metrics = {
+                "train/loss_sum": total_loss,
+                "train/loss_avg_local": total_loss / num_batches
+                if num_batches
+                else 0.0,
+                "train/kl_sum": total_kl,
+                "train/kl_avg_local": total_kl / num_batches if num_batches else 0.0,
+                "train/num_batches": num_batches,
+                "train/num_micro_batches": int(
+                    getattr(self, "_last_micro_batches", num_batches)
+                ),
+                "train/optimizer_steps_applied": optimizer_steps_applied,
+                "train/ratio_max": ratio_max,
+                "train/ratio_min": ratio_min,
+                "train/clip_fraction": clip_fraction_sum / num_batches
+                if num_batches
+                else 0.0,
+                "train/grad_norm": grad_norm_sum / num_batches if num_batches else 0.0,
+                "train/optimizer_learning_rates_before_scheduler": (
+                    optimizer_learning_rates_before_scheduler
+                ),
+                "train/target_behavior_kl": getattr(self, "_target_behavior_kl", None),
+                **getattr(self, "_last_optimizer_permutation_metrics", {}),
+                **getattr(self, "_last_ppo_advantage_metrics", {}),
+            }
+        self._last_behavior_kl_backtrack_metrics = {}
+        post_update_metrics: dict[str, float | int] | None = None
+        try:
+            # This no-grad replay describes the final candidate policy.  Keep
+            # it inside the mutation guard because the diagnostic itself may
+            # fail after Adam has already changed parameters.
+            post_update_metrics = self._post_update_diagnostics(samples)
+            if behavior_kl_backtrack and optimizer_steps_applied:
+                if actor_snapshot is None:
+                    raise RuntimeError(
+                        "PPO behavior-KL backtracking lost its pre-step actor snapshot"
+                    )
+                if optimizer_learning_rates_before_scheduler is None:
+                    raise RuntimeError(
+                        "PPO behavior-KL backtracking has no audited actor LR"
+                    )
+                post_update_metrics, backtrack_metrics = self._backtrack_behavior_kl(
+                    samples,
+                    post_update_metrics,
+                    actor_snapshot,
+                    actor_learning_rate=(optimizer_learning_rates_before_scheduler[0]),
+                )
+                self._last_behavior_kl_backtrack_metrics = {
+                    key: value
+                    for key, value in backtrack_metrics.items()
+                    if key != "train/actor_backtrack_history"
+                }
+                if optimizer_metrics is not None:
+                    optimizer_metrics.update(backtrack_metrics)
+                if int(backtrack_metrics["train/actor_backtrack_failed"]):
+                    raise FloatingPointError(
+                        "PPO actor behavior-KL backtracking exhausted its calibrated "
+                        "attempts; restored the pre-step actor and refusing scheduler, "
+                        "checkpoint, or weight sync"
+                    )
+            self._validate_update_diagnostics(
+                post_update_metrics,
+                phase="post_update",
+            )
+        except Exception as guard_failure:
+            rejection: BaseException = guard_failure
+            if behavior_kl_backtrack and optimizer_steps_applied:
+                restore_metadata: dict[str, float | int] = {
+                    "train/actor_restore_attempted": 0,
+                    "train/actor_restore_succeeded": 0,
+                    # Adam moments and the critic update are process-local and
+                    # intentionally not rewound.  Fail-stop below prevents
+                    # scheduler, checkpoint, and weight-sync publication.
+                    "train/actor_optimizer_state_rolled_back": 0,
+                }
+                if post_update_metrics is not None:
+                    candidate_kl = float(
+                        post_update_metrics.get(
+                            "train/post_update_approx_kl", float("nan")
+                        )
+                    )
+                    target_behavior_kl = getattr(self, "_target_behavior_kl", None)
+                    if (
+                        math.isfinite(candidate_kl)
+                        and target_behavior_kl is not None
+                        and candidate_kl > float(target_behavior_kl)
+                    ):
+                        restore_metadata["train/behavior_kl_last_unsafe_candidate"] = (
+                            candidate_kl
+                        )
+                if actor_snapshot is None:
+                    restore_failure: BaseException = RuntimeError(
+                        "PPO post-update rejection cannot restore the actor because "
+                        "its immutable pre-step snapshot is missing"
+                    )
+                    rejection = ExceptionGroup(
+                        "PPO post-update rejection and actor restoration failed",
+                        [guard_failure, restore_failure],
+                    )
+                    post_update_metrics = None
+                else:
+                    parameters, snapshots = actor_snapshot
+                    restore_metadata["train/actor_restore_attempted"] = 1
+                    try:
+                        self._scale_actor_step_toward_snapshot_(
+                            parameters,
+                            snapshots,
+                            relative_scale=0.0,
+                        )
+                        restore_metadata["train/actor_restore_succeeded"] = 1
+                    except Exception as restore_failure:
+                        rejection = ExceptionGroup(
+                            "PPO post-update rejection and actor restoration failed",
+                            [guard_failure, restore_failure],
+                        )
+                        post_update_metrics = None
+                    else:
+                        try:
+                            restored_metrics = self._post_update_diagnostics(samples)
+                        except Exception as restored_diagnostic_failure:
+                            rejection = ExceptionGroup(
+                                "PPO post-update rejection and restored-state "
+                                "diagnostic failed",
+                                [guard_failure, restored_diagnostic_failure],
+                            )
+                            post_update_metrics = None
+                        else:
+                            post_update_metrics = restored_metrics
+                            restored_kl = float(
+                                restored_metrics.get(
+                                    "train/post_update_approx_kl", float("nan")
+                                )
+                            )
+                            if math.isfinite(restored_kl):
+                                restore_metadata["train/behavior_kl_after_restore"] = (
+                                    restored_kl
+                                )
+                if optimizer_metrics is not None:
+                    optimizer_metrics.update(restore_metadata)
+            if write_ppo_receipt:
+                assert receipt_run_config is not None
+                assert receipt_rank is not None
+                try:
+                    receipt_path = _write_ppo_update_diagnostic_receipt(
+                        config=self.config,
+                        run_config=receipt_run_config,
+                        rank=receipt_rank,
+                        current_step=current_step,
+                        total_steps=total_steps,
+                        state="post_rejected",
+                        received_rollouts=received_rollout_count,
+                        trainable_rollouts=len(rollouts),
+                        sample_rows=len(samples),
+                        behavior_weight_versions=behavior_weight_versions,
+                        is_master_replica=is_master_replica,
+                        do_save_checkpoint=do_save_checkpoint,
+                        pre_update_metrics=pre_update_metrics,
+                        optimizer_metrics=optimizer_metrics,
+                        post_update_metrics=post_update_metrics,
+                        rejection=rejection,
+                    )
+                    logger.error(
+                        "PPO post-update guard rejection receipt: %s", receipt_path
+                    )
+                except Exception as receipt_failure:
+                    raise ExceptionGroup(
+                        "PPO post-update guard and diagnostic receipt both failed",
+                        [rejection, receipt_failure],
+                    ) from None
+            if rejection is guard_failure:
+                raise
+            raise rejection from None
+        finally:
+            # Release the roughly 2 GB VLA action-head CPU snapshot before a
+            # checkpoint starts serializing model and optimizer state.
+            actor_snapshot = None
+        if post_update_metrics is None:
+            raise RuntimeError(
+                "PPO accepted-update path has no final policy diagnostics"
+            )
+
         lr_scheduler = self.lr_schedulers
         if lr_scheduler is None:
             raise RuntimeError("Cosmos trainer did not initialize its LR scheduler")
-        optimizer_steps_applied = self._optimizer_steps_applied_in_training_step
+        if write_ppo_receipt:
+            assert receipt_run_config is not None
+            assert receipt_rank is not None
+            receipt_path = _write_ppo_update_diagnostic_receipt(
+                config=self.config,
+                run_config=receipt_run_config,
+                rank=receipt_rank,
+                current_step=current_step,
+                total_steps=total_steps,
+                state="accepted",
+                received_rollouts=received_rollout_count,
+                trainable_rollouts=len(rollouts),
+                sample_rows=len(samples),
+                behavior_weight_versions=behavior_weight_versions,
+                is_master_replica=is_master_replica,
+                do_save_checkpoint=do_save_checkpoint,
+                pre_update_metrics=pre_update_metrics,
+                optimizer_metrics=optimizer_metrics,
+                post_update_metrics=post_update_metrics,
+                rejection=None,
+            )
+            logger.info(
+                "PPO accepted-update diagnostic receipt before scheduler/checkpoint: %s",
+                receipt_path,
+            )
         if optimizer_steps_applied:
             lr_scheduler.step()
         else:
@@ -324,6 +1449,8 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
             "train/iteration_time": 0.0,
             **pre_update_metrics,
             **post_update_metrics,
+            **getattr(self, "_last_ppo_advantage_metrics", {}),
+            **getattr(self, "_last_behavior_kl_backtrack_metrics", {}),
         }
         logger.info(
             "AlpaGym trainer step end current_step=%d steps=%d batches=%d "
@@ -680,41 +1807,264 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
     # Checkpointing
     # ------------------------------------------------------------------
 
+    def weight_resume(self) -> dict[str, Any]:
+        """Populate weights through base load or one fail-closed native restore.
+
+        Upstream Cosmos catches every native checkpoint error and then falls
+        back to Hugging Face. That behavior is unsafe for formal continuation:
+        a run can claim to continue step N while actually training base weights.
+        This override retains Cosmos's native loader but never catches a restore
+        failure. The restore receipt is written only after the exact tree is
+        revalidated and model/optimizer/scheduler/RNG/step restoration succeeds.
+        """
+
+        run_config = _load_run_config(self.config)
+        source = _validated_runtime_resume_source(
+            config=self.config,
+            run_config=run_config,
+        )
+        kl_enabled = float(self.config.train.train_policy.kl_beta) != 0.0
+        if kl_enabled:
+            # Preserve Cosmos's restart-stable fixed reference: capture the
+            # configured base policy before native resume replaces live weights.
+            self.model_load_from_hf()
+            self.reference_state_dict = {
+                key: value.detach().cpu()
+                for key, value in self.model.state_dict().items()
+            }
+
+        if source is None:
+            if not kl_enabled:
+                self.model_load_from_hf()
+            if self.map_w_from_policy_to_rollout is None:
+                raise RuntimeError("no policy-to-rollout parameter mapping exists")
+            self.set_model_train()
+            return {}
+
+        contract = run_config.cosmos.train.resume
+        assert contract.checkpoint_step is not None
+        assert contract.expected_next_training_step is not None
+        rank = getattr(self.ckpt_manager, "global_rank", None)
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+            raise ValueError("Cosmos checkpoint manager has no valid global rank")
+        expected_extra_info = _load_checkpoint_extra_info(
+            source,
+            rank=rank,
+            expected_step=contract.checkpoint_step,
+            expected_next_step=contract.expected_next_training_step,
+        )
+
+        logger.info(
+            "[Policy] Fail-closed native resume from %s at step %d",
+            source.checkpoint_path,
+            contract.checkpoint_step,
+        )
+        # Deliberately do not catch: both Cosmos's translated FileNotFoundError
+        # and any direct loader failure abort this run instead of loading HF/base.
+        restored = self.model_resume_from_checkpoint()
+        if self.lr_schedulers is None:
+            raise RuntimeError("Cosmos native resume did not restore a scheduler")
+        rng_reader = getattr(self.ckpt_manager, "get_rng_state", None)
+        if not callable(rng_reader):
+            raise RuntimeError("Cosmos checkpoint manager cannot verify restored RNG")
+        _validate_native_resume_result(
+            extra_info=expected_extra_info,
+            restored=restored,
+            current_rng_state=rng_reader(),
+        )
+        # Rehash after native torch.load calls so a concurrent or accidental
+        # checkpoint mutation cannot produce a successful receipt.
+        source_after = validate_checkpoint_resume_source(contract)
+        if source_after.snapshot != source.snapshot:
+            raise RuntimeError("checkpoint tree changed during native restore")
+        if self.map_w_from_policy_to_rollout is None:
+            raise RuntimeError("no policy-to-rollout parameter mapping exists")
+        self.set_model_train()
+        receipt_path = _write_checkpoint_restore_receipt(
+            config=self.config,
+            run_config=run_config,
+            source=source_after,
+            rank=rank,
+            restored=restored,
+        )
+        logger.info("[Policy] Native checkpoint restore receipt: %s", receipt_path)
+        return restored
+
+    def save_checkpoint(
+        self,
+        current_step: int,
+        total_steps: int,
+        remain_samples_num: int,
+        *,
+        is_final: bool,
+    ) -> None:
+        """Handle Cosmos's public synthetic-EOS checkpoint entry point.
+
+        Cosmos's policy worker calls this public method for
+        ``TrainingCompleteCommand``.  The inherited GRPO implementation uses a
+        generic Hugging Face exporter and therefore bypasses policy-native
+        candidate invariants.  Route that call through the same exporter as a
+        normal AlpaGym trainer step.  Public non-terminal calls are not part of
+        the AlpaGym scheduling contract and fail closed.
+        """
+        if not is_final:
+            raise ValueError(
+                "AlpaGym public save_checkpoint is reserved for synthetic "
+                "terminal completion"
+            )
+        if (
+            isinstance(current_step, bool)
+            or not isinstance(current_step, int)
+            or current_step < 1
+            or isinstance(total_steps, bool)
+            or not isinstance(total_steps, int)
+            or total_steps < current_step
+        ):
+            raise ValueError(
+                "AlpaGym synthetic terminal checkpoint coordinates are invalid"
+            )
+        self._save_checkpoint(
+            current_step,
+            total_steps,
+            remain_samples_num,
+            allow_completed_policy_native_export=True,
+        )
+
     def _save_checkpoint(
         self,
         current_step: int,
         total_steps: int,
         remain_samples_num: int,
+        *,
+        allow_completed_policy_native_export: bool = False,
     ) -> None:
         """Save policy weights at ``current_step``.
 
-        Exports deployable weights when
-        ``config.train.ckpt.export_safetensors`` is set, then writes the cosmos
-        resume checkpoint (model + optimizer + scheduler +
-        ``remain_samples_num``) via ``self.ckpt_manager``. The resume checkpoint
-        is always written when this method is called, including on the final
-        step.
+        First writes and completes the Cosmos resume checkpoint (model +
+        optimizer + scheduler + ``remain_samples_num``), then exports deployable
+        weights when ``config.train.ckpt.export_safetensors`` is set.  This order
+        prevents a failed resume save from leaving a candidate that claims a
+        durable training step, while an export failure still leaves a resumable
+        optimizer state.
 
         The inherited ``ckpt_manager`` and ``export_safetensors`` come from
         ``LLMTrainer``; ``output_dir`` / ``ckpt`` / ``param_dtype`` come from
         ``cosmos_config.toml``.
         """
-        is_last_step = current_step == total_steps
+        logical_total_steps = int(
+            getattr(self, "_logical_total_training_steps", total_steps)
+        )
+        global_train_batch_size = getattr(self, "_global_train_batch_size", None)
+        if not current_step <= total_steps <= logical_total_steps:
+            raise ValueError(
+                "checkpoint process-stage coordinates exceed the logical horizon"
+            )
+        if remain_samples_num < 0:
+            raise ValueError("checkpoint remaining samples must be nonnegative")
+        if global_train_batch_size is not None:
+            expected_remaining_samples = (
+                logical_total_steps - current_step
+            ) * global_train_batch_size
+            if remain_samples_num != expected_remaining_samples:
+                raise ValueError(
+                    "checkpoint remaining samples disagree with the logical horizon"
+                )
+        is_last_step = current_step == logical_total_steps and remain_samples_num == 0
+        export_hook = getattr(
+            getattr(self, "_policy_bundle", None),
+            "export_model_checkpoint",
+            None,
+        )
+        completed_exports = getattr(
+            self,
+            "_completed_policy_native_exports",
+            None,
+        )
+        if completed_exports is None:
+            completed_exports = {}
+            self._completed_policy_native_exports = completed_exports
+        prior_export = completed_exports.get(current_step)
+        if prior_export is not None:
+            if not allow_completed_policy_native_export:
+                raise RuntimeError(
+                    "policy-native checkpoint step was already exported by this "
+                    "trainer instance"
+                )
+            if not self.config.train.ckpt.export_safetensors or export_hook is None:
+                raise RuntimeError(
+                    "completed policy-native export no longer matches checkpoint config"
+                )
+            expected_path = (
+                Path(self.config.train.output_dir)
+                / "safetensors"
+                / f"step_{current_step}"
+            )
+            expected_context = _policy_checkpoint_export_context(
+                config=self.config,
+                current_step=current_step,
+                total_steps=logical_total_steps,
+                optimizer_steps_applied=int(
+                    getattr(
+                        self,
+                        "_optimizer_steps_applied_in_training_step",
+                        0,
+                    )
+                ),
+            )
+            if prior_export != (expected_path, expected_context):
+                raise RuntimeError(
+                    "synthetic terminal checkpoint differs from the completed "
+                    "policy-native export"
+                )
+            if not expected_path.is_dir() or expected_path.is_symlink():
+                raise RuntimeError(
+                    "completed policy-native candidate disappeared before synthetic EOS"
+                )
+        scheduler = self.lr_schedulers
+        if scheduler is None:
+            raise RuntimeError("Cosmos trainer did not initialize its LR scheduler")
+        logger.info("[Policy] Saving cosmos checkpoint at step %d", current_step)
+        self.ckpt_manager.save_checkpoint(
+            model=self.model,
+            optimizer=self.optimizers,
+            scheduler=scheduler,
+            step=current_step,
+            total_steps=logical_total_steps,
+            remain_samples_num=remain_samples_num,
+            is_final=is_last_step,
+        )
+        self.ckpt_manager.save_check(step=current_step)
+
         if self.config.train.ckpt.export_safetensors:
             export_rel_path = os.path.join("safetensors", f"step_{current_step}")
-            export_hook = getattr(
-                getattr(self, "_policy_bundle", None),
-                "export_model_checkpoint",
-                None,
-            )
             if export_hook is not None:
                 export_path = Path(self.config.train.output_dir) / export_rel_path
+                if prior_export is not None:
+                    logger.info(
+                        "[Policy] Preserving immutable policy-native checkpoint at "
+                        "step %d during synthetic terminal save",
+                        current_step,
+                    )
+                    return
+                export_context = _policy_checkpoint_export_context(
+                    config=self.config,
+                    current_step=current_step,
+                    total_steps=logical_total_steps,
+                    optimizer_steps_applied=int(
+                        getattr(
+                            self,
+                            "_optimizer_steps_applied_in_training_step",
+                            0,
+                        )
+                    ),
+                )
                 logger.info(
                     "[Policy] Saving policy-native checkpoint at step %d to %s",
                     current_step,
                     export_path,
                 )
-                export_hook(self.model, export_path)
+                export_hook(self.model, export_path, export_context)
+                completed_exports[current_step] = (export_path, export_context)
             else:
                 logger.info(
                     "[Policy] Saving huggingface checkpoint at step %d to %s",
@@ -730,21 +2080,6 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
                     # "float32"; all map to `torch.<name>` directly.
                     dtype=getattr(torch, str(self.config.train.param_dtype).lower()),
                 )
-
-        scheduler = self.lr_schedulers
-        if scheduler is None:
-            raise RuntimeError("Cosmos trainer did not initialize its LR scheduler")
-        logger.info("[Policy] Saving cosmos checkpoint at step %d", current_step)
-        self.ckpt_manager.save_checkpoint(
-            model=self.model,
-            optimizer=self.optimizers,
-            scheduler=scheduler,
-            step=current_step,
-            total_steps=total_steps,
-            remain_samples_num=remain_samples_num,
-            is_final=is_last_step,
-        )
-        self.ckpt_manager.save_check(step=current_step)
 
     # ------------------------------------------------------------------
     # Reference model lifecycle
@@ -806,23 +2141,60 @@ def _ppo_actor_valid_mask(
     return signal.actor_valid
 
 
+def _time_scaled_discount(
+    nominal_discount: float,
+    *,
+    duration_ticks: int,
+    nominal_duration_ticks: int,
+) -> float:
+    """Convert a policy-clock discount to one realized tick interval.
+
+    Flow-PPO configures gamma and lambda on the nominal 2 Hz policy clock,
+    while motion-reference feedback is recorded on the 50 Hz controller
+    clock.  Raising the nominal factor by ``duration / nominal_duration``
+    preserves the same physical-time horizon for ordinary, delayed, and empty
+    intervals.  Duration zero is useful at boundaries and has unit discount;
+    replay transitions themselves still require at least one realized tick.
+    """
+    if not math.isfinite(nominal_discount) or not 0.0 <= nominal_discount <= 1.0:
+        raise ValueError("nominal discount must be finite and within [0, 1]")
+    if duration_ticks < 0:
+        raise ValueError("duration_ticks cannot be negative")
+    if nominal_duration_ticks <= 0:
+        raise ValueError("nominal_duration_ticks must be positive")
+    if duration_ticks == 0:
+        return 1.0
+    return nominal_discount ** (duration_ticks / nominal_duration_ticks)
+
+
 def _discounted_transition_reward(
     signal: TrainingSignal,
     *,
-    gamma: float,
+    gamma_tick: float,
+    reward_values: torch.Tensor | None = None,
+    credit_mask: torch.Tensor | None = None,
 ) -> tuple[float, int]:
     """Return one macro reward and its controller-tick duration.
 
     Direct policies carry one scalar reward and therefore have duration one.
     Motion-reference policies carry the exact committed controller-tick reward
     prefix. Keeping the primitive rewards in replay lets the trainer change
-    neither their time order nor the semi-Markov discount by accident.
+    neither their time order nor the semi-Markov discount by accident.  An
+    optional actor reward view removes predecessor-owned certification gain,
+    while a credit mask excludes pre-install ticks. Neither operation rebases
+    later rewards to tick zero, so inference latency remains in the discount.
     """
     if signal.primitive_rewards is None:
+        if credit_mask is not None or reward_values is not None:
+            raise ValueError("PPO actor reward views require primitive rewards")
         reward = _require_ppo_signal(signal.rewards, "rewards")
         return float(reward.item()), 1
 
-    primitive_rewards = signal.primitive_rewards.reshape(-1)
+    primitive_rewards = (
+        signal.primitive_rewards if reward_values is None else reward_values
+    ).reshape(-1)
+    if primitive_rewards.shape != signal.primitive_rewards.reshape(-1).shape:
+        raise ValueError("PPO reward view shape must match primitive rewards")
     primitive_mask = _require_ppo_signal(
         signal.primitive_reward_mask,
         "primitive_reward_mask",
@@ -841,11 +2213,27 @@ def _discounted_transition_reward(
     selected = primitive_rewards[:duration]
     if not torch.isfinite(selected).all():
         raise ValueError("PPO primitive rewards must be finite")
+    if credit_mask is None:
+        selected_credit = torch.ones(duration, dtype=torch.bool)
+    else:
+        credit_mask = credit_mask.reshape(-1)
+        if credit_mask.shape != primitive_mask.shape:
+            raise ValueError("PPO credit mask shape must match primitive rewards")
+        if credit_mask.dtype != torch.bool:
+            raise ValueError("PPO credit mask dtype must be bool")
+        credit_mask_cpu = credit_mask.cpu()
+        if torch.any(credit_mask_cpu & ~primitive_mask.cpu()):
+            raise ValueError("PPO credit mask cannot select unrealized reward ticks")
+        selected_credit = credit_mask_cpu[:duration]
     powers = torch.pow(
-        torch.tensor(float(gamma), dtype=torch.float64),
+        torch.tensor(float(gamma_tick), dtype=torch.float64),
         torch.arange(duration, dtype=torch.float64),
     )
-    reward = torch.sum(selected.to(dtype=torch.float64).cpu() * powers)
+    reward = torch.sum(
+        selected.to(dtype=torch.float64).cpu()
+        * powers
+        * selected_credit.to(dtype=torch.float64)
+    )
     return float(reward.item()), duration
 
 
@@ -879,6 +2267,38 @@ def _replace_advantages(
         )
         for index, sample in enumerate(samples)
     ]
+
+
+def _ppo_advantage_metrics(
+    advantages: torch.Tensor,
+    *,
+    prefix: str,
+) -> dict[str, float | int]:
+    """Summarize the exact actor advantages consumed by Flow-PPO.
+
+    Cosmos also reports rollout-level GRPO advantages.  Those values are zero
+    when ``n_generation=1`` and are intentionally ignored by PPO, so exposing
+    the trainer-derived GAE here prevents that transport statistic from being
+    mistaken for the policy-gradient signal.
+    """
+    values = advantages.detach().to(device="cpu", dtype=torch.float64).reshape(-1)
+    if values.numel() == 0:
+        return {
+            f"{prefix}_rows": 0,
+            f"{prefix}_min": 0.0,
+            f"{prefix}_mean": 0.0,
+            f"{prefix}_max": 0.0,
+            f"{prefix}_std": 0.0,
+        }
+    if not torch.isfinite(values).all():
+        raise FloatingPointError("PPO actor advantages contain non-finite values")
+    return {
+        f"{prefix}_rows": int(values.numel()),
+        f"{prefix}_min": float(values.min().item()),
+        f"{prefix}_mean": float(values.mean().item()),
+        f"{prefix}_max": float(values.max().item()),
+        f"{prefix}_std": float(values.std(unbiased=False).item()),
+    }
 
 
 def _summarize_behavior_log_ratios(
@@ -937,21 +2357,6 @@ def _summarize_behavior_log_ratios(
     }
 
 
-def _summarize_post_update_log_ratios(
-    log_ratios: torch.Tensor,
-    *,
-    ratio_clip_low: float,
-    ratio_clip_high: float,
-) -> dict[str, float | int]:
-    """Backward-compatible post-update behavior-ratio summary helper."""
-    return _summarize_behavior_log_ratios(
-        log_ratios,
-        phase="post_update",
-        ratio_clip_low=ratio_clip_low,
-        ratio_clip_high=ratio_clip_high,
-    )
-
-
 @_trainer_base.TrainerRegistry.register(trainer_type="alpagym_ppo")
 class AlpagymPPOTrainer(AlpagymGRPOTrainer):
     """Actor-critic PPO trainer over AlpaGym replay payloads.
@@ -966,6 +2371,7 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
     """
 
     _flow_chunk_density = False
+    _write_ppo_update_diagnostic_receipts = True
     _dual_clip_ratio: float | None = None
     _value_huber_delta: float | None = None
 
@@ -1025,6 +2431,47 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                 "PPO target_behavior_kl must be finite and positive when set, "
                 f"got {target_behavior_kl!r}"
             )
+        behavior_kl_backtrack = ppo_config.get("behavior_kl_backtrack", False)
+        if type(behavior_kl_backtrack) is not bool:
+            raise TypeError("PPO behavior-KL backtracking flag must be a boolean")
+        self._behavior_kl_backtrack = behavior_kl_backtrack
+        behavior_kl_backtrack_margin = ppo_config.get(
+            "behavior_kl_backtrack_margin", 0.9
+        )
+        if isinstance(behavior_kl_backtrack_margin, bool):
+            raise TypeError("PPO behavior-KL backtracking margin cannot be boolean")
+        self._behavior_kl_backtrack_margin = float(behavior_kl_backtrack_margin)
+        behavior_kl_backtrack_max_attempts = ppo_config.get(
+            "behavior_kl_backtrack_max_attempts", 4
+        )
+        if type(behavior_kl_backtrack_max_attempts) is not int:
+            raise TypeError(
+                "PPO behavior-KL backtracking max attempts must be an integer"
+            )
+        self._behavior_kl_backtrack_max_attempts = behavior_kl_backtrack_max_attempts
+        if self._behavior_kl_backtrack:
+            if self._target_behavior_kl is None:
+                raise ValueError(
+                    "PPO behavior-KL backtracking requires target_behavior_kl"
+                )
+            if self._grpo_optimization_iterations != 1:
+                raise ValueError(
+                    "PPO behavior-KL backtracking requires exactly one optimizer "
+                    "iteration so actor-delta interpolation remains equivalent to "
+                    "lowering the actor learning rate"
+                )
+            if not 0.0 < self._behavior_kl_backtrack_margin < 1.0:
+                raise ValueError(
+                    "PPO behavior-KL backtracking margin must be within (0, 1)"
+                )
+            if self._behavior_kl_backtrack_max_attempts <= 0:
+                raise ValueError(
+                    "PPO behavior-KL backtracking max attempts must be positive"
+                )
+            if int(getattr(parallel_dims, "world_size", 1)) != 1:
+                raise NotImplementedError(
+                    "PPO behavior-KL backtracking currently requires one policy rank"
+                )
         step_mini_batch = ppo_config.get("step_mini_batch", self._mini_batch)
         if (
             isinstance(step_mini_batch, bool)
@@ -1065,6 +2512,276 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                 )
         caller_stream.wait_stream(self.train_stream)
         return grad_norm
+
+    def _actor_parameters_for_kl_backtracking(self) -> list[torch.nn.Parameter]:
+        """Return the action-head parameters owned by the first optimizer part.
+
+        The VLA model publishes ``[action_header, critic]`` through
+        ``separate_model_parts``.  Keeping this boundary explicit prevents a
+        behavior-KL correction from weakening the independently supervised
+        critic update.
+        """
+
+        separate_model_parts = getattr(self.model, "separate_model_parts", None)
+        if not callable(separate_model_parts):
+            raise TypeError(
+                "PPO behavior-KL backtracking requires model.separate_model_parts()"
+            )
+        parts = separate_model_parts()
+        if not isinstance(parts, (list, tuple)) or len(parts) != 2:
+            raise ValueError(
+                "PPO behavior-KL backtracking requires exactly [actor, critic] parts"
+            )
+        actor = parts[0]
+        critic = parts[1]
+
+        def trainable_parameters(part: Any, *, label: str) -> list[torch.nn.Parameter]:
+            parameters_method = getattr(part, "parameters", None)
+            if not callable(parameters_method):
+                raise TypeError(f"PPO {label} part must expose parameters()")
+            parameters: list[torch.nn.Parameter] = []
+            seen: set[int] = set()
+            for parameter in parameters_method():
+                if not isinstance(parameter, torch.nn.Parameter):
+                    raise TypeError(f"PPO {label} parameters must be torch Parameters")
+                if not parameter.requires_grad:
+                    continue
+                parameter_id = id(parameter)
+                if parameter_id in seen:
+                    continue
+                seen.add(parameter_id)
+                parameters.append(parameter)
+            return parameters
+
+        parameters = trainable_parameters(actor, label="actor")
+        critic_parameters = trainable_parameters(critic, label="critic")
+        if not parameters:
+            raise ValueError("PPO actor part has no trainable parameters")
+        if not critic_parameters:
+            raise ValueError("PPO critic part has no trainable parameters")
+        actor_parameter_ids = {id(parameter) for parameter in parameters}
+        critic_parameter_ids = {id(parameter) for parameter in critic_parameters}
+        if actor_parameter_ids & critic_parameter_ids:
+            raise ValueError("PPO actor and critic trainable parameters overlap")
+        optimizer_parameter_sets = _optimizer_parameter_id_sets(self.optimizers)
+        if len(optimizer_parameter_sets) != 2:
+            raise ValueError(
+                "PPO behavior-KL backtracking requires actor and critic optimizer leaves"
+            )
+        if optimizer_parameter_sets[0] != actor_parameter_ids:
+            raise ValueError(
+                "PPO first optimizer leaf does not exactly own the actor parameters"
+            )
+        if optimizer_parameter_sets[1] != critic_parameter_ids:
+            raise ValueError(
+                "PPO second optimizer leaf does not exactly own the critic parameters"
+            )
+        return parameters
+
+    def _snapshot_actor_for_kl_backtracking(
+        self,
+    ) -> tuple[list[torch.nn.Parameter], list[torch.Tensor]]:
+        """Copy the pre-step actor to CPU before the sole Adam update."""
+
+        parameters = self._actor_parameters_for_kl_backtracking()
+        snapshots = [
+            parameter.detach().to(device="cpu", copy=True) for parameter in parameters
+        ]
+        return parameters, snapshots
+
+    @staticmethod
+    def _scale_actor_step_toward_snapshot_(
+        parameters: list[torch.nn.Parameter],
+        snapshots: list[torch.Tensor],
+        *,
+        relative_scale: float,
+    ) -> None:
+        """Scale the current actor delta toward its immutable pre-step state."""
+
+        if len(parameters) != len(snapshots) or not parameters:
+            raise ValueError("PPO actor snapshot does not match live parameters")
+        if not math.isfinite(relative_scale) or not 0.0 <= relative_scale <= 1.0:
+            raise ValueError("PPO actor relative step scale must be within [0, 1]")
+        # Validate the complete structure before mutating the first tensor.  A
+        # malformed later entry must not leave an earlier parameter partially
+        # interpolated.
+        for parameter, snapshot in zip(parameters, snapshots, strict=True):
+            if tuple(parameter.shape) != tuple(snapshot.shape):
+                raise ValueError("PPO actor snapshot shape changed")
+            if not parameter.is_floating_point() or not snapshot.is_floating_point():
+                raise TypeError("PPO actor backtracking requires floating parameters")
+        with torch.no_grad():
+            for parameter, snapshot in zip(parameters, snapshots, strict=True):
+                if relative_scale == 0.0:
+                    # Exact rejection recovery must overwrite NaN/Inf.  The
+                    # algebraically equivalent ``parameter * 0 + old`` is not
+                    # safe because IEEE NaN/Inf multiplied by zero remains
+                    # non-finite.
+                    parameter.copy_(snapshot)
+                    continue
+                if relative_scale == 1.0:
+                    continue
+                old_parameter = snapshot.to(
+                    device=parameter.device,
+                    dtype=parameter.dtype,
+                )
+                parameter.mul_(relative_scale).add_(
+                    old_parameter,
+                    alpha=1.0 - relative_scale,
+                )
+
+    def _backtrack_behavior_kl(
+        self,
+        samples: list[Any],
+        initial_metrics: dict[str, float | int],
+        actor_snapshot: tuple[list[torch.nn.Parameter], list[torch.Tensor]],
+        *,
+        actor_learning_rate: float,
+    ) -> tuple[dict[str, float | int], dict[str, Any]]:
+        """Shrink one actor update until its measured behavior KL is safe.
+
+        Adam and the critic are updated exactly once.  Only the actor parameter
+        delta is interpolated toward the pre-step actor, which is equivalent to
+        lowering the actor LR for this update while preserving Adam's moment
+        accumulation and the complete critic update.
+        """
+
+        target = self._target_behavior_kl
+        if target is None:
+            raise RuntimeError("PPO behavior-KL backtracking has no target")
+        parameters, snapshots = actor_snapshot
+        initial_kl = float(initial_metrics["train/post_update_approx_kl"])
+        metrics = initial_metrics
+        current_scale = 1.0
+        attempts = 0
+        history: list[dict[str, float | int]] = [
+            {"attempt": 0, "actor_step_scale": 1.0, "behavior_kl": initial_kl}
+        ]
+        try:
+            if math.isfinite(initial_kl) and initial_kl > target:
+                for attempt in range(1, self._behavior_kl_backtrack_max_attempts + 1):
+                    # ``margin`` is a conservative scale factor, not a second
+                    # acceptance threshold.  The hard contract remains
+                    # measured behavior KL <= target.
+                    proposed_scale = current_scale * min(
+                        0.75,
+                        self._behavior_kl_backtrack_margin
+                        * math.sqrt(
+                            target / float(metrics["train/post_update_approx_kl"])
+                        ),
+                    )
+                    relative_scale = proposed_scale / current_scale
+                    self._scale_actor_step_toward_snapshot_(
+                        parameters,
+                        snapshots,
+                        relative_scale=relative_scale,
+                    )
+                    current_scale = proposed_scale
+                    attempts = attempt
+                    metrics = self._post_update_diagnostics(samples)
+                    observed_kl = float(metrics["train/post_update_approx_kl"])
+                    history.append(
+                        {
+                            "attempt": attempt,
+                            "actor_step_scale": current_scale,
+                            "behavior_kl": observed_kl,
+                        }
+                    )
+                    if math.isfinite(observed_kl) and observed_kl <= target:
+                        break
+                    if not math.isfinite(observed_kl):
+                        break
+        except Exception as candidate_failure:
+            # A diagnostic can fail after a partial interpolation.  Restore in
+            # the helper itself so no caller can accidentally observe that
+            # partially scaled actor, then preserve the original exception.
+            try:
+                self._scale_actor_step_toward_snapshot_(
+                    parameters,
+                    snapshots,
+                    relative_scale=0.0,
+                )
+            except Exception as restore_failure:
+                raise ExceptionGroup(
+                    "PPO actor backtracking and exception-safety restore failed",
+                    [candidate_failure, restore_failure],
+                ) from None
+            raise
+
+        candidate_kl = float(metrics["train/post_update_approx_kl"])
+        backtrack_failed = not math.isfinite(candidate_kl) or candidate_kl > target
+        restored_kl: float | None = None
+        if backtrack_failed:
+            # Exhaustion/non-finite diagnostics restore the exact old actor for
+            # the rejection receipt.  The critic and optimizer moments remain
+            # process-local and can never cross scheduler/checkpoint/sync.
+            try:
+                self._scale_actor_step_toward_snapshot_(
+                    parameters,
+                    snapshots,
+                    relative_scale=0.0,
+                )
+                current_scale = 0.0
+                metrics = self._post_update_diagnostics(samples)
+                restored_kl = float(metrics["train/post_update_approx_kl"])
+            except Exception as rejection_failure:
+                try:
+                    self._scale_actor_step_toward_snapshot_(
+                        parameters,
+                        snapshots,
+                        relative_scale=0.0,
+                    )
+                except Exception as restore_failure:
+                    raise ExceptionGroup(
+                        "PPO rejected candidate and actor restoration failed",
+                        [rejection_failure, restore_failure],
+                    ) from None
+                raise
+            history.append(
+                {
+                    "attempt": attempts + 1,
+                    "actor_step_scale": 0.0,
+                    "behavior_kl": restored_kl,
+                }
+            )
+        backtrack_metrics: dict[str, Any] = {
+            "train/behavior_kl_before_backtrack": initial_kl,
+            "train/behavior_kl_after_backtrack": candidate_kl,
+            "train/actor_step_scale": current_scale,
+            "train/actor_backtrack_attempts": attempts,
+            "train/actor_configured_learning_rate": actor_learning_rate,
+            "train/actor_effective_learning_rate": (
+                actor_learning_rate * current_scale
+            ),
+            "train/actor_backtrack_failed": int(backtrack_failed),
+            "train/actor_backtrack_history": history,
+        }
+        if backtrack_failed:
+            backtrack_metrics.update(
+                {
+                    "train/actor_restore_attempted": 1,
+                    "train/actor_restore_succeeded": 1,
+                    "train/actor_optimizer_state_rolled_back": 0,
+                }
+            )
+            if math.isfinite(candidate_kl):
+                backtrack_metrics["train/behavior_kl_last_unsafe_candidate"] = (
+                    candidate_kl
+                )
+            if restored_kl is not None and math.isfinite(restored_kl):
+                backtrack_metrics["train/behavior_kl_after_restore"] = restored_kl
+        logger.info(
+            "AlpaGym PPO behavior-KL actor backtracking initial_kl=%.6f "
+            "candidate_kl=%.6f target=%.6f attempts=%d actor_step_scale=%.6f "
+            "effective_actor_lr=%.8g",
+            initial_kl,
+            candidate_kl,
+            target,
+            attempts,
+            current_scale,
+            actor_learning_rate * current_scale,
+        )
+        return metrics, backtrack_metrics
 
     def _prepare_training_data(
         self,
@@ -1150,8 +2867,13 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             )
 
         advantage_tensor = torch.tensor(advantages, dtype=torch.float32)
+        valid_mask = torch.tensor(actor_valid_rows, dtype=torch.bool)
+        raw_valid_advantages = advantage_tensor[valid_mask]
+        self._last_ppo_advantage_metrics = _ppo_advantage_metrics(
+            raw_valid_advantages,
+            prefix="train/ppo_advantage_raw",
+        )
         if self._normalize_advantages and advantage_tensor.numel() > 0:
-            valid_mask = torch.tensor(actor_valid_rows, dtype=torch.bool)
             if int(valid_mask.sum().item()) > 1:
                 valid_advantages = advantage_tensor[valid_mask]
                 std = valid_advantages.std(unbiased=False)
@@ -1161,6 +2883,34 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                     ) / (std + 1.0e-8)
             advantage_tensor[~valid_mask] = 0.0
             samples = _replace_advantages(samples, advantage_tensor, per_rollout_ranges)
+        self._last_ppo_advantage_metrics.update(
+            _ppo_advantage_metrics(
+                advantage_tensor[valid_mask],
+                prefix="train/ppo_advantage_effective",
+            )
+        )
+        logger.info(
+            "AlpaGym PPO actor advantages rows=%d raw_min=%.6f raw_mean=%.6f "
+            "raw_max=%.6f raw_std=%.6f effective_min=%.6f "
+            "effective_mean=%.6f effective_max=%.6f effective_std=%.6f",
+            int(self._last_ppo_advantage_metrics["train/ppo_advantage_raw_rows"]),
+            float(self._last_ppo_advantage_metrics["train/ppo_advantage_raw_min"]),
+            float(self._last_ppo_advantage_metrics["train/ppo_advantage_raw_mean"]),
+            float(self._last_ppo_advantage_metrics["train/ppo_advantage_raw_max"]),
+            float(self._last_ppo_advantage_metrics["train/ppo_advantage_raw_std"]),
+            float(
+                self._last_ppo_advantage_metrics["train/ppo_advantage_effective_min"]
+            ),
+            float(
+                self._last_ppo_advantage_metrics["train/ppo_advantage_effective_mean"]
+            ),
+            float(
+                self._last_ppo_advantage_metrics["train/ppo_advantage_effective_max"]
+            ),
+            float(
+                self._last_ppo_advantage_metrics["train/ppo_advantage_effective_std"]
+            ),
+        )
         return samples, advantage_tensor
 
     def _run_training_loop(
@@ -1221,8 +2971,36 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         clip_fraction_sum = 0.0
         grad_norm_sum = 0.0
 
-        for _ in range(self._grpo_optimization_iterations):
-            indices = torch.randperm(num_steps)
+        config_train = getattr(getattr(self, "config", None), "train", None)
+        configured_seed = getattr(config_train, "seed", None)
+        write_receipts = bool(
+            getattr(self, "_write_ppo_update_diagnostic_receipts", False)
+        )
+        if configured_seed is None:
+            if write_receipts:
+                raise ValueError(
+                    "formal PPO optimizer permutation requires config.train.seed"
+                )
+            configured_seed = int(torch.initial_seed())
+        if isinstance(configured_seed, bool) or not isinstance(configured_seed, int):
+            raise TypeError("PPO optimizer permutation seed must be an integer")
+        current_step = getattr(self, "_active_optimizer_step", None)
+        if current_step is None:
+            if write_receipts:
+                raise RuntimeError(
+                    "formal PPO optimizer permutation requires the active trainer step"
+                )
+            current_step = 0
+        permutation_records: list[dict[str, Any]] = []
+
+        for optimization_iteration in range(self._grpo_optimization_iterations):
+            indices, permutation_record = _deterministic_optimizer_permutation(
+                num_steps=num_steps,
+                base_seed=configured_seed,
+                current_step=current_step,
+                optimization_iteration=optimization_iteration,
+            )
+            permutation_records.append(permutation_record)
             self.optimizers.zero_grad()
             update_loss = 0.0
             update_kl = 0.0
@@ -1290,6 +3068,10 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                 update_kl,
                 grad_norm,
             )
+
+        self._last_optimizer_permutation_metrics = {
+            "train/optimizer_permutation_records": permutation_records,
+        }
 
         if not total_actor_rows:
             ratio_max = 1.0
@@ -1563,7 +3345,7 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             value = _require_ppo_signal(signal.old_values, "old_values")
             reward, duration = _discounted_transition_reward(
                 signal,
-                gamma=self._gamma,
+                gamma_tick=self._gamma,
             )
             bootstrap = (
                 None
@@ -1903,16 +3685,34 @@ class AlpagymFlowPPOTrainer(AlpagymPPOTrainer):
             raise ValueError("alpagym_flow_ppo does not use reference-model KL")
 
     def _compute_gae(self, step_samples: list[Any]) -> tuple[list[float], list[float]]:
-        """Compute variable-duration GAE on the VLA's nominal 0.5 s clock.
+        """Compute causal actor GAE and chronological critic returns at 50 Hz.
 
-        RLinf's configured ``gamma`` and ``lambda`` are per policy decision,
-        not per 50 Hz controller tick.  A nominal transition is 25 controller
-        ticks; delayed plan installation may make the realized interval longer.
-        We therefore time-scale gamma by ``duration / 25`` while applying
-        lambda once per sampled policy transition.
+        RLinf configures ``gamma`` and ``lambda`` per nominal 2 Hz policy
+        decision.  The realized feedback interval is instead a variable number
+        of 50 Hz controller ticks, so both factors are converted to physical
+        time before reward aggregation, bootstrap, and GAE tracing.
+
+        Async inference can leave a predecessor reference active at the start
+        of a sampled plan's interval.  The critic consumes that full
+        chronological interval. The actor excludes the predecessor prefix
+        through ``actor_primitive_reward_mask`` and consumes the causal
+        ``actor_primitive_rewards`` view, which can also remove a support gain
+        majority-owned by that predecessor. Source rewards retain their
+        absolute tick offsets and the full interval still controls bootstrap
+        and trace discount. Thus policy latency cannot be erased by rebasing the
+        causal suffix to tick zero. The actor trace then follows the next row's
+        full chronological GAE: its predecessor prefix is often the current plan
+        still executing and therefore remains valid downstream credit.
         """
-        nominal_duration_ticks = 25.0
-        transitions: list[tuple[float, int, bool, bool, float, float | None]] = []
+        nominal_duration_ticks = 25
+        gamma_tick = _time_scaled_discount(
+            self._gamma,
+            duration_ticks=1,
+            nominal_duration_ticks=nominal_duration_ticks,
+        )
+        transitions: list[
+            tuple[float, float, int, bool, bool, float, float | None]
+        ] = []
         valid_indices: list[int] = []
         for index, step in enumerate(step_samples):
             signal = step.training_signal
@@ -1931,25 +3731,29 @@ class AlpagymFlowPPOTrainer(AlpagymPPOTrainer):
             primitive_rewards = _require_ppo_signal(
                 signal.primitive_rewards, "primitive_rewards"
             ).reshape(-1)
-            primitive_mask = _require_ppo_signal(
-                signal.primitive_reward_mask, "primitive_reward_mask"
-            ).reshape(-1)
-            duration = int(
-                _require_ppo_signal(signal.duration_ticks, "duration_ticks").item()
+            full_reward, duration = _discounted_transition_reward(
+                signal,
+                gamma_tick=gamma_tick,
             )
-            if not 1 <= duration <= primitive_rewards.numel():
-                raise ValueError(
-                    "Flow-PPO duration must select a non-empty realized reward prefix"
-                )
-            expected_mask = torch.arange(primitive_rewards.numel()) < duration
-            if not torch.equal(primitive_mask.cpu(), expected_mask):
-                raise ValueError(
-                    "Flow-PPO primitive reward mask must match duration_ticks"
-                )
-            selected_rewards = primitive_rewards[:duration]
-            if not torch.isfinite(selected_rewards).all():
-                raise ValueError("Flow-PPO primitive rewards must be finite")
-            transition_reward = selected_rewards.to(dtype=torch.float64).sum()
+            actor_reward_mask = _require_ppo_signal(
+                signal.actor_primitive_reward_mask,
+                "actor_primitive_reward_mask",
+            )
+            actor_primitive_rewards = _require_ppo_signal(
+                signal.actor_primitive_rewards,
+                "actor_primitive_rewards",
+            )
+            actor_reward, actor_duration = _discounted_transition_reward(
+                signal,
+                gamma_tick=gamma_tick,
+                reward_values=actor_primitive_rewards,
+                credit_mask=actor_reward_mask,
+            )
+            if actor_duration != duration:
+                raise AssertionError("actor and critic reward durations diverged")
+            raw_transition_reward = (
+                primitive_rewards[:duration].to(dtype=torch.float64).cpu().sum()
+            )
             transported_reward = _require_ppo_signal(signal.rewards, "rewards").reshape(
                 -1
             )
@@ -1959,7 +3763,7 @@ class AlpagymFlowPPOTrainer(AlpagymPPOTrainer):
             ):
                 raise ValueError("Flow-PPO requires one finite transition reward")
             if not torch.isclose(
-                transition_reward,
+                raw_transition_reward,
                 transported_reward[0].to(dtype=torch.float64),
                 rtol=1.0e-6,
                 atol=1.0e-6,
@@ -1975,7 +3779,8 @@ class AlpagymFlowPPOTrainer(AlpagymPPOTrainer):
             )
             transitions.append(
                 (
-                    float(transition_reward.item()),
+                    full_reward,
+                    actor_reward,
                     duration,
                     terminated,
                     truncated,
@@ -1987,28 +3792,49 @@ class AlpagymFlowPPOTrainer(AlpagymPPOTrainer):
 
         advantages = [0.0 for _ in step_samples]
         returns = [0.0 for _ in step_samples]
-        last_gae = 0.0
+        last_critic_gae = 0.0
         for valid_pos in reversed(range(len(valid_indices))):
-            reward, duration, terminated, truncated, value, bootstrap = transitions[
-                valid_pos
-            ]
+            (
+                full_reward,
+                actor_reward,
+                duration,
+                terminated,
+                truncated,
+                value,
+                bootstrap,
+            ) = transitions[valid_pos]
             if bootstrap is None:
                 bootstrap = (
-                    transitions[valid_pos + 1][4]
+                    transitions[valid_pos + 1][5]
                     if valid_pos + 1 < len(transitions)
                     else 0.0
                 )
-            gamma_duration = self._gamma ** (duration / nominal_duration_ticks)
-            delta = reward + (0.0 if terminated else gamma_duration) * bootstrap - value
+            gamma_duration = _time_scaled_discount(
+                self._gamma,
+                duration_ticks=duration,
+                nominal_duration_ticks=nominal_duration_ticks,
+            )
+            bootstrap_term = 0.0 if terminated else gamma_duration * bootstrap
+            actor_delta = actor_reward + bootstrap_term - value
+            critic_delta = full_reward + bootstrap_term - value
             continues = (
                 not terminated and not truncated and valid_pos + 1 < len(transitions)
             )
-            last_gae = delta + (
-                gamma_duration * self._gae_lambda * last_gae if continues else 0.0
+            trace_discount = (
+                _time_scaled_discount(
+                    self._gamma * self._gae_lambda,
+                    duration_ticks=duration,
+                    nominal_duration_ticks=nominal_duration_ticks,
+                )
+                if continues
+                else 0.0
             )
+            next_critic_gae = last_critic_gae
+            last_critic_gae = critic_delta + trace_discount * next_critic_gae
+            actor_gae = actor_delta + trace_discount * next_critic_gae
             sample_index = valid_indices[valid_pos]
-            advantages[sample_index] = float(last_gae)
-            returns[sample_index] = float(last_gae + value)
+            advantages[sample_index] = float(actor_gae)
+            returns[sample_index] = float(last_critic_gae + value)
         return advantages, returns
 
     def _forward_with_reference_and_value(

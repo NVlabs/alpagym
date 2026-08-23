@@ -347,8 +347,20 @@ def collate_vla_replay_samples(
         for sample in rectangular_samples:
             primitive_rewards = sample.training_signal.primitive_rewards
             primitive_reward_mask = sample.training_signal.primitive_reward_mask
+            actor_primitive_rewards = sample.training_signal.actor_primitive_rewards
+            actor_primitive_reward_mask = (
+                sample.training_signal.actor_primitive_reward_mask
+            )
             assert primitive_rewards is not None
             assert primitive_reward_mask is not None
+            if actor_primitive_rewards is None:
+                raise ValueError(
+                    "VLA primitive rewards require actor_primitive_rewards"
+                )
+            if actor_primitive_reward_mask is None:
+                raise ValueError(
+                    "VLA primitive rewards require actor_primitive_reward_mask"
+                )
             pad_width = max_primitive_width - int(primitive_rewards.shape[1])
             if pad_width:
                 primitive_rewards = torch.cat(
@@ -373,6 +385,28 @@ def collate_vla_replay_samples(
                     ),
                     dim=1,
                 )
+                actor_primitive_rewards = torch.cat(
+                    (
+                        actor_primitive_rewards,
+                        torch.zeros(
+                            (actor_primitive_rewards.shape[0], pad_width),
+                            dtype=actor_primitive_rewards.dtype,
+                            device=actor_primitive_rewards.device,
+                        ),
+                    ),
+                    dim=1,
+                )
+                actor_primitive_reward_mask = torch.cat(
+                    (
+                        actor_primitive_reward_mask,
+                        torch.zeros(
+                            (actor_primitive_reward_mask.shape[0], pad_width),
+                            dtype=torch.bool,
+                            device=actor_primitive_reward_mask.device,
+                        ),
+                    ),
+                    dim=1,
+                )
             padded_samples.append(
                 replace(
                     sample,
@@ -380,6 +414,8 @@ def collate_vla_replay_samples(
                         sample.training_signal,
                         primitive_rewards=primitive_rewards,
                         primitive_reward_mask=primitive_reward_mask,
+                        actor_primitive_rewards=actor_primitive_rewards,
+                        actor_primitive_reward_mask=actor_primitive_reward_mask,
                     ),
                 )
             )

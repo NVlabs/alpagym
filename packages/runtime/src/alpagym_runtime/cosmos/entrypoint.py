@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from alpagym_host.config import TransportKind, load_run_config
+from alpagym_host.config import CosmosRLMode, TransportKind, load_run_config
 from cosmos_rl.launcher.worker_entry import main as launch_worker
 from torch.distributed.elastic.multiprocessing.errors import record
 
@@ -19,8 +19,13 @@ from alpagym_runtime.cosmos import (
     rollout_backend as _rollout_backend,  # noqa: F401
     trainer as _trainer,  # noqa: F401
 )
+from alpagym_runtime.cosmos.colocated_resume_bridge import (
+    install_colocated_resume_bootstrap_bridge,
+)
 from alpagym_runtime.cosmos.dataset import AlpagymSceneDataset
-from alpagym_runtime.cosmos.nccl_cleanup_hooks import install_cosmos_nccl_cleanup_publisher_opt_in
+from alpagym_runtime.cosmos.nccl_cleanup_hooks import (
+    install_cosmos_nccl_cleanup_publisher_opt_in,
+)
 from alpagym_runtime.cosmos.nccl_store import start_nccl_store_master
 from alpagym_runtime.cosmos.reward_fn import episode_reward_from_artifact
 from alpagym_runtime.policies.registry import get_policy_bundle
@@ -82,7 +87,9 @@ def _install_policy_bundle_runtime_hooks(policy_bundle: Any, run_config: Any) ->
 def _install_alpagym_rollout_teardown() -> None:
     """Close AlpaGym rollout resources before Cosmos destroys torch distributed."""
     from cosmos_rl.rollout.worker.llm_worker import LLMRolloutWorker
-    from cosmos_rl.rollout.worker.rollout_control import DisaggregatedRolloutControlWorker
+    from cosmos_rl.rollout.worker.rollout_control import (
+        DisaggregatedRolloutControlWorker,
+    )
 
     original_destroy_worker = LLMRolloutWorker.destroy_worker
 
@@ -127,7 +134,9 @@ def _install_alpagym_rollout_teardown() -> None:
         False,
     ):
         handle_shutdown_with_bounded_joins._alpagym_bounded_shutdown_wrap = True  # type: ignore[attr-defined]
-        DisaggregatedRolloutControlWorker.handle_shutdown = handle_shutdown_with_bounded_joins
+        DisaggregatedRolloutControlWorker.handle_shutdown = (
+            handle_shutdown_with_bounded_joins
+        )
 
     if getattr(original_destroy_worker, "_alpagym_teardown_wrap", False):
         return
@@ -178,6 +187,9 @@ def main(argv: list[str] | None = None) -> None:
     _configure_logging(str(run_config.logging_level))
 
     cosmos_role = os.environ.get("COSMOS_ROLE")
+
+    if cosmos_role == "Policy" and run_config.cosmos.mode == CosmosRLMode.colocated:
+        install_colocated_resume_bootstrap_bridge()
 
     # The Controller owns no data plane, but on NCCL it starts the TCPStore
     # master that Policy/Rollout workers rendezvous through and installs the

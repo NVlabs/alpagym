@@ -167,6 +167,16 @@ def test_replay_packer_extracts_transition_signal_and_zero_pads_it(
             "requires integer transition.owning_reference_executed_ticks",
         ),
         (
+            "actor_primitive_reward_mask",
+            {},
+            "missing transition.actor_primitive_reward_mask",
+        ),
+        (
+            "actor_primitive_rewards",
+            {},
+            "missing transition.actor_primitive_rewards",
+        ),
+        (
             None,
             {"owning_reference_executed_ticks": 26},
             "must be within \\[0, duration_ticks\\]",
@@ -191,6 +201,14 @@ def test_replay_packer_extracts_transition_signal_and_zero_pads_it(
             {"duration_ticks": True},
             "requires integer transition.duration_ticks",
         ),
+        (
+            None,
+            {
+                "owning_reference_executed_ticks": 13,
+                "actor_primitive_reward_mask": [False] * 11 + [True] * 14,
+            },
+            "must be the owning-reference suffix",
+        ),
     ),
 )
 def test_g1_motion_replay_fails_closed_on_invalid_actor_ownership(
@@ -209,6 +227,8 @@ def test_g1_motion_replay_fails_closed_on_invalid_actor_ownership(
         "old_value": 0.0,
         "primitive_rewards": [0.0] * 25,
         "primitive_reward_mask": [True] * 25,
+        "actor_primitive_rewards": [0.0] * 25,
+        "actor_primitive_reward_mask": [True] * 25,
         "duration_ticks": 25,
         "owning_reference_executed_ticks": 25,
         "actor_valid": True,
@@ -247,6 +267,8 @@ def test_g1_motion_replay_accepts_consistent_actor_ownership(
             "transition": {
                 "primitive_rewards": [0.0] * 25,
                 "primitive_reward_mask": [True] * 25,
+                "actor_primitive_rewards": [0.0] * 25,
+                "actor_primitive_reward_mask": [True] * 25,
                 "duration_ticks": 25,
                 "owning_reference_executed_ticks": 25,
                 "actor_valid": True,
@@ -258,6 +280,8 @@ def test_g1_motion_replay_accepts_consistent_actor_ownership(
 
     assert bool(signals["actor_valid"].item())
     assert int(signals["duration_ticks"].item()) == 25
+    assert bool((signals["actor_primitive_rewards"] == 0.0).all())
+    assert bool(signals["actor_primitive_reward_mask"].all())
 
 
 def test_replay_packer_exact_t_pack_has_no_padding(

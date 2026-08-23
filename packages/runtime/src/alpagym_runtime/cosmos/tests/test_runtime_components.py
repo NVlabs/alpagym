@@ -129,6 +129,8 @@ def _write_resolved_config(
                 "max_num_steps": 1,
                 "num_epochs": 1,
                 "train_batch_per_replica": 2,
+                "seed": 42,
+                "deterministic": False,
                 "optm_lr": 1.0e-6,
                 "optm_warmup_steps": 20,
                 "train_policy": {
@@ -356,6 +358,27 @@ def test_rollout_generation_declares_current_weight_version(
         "rollout_generation must declare `current_weight_version` so a "
         "new cosmos kwarg surfaces as TypeError instead of being absorbed."
     )
+
+
+def test_resumed_rollout_seed_panel_skips_completed_global_batches(
+    cosmos_stubs: None,
+) -> None:
+    """A checkpoint continuation must not replay rollout seeds already trained on."""
+
+    del cosmos_stubs
+    rollout_module = importlib.import_module("alpagym_runtime.cosmos.rollout_backend")
+    run_config = SimpleNamespace(
+        alpasim=SimpleNamespace(humanoid=SimpleNamespace(rollout_seed_base=292_285)),
+        cosmos=SimpleNamespace(
+            train=SimpleNamespace(
+                train_batch_per_replica=4,
+                resume=SimpleNamespace(enabled=True, checkpoint_step=3),
+            ),
+            launch=SimpleNamespace(policy_replicas=2),
+        ),
+    )
+
+    assert rollout_module._effective_humanoid_rollout_seed_base(run_config) == 292_309
 
 
 def test_rollout_init_acquires_runtime_for_driver(

@@ -167,6 +167,13 @@ class HumanoidPolicyCameraProfile(StrEnum):
                 return "humanoid_vla_d435_native"
 
 
+class HumanoidSceneCachePolicy(StrEnum):
+    """Lifecycle policy for the scene-bound NuRec renderer cache."""
+
+    build_if_missing = "build_if_missing"
+    require = "require"
+
+
 class HumanoidReferenceControllerProfile(StrEnum):
     """Dynamics-owned tracker selected for a motion-reference rollout."""
 
@@ -276,6 +283,11 @@ class CosmosRLTrainPolicyConfig:
     # generated the current PPO replay batch. This is distinct from
     # fixed-reference KL.
     ppo_target_behavior_kl: float | None = None
+    # When enabled, Flow-PPO retries an actor update with a conservatively
+    # scaled step until post-update behavior KL satisfies the hard target.
+    ppo_behavior_kl_backtrack: bool = False
+    ppo_behavior_kl_backtrack_margin: float = 0.9
+    ppo_behavior_kl_backtrack_max_attempts: int = 4
     # Number of flattened transition rows per PPO forward/backward microbatch.
     # This is deliberately independent from Cosmos's rollout/shard ``mini_batch``.
     step_mini_batch: int | None = None
@@ -289,15 +301,40 @@ class CosmosRLTrainCkptConfig:
     that AlpaGym uses; the rest fall back to upstream defaults. Saves land
     under ``{run_dir}/cosmos/<timestamp>/checkpoints/step_{N}/`` (cosmos
     resume bundle) and ``{run_dir}/cosmos/<timestamp>/safetensors/step_{N}/``
-    (HF-compatible weights). ``<timestamp>`` is appended by cosmos to
+    (a policy-native immutable candidate when the selected bundle supplies an
+    export hook, otherwise HF-compatible weights). ``<timestamp>`` is appended by cosmos to
     ``train.output_dir`` at startup.
     """
 
     enable_checkpoint: bool = False
     save_freq: int = 20
     save_freq_in_epoch: int = 0
+    # Formal runs publish candidates only after the corresponding native
+    # checkpoint is durably complete. Keep synchronous persistence as the safe
+    # default; async mode is available only for non-formal experiments.
+    save_mode: str = "sync"
     export_safetensors: bool = True
     max_keep: int = 5
+
+
+@dataclass
+class CosmosRLCheckpointResumeConfig:
+    """Fail-closed identity for one exact native Cosmos checkpoint restore.
+
+    The public Cosmos ``train.resume`` bool/string is deliberately not exposed
+    directly.  A continued AlpaGym run must bind the completed prior formal run,
+    the exact native checkpoint tree, and the first training step that follows
+    it.  ``run_artifacts`` translates a validated enabled contract to Cosmos's
+    exact policy-directory string; disabled contracts translate to ``false``.
+    """
+
+    enabled: bool = False
+    prior_formal_run_id: str | None = None
+    checkpoint_step: int | None = None
+    checkpoint_path: str | None = None
+    checkpoint_tree_sha256: str | None = None
+    prior_postrun_receipt_sha256: str | None = None
+    expected_next_training_step: int | None = None
 
 
 @dataclass
@@ -307,6 +344,8 @@ class CosmosRLTrainConfig:
     train_batch_per_replica: int
     max_num_steps: int | None
     num_epochs: int
+    seed: int
+    deterministic: bool
     optm_lr: float
     optm_warmup_steps: int
     train_policy: CosmosRLTrainPolicyConfig
@@ -327,6 +366,9 @@ class CosmosRLTrainConfig:
     # Defaults match `conf/default.yaml`; field-level defaults let callers and
     # tests construct `CosmosRLTrainConfig` without supplying `ckpt`.
     ckpt: CosmosRLTrainCkptConfig = field(default_factory=CosmosRLTrainCkptConfig)
+    resume: CosmosRLCheckpointResumeConfig = field(
+        default_factory=CosmosRLCheckpointResumeConfig
+    )
 
 
 @dataclass
@@ -492,6 +534,13 @@ class HumanoidAlpaSimConfig:
     policy_camera_profile: HumanoidPolicyCameraProfile | None = None
     # Writable host path mounted into the worker-local policy-camera renderer.
     scene_cache_path: str | None = None
+    # One host-owned policy is applied atomically to both the policy camera and
+    # Visual SONIC render lanes.  Formal qualification uses ``require`` so a
+    # rollout cannot silently build or switch cache identity; scene-preparation
+    # workflows may opt into ``build_if_missing`` explicitly.
+    scene_cache_policy: HumanoidSceneCachePolicy = (
+        HumanoidSceneCachePolicy.build_if_missing
+    )
     # Host-frozen identity snapshot.  Authored configs leave this empty; run
     # preparation fills it from every selected SceneStore manifest before the
     # resolved config is written.
@@ -616,14 +665,16 @@ class HumanoidAlpaSimConfig:
                 )
             if self.reward_profile_id not in (
                 "direct_v9_shaped.v1",
+                "stable_support_route.v2",
                 "reference_route_centered.v1",
                 "reference_route_centered.v2",
                 "reference_route_centered.v3",
             ):
                 raise ValueError(
                     "motion_reference reward_profile_id must be one of "
-                    "direct_v9_shaped.v1, reference_route_centered.v1, "
-                    "reference_route_centered.v2, or reference_route_centered.v3"
+                    "direct_v9_shaped.v1, stable_support_route.v2, "
+                    "reference_route_centered.v1, reference_route_centered.v2, "
+                    "or reference_route_centered.v3"
                 )
         else:
             if (
@@ -705,6 +756,11 @@ class AlpaSimConfig:
     startup_timeout_s: float
     simulation_timeout_s: float
     wizard_args: AlpaSimWizardArgs
+    # AlpaSim's worker-side deadline must expire first so it can cancel the
+    # rollout, run bounded service/renderer teardown, and return a structured
+    # failure before this host-side simulate RPC deadline fires.
+    runtime_rollout_timeout_s: float = 540.0
+    simulation_cleanup_margin_s: float = 60.0
     simulation_domain: str = "av"
     repo_url: str | None = None
     repo_ref: str | None = None
@@ -832,6 +888,13 @@ class ExecutionBackend(StrEnum):
         return self is ExecutionBackend.slurm
 
 
+class ProvenanceMode(StrEnum):
+    """Host-owned source/runtime evidence required for one execution."""
+
+    disabled = "disabled"
+    required = "required"
+
+
 @dataclass
 class ExecutionConfig:
     """Host execution settings for local and Slurm runs.
@@ -844,6 +907,7 @@ class ExecutionConfig:
     backend: ExecutionBackend
     resolved_config_path: str | None
     slurm: SlurmConfig
+    provenance_mode: ProvenanceMode = ProvenanceMode.disabled
 
 
 @dataclass

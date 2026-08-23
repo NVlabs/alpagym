@@ -4,6 +4,7 @@
 """Trainer-side replay signal tests."""
 
 import importlib
+import json
 import logging
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -219,6 +220,54 @@ def test_ppo_prepare_training_data_computes_gae_inside_trainer(
         samples[1].training_signal.returns,
         torch.tensor([1.0], dtype=torch.float32),
     )
+    assert trainer._last_ppo_advantage_metrics == pytest.approx(
+        {
+            "train/ppo_advantage_raw_rows": 2,
+            "train/ppo_advantage_raw_min": 1.0,
+            "train/ppo_advantage_raw_mean": 1.5,
+            "train/ppo_advantage_raw_max": 2.0,
+            "train/ppo_advantage_raw_std": 0.5,
+            "train/ppo_advantage_effective_rows": 2,
+            "train/ppo_advantage_effective_min": 1.0,
+            "train/ppo_advantage_effective_mean": 1.5,
+            "train/ppo_advantage_effective_max": 2.0,
+            "train/ppo_advantage_effective_std": 0.5,
+        }
+    )
+
+
+def test_ppo_reports_normalized_effective_advantages_separately_from_raw_gae(
+    cosmos_stubs: None,
+) -> None:
+    """Diagnostics expose the real PPO signal, not Cosmos's GRPO placeholder."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
+    trainer.data_packer = _PpoPerStepPacker(
+        {"a": [(1.0, 0.0, False, False), (1.0, 0.0, True, False)]}
+    )
+    trainer._normalize_advantages = True
+    trainer._gamma = 1.0
+    trainer._gae_lambda = 1.0
+
+    _samples, advantages = trainer._prepare_training_data(
+        [
+            SimpleNamespace(
+                prompt="a",
+                completion="a",
+                n_ignore_prefix_tokens=0,
+                advantage=0.0,
+                weight_version=0,
+            )
+        ]
+    )
+
+    torch.testing.assert_close(advantages, torch.tensor([1.0, -1.0]))
+    metrics = trainer._last_ppo_advantage_metrics
+    assert metrics["train/ppo_advantage_raw_mean"] == pytest.approx(1.5)
+    assert metrics["train/ppo_advantage_raw_std"] == pytest.approx(0.5)
+    assert metrics["train/ppo_advantage_effective_mean"] == pytest.approx(0.0)
+    assert metrics["train/ppo_advantage_effective_std"] == pytest.approx(1.0)
 
 
 def test_ppo_prepare_keeps_actor_invalid_transition_in_gae_and_value_targets(
@@ -663,6 +712,52 @@ def test_ppo_step_microbatches_accumulate_one_exact_optimizer_update(
         rtol=1.0e-6,
         atol=1.0e-7,
     )
+    assert (
+        micro_batch._last_optimizer_permutation_metrics
+        == full_batch._last_optimizer_permutation_metrics
+    )
+
+
+def test_ppo_optimizer_permutation_is_private_restart_stable_and_auditable(
+    cosmos_stubs: None,
+) -> None:
+    """PPO row order must not depend on unrelated global RNG consumption."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    torch.manual_seed(123)
+    rng_before = torch.get_rng_state().clone()
+
+    first, first_record = trainer_module._deterministic_optimizer_permutation(
+        num_steps=98,
+        base_seed=20260822,
+        current_step=1,
+        optimization_iteration=0,
+    )
+    rng_after = torch.get_rng_state().clone()
+    _unrelated_random_values = torch.rand(1000)
+    second, second_record = trainer_module._deterministic_optimizer_permutation(
+        num_steps=98,
+        base_seed=20260822,
+        current_step=1,
+        optimization_iteration=0,
+    )
+    next_step, next_record = trainer_module._deterministic_optimizer_permutation(
+        num_steps=98,
+        base_seed=20260822,
+        current_step=2,
+        optimization_iteration=0,
+    )
+
+    assert torch.equal(rng_after, rng_before)
+    assert torch.equal(first, second)
+    assert first_record == second_record
+    assert first_record["schema_id"] == "alpagym.optimizer_permutation.v1"
+    assert first_record["num_steps"] == 98
+    assert len(first_record["indices_sha256"]) == 64
+    assert first_record["indices_head"] == [int(index) for index in first[:16]]
+    assert first_record["indices_tail"] == [int(index) for index in first[-16:]]
+    assert not torch.equal(first, next_step)
+    assert first_record["indices_sha256"] != next_record["indices_sha256"]
 
 
 def test_ppo_minibatch_trains_value_head(cosmos_stubs: None) -> None:
@@ -974,6 +1069,7 @@ def test_step_training_success_reports_scalar_scheduler_lr(
     trainer._grpo_optimization_iterations = 1
     trainer._allowed_outdated_steps = 100
     trainer._on_policy = True
+    trainer._last_ppo_advantage_metrics = {"train/ppo_advantage_effective_mean": 0.25}
     trainer.config = SimpleNamespace(train=SimpleNamespace(train_batch_per_replica=1))
     monkeypatch.setattr(
         trainer_module, "filter_trainable_rollouts", lambda rollouts, **kwargs: rollouts
@@ -1009,6 +1105,7 @@ def test_step_training_success_reports_scalar_scheduler_lr(
     assert metrics["train/kl_avg"] == 0.125
     assert metrics["train/clip_fraction"] == 0.25
     assert metrics["train/optimizer_steps_applied"] == 2
+    assert metrics["train/ppo_advantage_effective_mean"] == 0.25
     assert scheduler.steps == 1
 
 
@@ -1305,6 +1402,7 @@ def test_ppo_post_update_behavior_kl_guard_precedes_scheduler_and_checkpoint(
     ) -> tuple[float, float, int, float, float, float, float]:
         del args
         events.append("train")
+        trainer._optimizer_steps_applied_in_training_step = 1
         return (1.0, 0.0, 1, 1.0, 1.0, 0.0, 0.0)
 
     trainer._run_training_loop = _record_training
@@ -1324,10 +1422,573 @@ def test_ppo_post_update_behavior_kl_guard_precedes_scheduler_and_checkpoint(
     assert trainer.saved_checkpoints == []
 
 
+def test_ppo_behavior_kl_backtracking_scales_actor_only_before_accept(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """One oversized Adam step is shrunk without weakening the critic update."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = _ppo_step_guard_trainer(trainer_module)
+    trainer._write_ppo_update_diagnostic_receipts = True
+    trainer.ckpt_manager = SimpleNamespace(global_rank=0)
+    receipt_path = tmp_path / "step_1_rank_0.json"
+    monkeypatch.setattr(trainer_module, "_load_run_config", lambda config: object())
+    monkeypatch.setattr(
+        trainer_module,
+        "_ppo_update_receipt_context",
+        lambda **kwargs: (receipt_path, {}),
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "filter_trainable_rollouts",
+        lambda rollouts, **kwargs: rollouts,
+    )
+
+    trainer.model = _BacktrackActorCritic(actor_weight=0.0, critic_weight=0.0)
+    trainer.optimizers = _actor_critic_optimizer_container(trainer.model)
+    trainer._behavior_kl_backtrack = True
+    trainer._behavior_kl_backtrack_margin = 0.9
+    trainer._behavior_kl_backtrack_max_attempts = 4
+    trainer._target_behavior_kl = 0.003
+    trainer._pre_update_diagnostics = lambda samples: {
+        "train/pre_update_valid_rows": len(samples),
+        "train/pre_update_approx_kl": 0.0,
+    }
+
+    def post_update(samples: list[object]) -> dict[str, float | int]:
+        actor_scale = float(trainer.model.actor.weight.item())
+        return {
+            "train/post_update_valid_rows": len(samples),
+            "train/post_update_approx_kl": 0.004 * actor_scale**2,
+        }
+
+    trainer._post_update_diagnostics = post_update
+
+    def oversized_update(
+        *args: Any,
+    ) -> tuple[float, float, int, float, float, float, float]:
+        del args
+        with torch.no_grad():
+            trainer.model.actor.weight.fill_(1.0)
+            trainer.model.critic.weight.fill_(2.0)
+        trainer._optimizer_steps_applied_in_training_step = 1
+        trainer._last_micro_batches = 1
+        return (1.0, 0.0, 1, 1.0, 1.0, 0.0, 1.0)
+
+    trainer._run_training_loop = oversized_update
+
+    metrics = trainer.step_training(
+        rollouts=[SimpleNamespace(weight_version=0)],
+        current_step=1,
+        total_steps=2,
+        remain_samples_num=1,
+        inter_policy_nccl=object(),
+        is_master_replica=True,
+        do_save_checkpoint=True,
+    )
+
+    assert trainer.model.actor.weight.item() == pytest.approx(0.75)
+    assert trainer.model.critic.weight.item() == pytest.approx(2.0)
+    assert metrics["train/post_update_approx_kl"] == pytest.approx(0.00225)
+    assert metrics["train/behavior_kl_before_backtrack"] == pytest.approx(0.004)
+    assert metrics["train/behavior_kl_after_backtrack"] == pytest.approx(0.00225)
+    assert metrics["train/actor_step_scale"] == pytest.approx(0.75)
+    assert metrics["train/actor_effective_learning_rate"] == pytest.approx(0.075)
+    assert metrics["train/actor_backtrack_attempts"] == 1
+    assert metrics["train/actor_backtrack_failed"] == 0
+    assert trainer._optimizer_steps_applied_in_training_step == 1
+    assert trainer.lr_schedulers.steps == 1
+    assert trainer.saved_checkpoints == [(1, 2, 1)]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["state"] == "accepted"
+    assert receipt["optimizer_metrics"]["train/actor_step_scale"] == pytest.approx(0.75)
+    history = receipt["optimizer_metrics"]["train/actor_backtrack_history"]
+    assert [entry["attempt"] for entry in history] == [0, 1]
+    assert [entry["actor_step_scale"] for entry in history] == pytest.approx(
+        [1.0, 0.75]
+    )
+    assert [entry["behavior_kl"] for entry in history] == pytest.approx(
+        [0.004, 0.00225]
+    )
+
+
+def test_ppo_behavior_kl_backtracking_restores_actor_and_rejects_bad_diagnostic(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-responsive KL diagnostic restores the actor and publishes nothing."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = _ppo_step_guard_trainer(trainer_module)
+    monkeypatch.setattr(
+        trainer_module,
+        "filter_trainable_rollouts",
+        lambda rollouts, **kwargs: rollouts,
+    )
+
+    trainer.model = _BacktrackActorCritic(actor_weight=0.25, critic_weight=0.0)
+    trainer.optimizers = _actor_critic_optimizer_container(trainer.model)
+    trainer._behavior_kl_backtrack = True
+    trainer._behavior_kl_backtrack_margin = 0.9
+    trainer._behavior_kl_backtrack_max_attempts = 2
+    trainer._target_behavior_kl = 0.003
+    trainer._pre_update_diagnostics = lambda samples: {
+        "train/pre_update_valid_rows": len(samples),
+        "train/pre_update_approx_kl": 0.0,
+    }
+    trainer._post_update_diagnostics = lambda samples: {
+        "train/post_update_valid_rows": len(samples),
+        "train/post_update_approx_kl": 0.01,
+    }
+
+    def oversized_update(
+        *args: Any,
+    ) -> tuple[float, float, int, float, float, float, float]:
+        del args
+        with torch.no_grad():
+            trainer.model.actor.weight.fill_(1.0)
+            trainer.model.critic.weight.fill_(2.0)
+        trainer._optimizer_steps_applied_in_training_step = 1
+        trainer._last_micro_batches = 1
+        return (1.0, 0.0, 1, 1.0, 1.0, 0.0, 1.0)
+
+    trainer._run_training_loop = oversized_update
+
+    with pytest.raises(FloatingPointError, match="backtracking exhausted"):
+        trainer.step_training(
+            rollouts=[SimpleNamespace(weight_version=0)],
+            current_step=1,
+            total_steps=2,
+            remain_samples_num=1,
+            inter_policy_nccl=object(),
+            is_master_replica=True,
+            do_save_checkpoint=True,
+        )
+
+    assert trainer.model.actor.weight.item() == pytest.approx(0.25)
+    assert trainer.model.critic.weight.item() == pytest.approx(2.0)
+    assert trainer._optimizer_steps_applied_in_training_step == 1
+    assert trainer.lr_schedulers.steps == 0
+    assert trainer.saved_checkpoints == []
+
+
+def test_ppo_behavior_kl_backtracking_restores_after_initial_post_diagnostic_failure(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A diagnostic crash after Adam restores actor and emits a null-metric rejection."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = _ppo_step_guard_trainer(trainer_module)
+    trainer._write_ppo_update_diagnostic_receipts = True
+    trainer.ckpt_manager = SimpleNamespace(global_rank=0)
+    receipt_path = tmp_path / "step_1_rank_0.json"
+    monkeypatch.setattr(trainer_module, "_load_run_config", lambda config: object())
+    monkeypatch.setattr(
+        trainer_module,
+        "_ppo_update_receipt_context",
+        lambda **kwargs: (receipt_path, {}),
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "filter_trainable_rollouts",
+        lambda rollouts, **kwargs: rollouts,
+    )
+
+    trainer.model = _BacktrackActorCritic(actor_weight=0.25, critic_weight=-0.5)
+    trainer.optimizers = _actor_critic_optimizer_container(trainer.model)
+    trainer._behavior_kl_backtrack = True
+    trainer._behavior_kl_backtrack_margin = 0.9
+    trainer._behavior_kl_backtrack_max_attempts = 4
+    trainer._target_behavior_kl = 0.003
+    trainer._pre_update_diagnostics = lambda samples: {
+        "train/pre_update_valid_rows": len(samples),
+        "train/pre_update_approx_kl": 0.0,
+    }
+    diagnostic_calls = 0
+
+    def failed_post_diagnostic(samples: list[object]) -> dict[str, float | int]:
+        del samples
+        nonlocal diagnostic_calls
+        diagnostic_calls += 1
+        raise RuntimeError("post-update replay unavailable")
+
+    trainer._post_update_diagnostics = failed_post_diagnostic
+
+    def mutate_once(
+        *args: Any,
+    ) -> tuple[float, float, int, float, float, float, float]:
+        del args
+        with torch.no_grad():
+            trainer.model.actor.weight.fill_(1.0)
+            trainer.model.critic.weight.fill_(2.0)
+        trainer._optimizer_steps_applied_in_training_step = 1
+        trainer._last_micro_batches = 1
+        return (1.0, 0.0, 1, 1.0, 1.0, 0.0, 1.0)
+
+    trainer._run_training_loop = mutate_once
+
+    with pytest.raises(ExceptionGroup, match="restored-state diagnostic failed"):
+        trainer.step_training(
+            rollouts=[SimpleNamespace(weight_version=0)],
+            current_step=1,
+            total_steps=2,
+            remain_samples_num=1,
+            inter_policy_nccl=object(),
+            is_master_replica=True,
+            do_save_checkpoint=True,
+        )
+
+    assert diagnostic_calls == 2
+    assert trainer.model.actor.weight.item() == pytest.approx(0.25)
+    assert trainer.model.critic.weight.item() == pytest.approx(2.0)
+    assert trainer.lr_schedulers.steps == 0
+    assert trainer.saved_checkpoints == []
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["state"] == "post_rejected"
+    assert receipt["post_update_metrics"] is None
+    assert receipt["boundary"] == {
+        "optimizer_steps_applied": 1,
+        "scheduler_advanced": False,
+        "checkpoint_started": False,
+        "weight_sync_started": False,
+    }
+    optimizer_metrics = receipt["optimizer_metrics"]
+    assert optimizer_metrics["train/actor_restore_attempted"] == 1
+    assert optimizer_metrics["train/actor_restore_succeeded"] == 1
+    assert optimizer_metrics["train/actor_optimizer_state_rolled_back"] == 0
+    assert "train/behavior_kl_after_restore" not in optimizer_metrics
+
+
+def test_ppo_behavior_kl_backtracking_exactly_restores_nan_actor(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Exact restore overwrites a non-finite Adam result instead of computing NaN*0."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = _ppo_step_guard_trainer(trainer_module)
+    trainer._write_ppo_update_diagnostic_receipts = True
+    trainer.ckpt_manager = SimpleNamespace(global_rank=0)
+    receipt_path = tmp_path / "step_1_rank_0.json"
+    monkeypatch.setattr(trainer_module, "_load_run_config", lambda config: object())
+    monkeypatch.setattr(
+        trainer_module,
+        "_ppo_update_receipt_context",
+        lambda **kwargs: (receipt_path, {}),
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "filter_trainable_rollouts",
+        lambda rollouts, **kwargs: rollouts,
+    )
+
+    trainer.model = _BacktrackActorCritic(actor_weight=0.25, critic_weight=-0.5)
+    actor_before = trainer.model.actor.weight.detach().clone()
+    trainer.optimizers = _actor_critic_optimizer_container(trainer.model)
+    trainer._behavior_kl_backtrack = True
+    trainer._behavior_kl_backtrack_margin = 0.9
+    trainer._behavior_kl_backtrack_max_attempts = 4
+    trainer._target_behavior_kl = 0.003
+    trainer._pre_update_diagnostics = lambda samples: {
+        "train/pre_update_valid_rows": len(samples),
+        "train/pre_update_approx_kl": 0.0,
+    }
+    diagnostic_calls = 0
+
+    def reject_nonfinite_actor(samples: list[object]) -> dict[str, float | int]:
+        nonlocal diagnostic_calls
+        diagnostic_calls += 1
+        if not torch.isfinite(trainer.model.actor.weight).all():
+            raise FloatingPointError("post-update actor is non-finite")
+        return {
+            "train/post_update_valid_rows": len(samples),
+            "train/post_update_approx_kl": 0.0,
+        }
+
+    trainer._post_update_diagnostics = reject_nonfinite_actor
+
+    def write_nan_actor(
+        *args: Any,
+    ) -> tuple[float, float, int, float, float, float, float]:
+        del args
+        with torch.no_grad():
+            trainer.model.actor.weight.fill_(float("nan"))
+            trainer.model.critic.weight.fill_(2.0)
+        trainer._optimizer_steps_applied_in_training_step = 1
+        trainer._last_micro_batches = 1
+        return (1.0, 0.0, 1, 1.0, 1.0, 0.0, 1.0)
+
+    trainer._run_training_loop = write_nan_actor
+
+    with pytest.raises(FloatingPointError, match="post-update actor is non-finite"):
+        trainer.step_training(
+            rollouts=[SimpleNamespace(weight_version=0)],
+            current_step=1,
+            total_steps=2,
+            remain_samples_num=1,
+            inter_policy_nccl=object(),
+            is_master_replica=True,
+            do_save_checkpoint=True,
+        )
+
+    assert diagnostic_calls == 2
+    assert torch.equal(trainer.model.actor.weight.detach(), actor_before)
+    assert torch.isfinite(trainer.model.actor.weight).all()
+    assert trainer.model.critic.weight.item() == pytest.approx(2.0)
+    assert trainer.lr_schedulers.steps == 0
+    assert trainer.saved_checkpoints == []
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["state"] == "post_rejected"
+    assert receipt["post_update_metrics"]["train/post_update_approx_kl"] == 0.0
+    optimizer_metrics = receipt["optimizer_metrics"]
+    assert optimizer_metrics["train/actor_restore_attempted"] == 1
+    assert optimizer_metrics["train/actor_restore_succeeded"] == 1
+    assert optimizer_metrics["train/actor_optimizer_state_rolled_back"] == 0
+    assert optimizer_metrics["train/behavior_kl_after_restore"] == pytest.approx(0.0)
+    assert receipt["boundary"] == {
+        "optimizer_steps_applied": 1,
+        "scheduler_advanced": False,
+        "checkpoint_started": False,
+        "weight_sync_started": False,
+    }
+
+
+def test_ppo_behavior_kl_backtracking_validates_all_snapshots_before_mutation(
+    cosmos_stubs: None,
+) -> None:
+    """A malformed later snapshot cannot partially scale an earlier parameter."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    first = torch.nn.Parameter(torch.tensor([2.0]))
+    second = torch.nn.Parameter(torch.tensor([3.0]))
+    first_before = first.detach().clone()
+    second_before = second.detach().clone()
+
+    with pytest.raises(ValueError, match="snapshot shape changed"):
+        trainer_module.AlpagymPPOTrainer._scale_actor_step_toward_snapshot_(
+            [first, second],
+            [torch.tensor([1.0]), torch.tensor([1.0, 1.0])],
+            relative_scale=0.5,
+        )
+
+    assert torch.equal(first.detach(), first_before)
+    assert torch.equal(second.detach(), second_before)
+
+
+def test_ppo_behavior_kl_backtracking_restores_after_partial_scale_diagnostic_failure(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A crash after partial interpolation cannot leave the scaled actor live."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = _ppo_step_guard_trainer(trainer_module)
+    trainer._write_ppo_update_diagnostic_receipts = True
+    trainer.ckpt_manager = SimpleNamespace(global_rank=0)
+    receipt_path = tmp_path / "step_1_rank_0.json"
+    monkeypatch.setattr(trainer_module, "_load_run_config", lambda config: object())
+    monkeypatch.setattr(
+        trainer_module,
+        "_ppo_update_receipt_context",
+        lambda **kwargs: (receipt_path, {}),
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "filter_trainable_rollouts",
+        lambda rollouts, **kwargs: rollouts,
+    )
+
+    trainer.model = _BacktrackActorCritic(actor_weight=0.0, critic_weight=-0.5)
+    trainer.optimizers = _actor_critic_optimizer_container(trainer.model)
+    trainer._behavior_kl_backtrack = True
+    trainer._behavior_kl_backtrack_margin = 0.9
+    trainer._behavior_kl_backtrack_max_attempts = 4
+    trainer._target_behavior_kl = 0.003
+    trainer._pre_update_diagnostics = lambda samples: {
+        "train/pre_update_valid_rows": len(samples),
+        "train/pre_update_approx_kl": 0.0,
+    }
+    diagnostic_calls = 0
+
+    def injected_post_diagnostic(
+        samples: list[object],
+    ) -> dict[str, float | int]:
+        nonlocal diagnostic_calls
+        diagnostic_calls += 1
+        if diagnostic_calls == 1:
+            assert trainer.model.actor.weight.item() == pytest.approx(1.0)
+            return {
+                "train/post_update_valid_rows": len(samples),
+                "train/post_update_approx_kl": 0.004,
+            }
+        if diagnostic_calls == 2:
+            assert trainer.model.actor.weight.item() == pytest.approx(0.75)
+            raise RuntimeError("partial-backtrack replay unavailable")
+        assert trainer.model.actor.weight.item() == pytest.approx(0.0)
+        return {
+            "train/post_update_valid_rows": len(samples),
+            "train/post_update_approx_kl": 0.0,
+        }
+
+    trainer._post_update_diagnostics = injected_post_diagnostic
+
+    def mutate_once(
+        *args: Any,
+    ) -> tuple[float, float, int, float, float, float, float]:
+        del args
+        with torch.no_grad():
+            trainer.model.actor.weight.fill_(1.0)
+            trainer.model.critic.weight.fill_(2.0)
+        trainer._optimizer_steps_applied_in_training_step = 1
+        trainer._last_micro_batches = 1
+        return (1.0, 0.0, 1, 1.0, 1.0, 0.0, 1.0)
+
+    trainer._run_training_loop = mutate_once
+
+    with pytest.raises(RuntimeError, match="partial-backtrack replay unavailable"):
+        trainer.step_training(
+            rollouts=[SimpleNamespace(weight_version=0)],
+            current_step=1,
+            total_steps=2,
+            remain_samples_num=1,
+            inter_policy_nccl=object(),
+            is_master_replica=True,
+            do_save_checkpoint=True,
+        )
+
+    assert diagnostic_calls == 3
+    assert trainer.model.actor.weight.item() == pytest.approx(0.0)
+    assert trainer.model.critic.weight.item() == pytest.approx(2.0)
+    assert trainer.lr_schedulers.steps == 0
+    assert trainer.saved_checkpoints == []
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["state"] == "post_rejected"
+    assert receipt["post_update_metrics"]["train/post_update_approx_kl"] == 0.0
+    optimizer_metrics = receipt["optimizer_metrics"]
+    assert optimizer_metrics["train/actor_restore_attempted"] == 1
+    assert optimizer_metrics["train/actor_restore_succeeded"] == 1
+    assert optimizer_metrics["train/actor_optimizer_state_rolled_back"] == 0
+    assert optimizer_metrics[
+        "train/behavior_kl_last_unsafe_candidate"
+    ] == pytest.approx(0.004)
+    assert optimizer_metrics["train/behavior_kl_after_restore"] == pytest.approx(0.0)
+
+
+def test_ppo_behavior_kl_backtracking_rejects_swapped_optimizer_ownership_before_update(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Actor/critic optimizer ownership is checked before any weight mutation."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = _ppo_step_guard_trainer(trainer_module)
+    monkeypatch.setattr(
+        trainer_module,
+        "filter_trainable_rollouts",
+        lambda rollouts, **kwargs: rollouts,
+    )
+
+    trainer.model = _BacktrackActorCritic(actor_weight=0.25, critic_weight=-0.5)
+    trainer.optimizers = _actor_critic_optimizer_container(
+        trainer.model,
+        swap_ownership=True,
+    )
+    trainer._behavior_kl_backtrack = True
+    trainer._behavior_kl_backtrack_margin = 0.9
+    trainer._behavior_kl_backtrack_max_attempts = 4
+    trainer._target_behavior_kl = 0.003
+    trainer._pre_update_diagnostics = lambda samples: {
+        "train/pre_update_valid_rows": len(samples),
+        "train/pre_update_approx_kl": 0.0,
+    }
+
+    optimizer_entered = False
+
+    def unexpected_update(*args: Any) -> Any:
+        del args
+        nonlocal optimizer_entered
+        optimizer_entered = True
+        with torch.no_grad():
+            trainer.model.actor.weight.fill_(99.0)
+            trainer.model.critic.weight.fill_(99.0)
+        raise AssertionError("optimizer ran before ownership validation")
+
+    trainer._run_training_loop = unexpected_update
+
+    with pytest.raises(
+        ValueError,
+        match="first optimizer leaf does not exactly own the actor parameters",
+    ):
+        trainer.step_training(
+            rollouts=[SimpleNamespace(weight_version=0)],
+            current_step=1,
+            total_steps=2,
+            remain_samples_num=1,
+            inter_policy_nccl=object(),
+            is_master_replica=True,
+            do_save_checkpoint=True,
+        )
+
+    assert optimizer_entered is False
+    assert trainer.model.actor.weight.item() == pytest.approx(0.25)
+    assert trainer.model.critic.weight.item() == pytest.approx(-0.5)
+    assert trainer.lr_schedulers.steps == 0
+    assert trainer.saved_checkpoints == []
+
+
+def test_ppo_behavior_kl_backtracking_requires_one_optimizer_iteration(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whole-delta interpolation is invalid after multiple optimizer steps."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+
+    def shared_init(
+        trainer: Any,
+        *,
+        config: object,
+        parallel_dims: object,
+        **kwargs: object,
+    ) -> None:
+        del config, parallel_dims, kwargs
+        trainer._grpo_optimization_iterations = 2
+        trainer._mini_batch = 1
+
+    monkeypatch.setattr(
+        trainer_module.AlpagymGRPOTrainer,
+        "__init__",
+        shared_init,
+    )
+    config = SimpleNamespace(
+        custom={
+            "ppo": {
+                "target_behavior_kl": 0.003,
+                "behavior_kl_backtrack": True,
+            }
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="requires exactly one optimizer iteration",
+    ):
+        trainer_module.AlpagymPPOTrainer(
+            config=config,
+            parallel_dims=SimpleNamespace(world_size=1),
+        )
+
+
 def test_final_checkpoint_respects_disabled_safetensors_export(
     cosmos_stubs: None,
 ) -> None:
-    """A final save writes resume state without a disabled weight export."""
+    """Remaining samples keep a process-boundary checkpoint nonterminal."""
     del cosmos_stubs
     trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
     trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
@@ -1366,10 +2027,91 @@ def test_final_checkpoint_respects_disabled_safetensors_export(
             "step": 1,
             "total_steps": 1,
             "remain_samples_num": 17,
-            "is_final": True,
+            "is_final": False,
         },
     )
     assert manager_calls[1] == ("save_check", {"step": 1})
+
+
+def test_staged_checkpoint_persists_the_logical_training_horizon(
+    cosmos_stubs: None,
+) -> None:
+    """A five-step process stage must remain resumable within a 50-step run."""
+
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
+    trainer.config = SimpleNamespace(
+        train=SimpleNamespace(
+            output_dir="/tmp/alpagym-staged-checkpoint-test",
+            param_dtype="float32",
+            ckpt=SimpleNamespace(export_safetensors=False),
+        )
+    )
+    trainer.model = object()
+    trainer.optimizers = object()
+    trainer.lr_schedulers = object()
+    trainer._logical_total_training_steps = 50
+    trainer._global_train_batch_size = 4
+    manager_calls: list[dict[str, object]] = []
+    trainer.ckpt_manager = SimpleNamespace(
+        save_checkpoint=lambda **kwargs: manager_calls.append(kwargs),
+        save_check=lambda **kwargs: None,
+    )
+
+    trainer._save_checkpoint(
+        current_step=5,
+        total_steps=5,
+        remain_samples_num=180,
+    )
+
+    assert manager_calls[0]["step"] == 5
+    assert manager_calls[0]["total_steps"] == 50
+    assert manager_calls[0]["remain_samples_num"] == 180
+    assert manager_calls[0]["is_final"] is False
+
+
+def _canonical_checkpoint_test_config(
+    tmp_path: Path,
+    *,
+    cosmos_timestamp: str = "20260822123456",
+) -> tuple[SimpleNamespace, str]:
+    """Write a real host config and model Cosmos's timestamped output layout."""
+    from alpagym_host.config import register_config_schema
+    from alpagym_host.run_artifacts import (
+        build_artifact_paths,
+        build_run_config,
+        write_run_artifacts,
+    )
+    from hydra import compose, initialize_config_module
+
+    register_config_schema()
+    with initialize_config_module(version_base=None, config_module="alpagym_host.conf"):
+        authored = compose(
+            config_name="default",
+            overrides=[
+                f"run_root={tmp_path.as_posix()}",
+                "deploy=local",
+                "topology=local_colocated_1gpu",
+                "policy.model.kind=alpamayo_r1",
+                f"policy.model.path={(tmp_path / 'model').as_posix()}",
+            ],
+        )
+    artifact_paths = build_artifact_paths(authored)
+    run_config = build_run_config(authored, artifact_paths)
+    write_run_artifacts(run_config)
+    cosmos_output_dir = artifact_paths.run_dir / "cosmos" / cosmos_timestamp
+    cosmos_output_dir.mkdir(parents=True)
+    config = SimpleNamespace(
+        custom={"resolved_config_path": str(artifact_paths.resolved_config_path)},
+        train=SimpleNamespace(
+            output_dir=str(cosmos_output_dir),
+            timestamp=cosmos_timestamp,
+            param_dtype="float32",
+            ckpt=SimpleNamespace(export_safetensors=True),
+        ),
+    )
+    return config, artifact_paths.run_dir.name
 
 
 def test_final_checkpoint_uses_policy_native_export_hook(
@@ -1380,20 +2122,19 @@ def test_final_checkpoint_uses_policy_native_export_hook(
     del cosmos_stubs
     trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
     trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
-    trainer.config = SimpleNamespace(
-        train=SimpleNamespace(
-            output_dir=str(tmp_path),
-            param_dtype="float32",
-            ckpt=SimpleNamespace(export_safetensors=True),
-        )
-    )
+    trainer.config, formal_run_id = _canonical_checkpoint_test_config(tmp_path)
     trainer.model = object()
     trainer.optimizers = object()
     trainer.lr_schedulers = object()
-    exported: list[tuple[object, Path]] = []
-    trainer._policy_bundle = SimpleNamespace(
-        export_model_checkpoint=lambda model, path: exported.append((model, path))
-    )
+    trainer._optimizer_steps_applied_in_training_step = 1
+    exported: list[tuple[object, Path, object]] = []
+    events: list[str] = []
+
+    def _record_export(model: object, path: Path, context: object) -> None:
+        events.append("export")
+        exported.append((model, path, context))
+
+    trainer._policy_bundle = SimpleNamespace(export_model_checkpoint=_record_export)
 
     def reject_cosmos_export(**kwargs: object) -> None:
         del kwargs
@@ -1401,13 +2142,317 @@ def test_final_checkpoint_uses_policy_native_export_hook(
 
     trainer.export_safetensors = reject_cosmos_export
     trainer.ckpt_manager = SimpleNamespace(
-        save_checkpoint=lambda **kwargs: None,
-        save_check=lambda **kwargs: None,
+        save_checkpoint=lambda **kwargs: events.append("resume"),
+        save_check=lambda **kwargs: events.append("resume_complete"),
     )
 
     trainer._save_checkpoint(current_step=1, total_steps=1, remain_samples_num=0)
 
-    assert exported == [(trainer.model, tmp_path / "safetensors" / "step_1")]
+    assert len(exported) == 1
+    assert exported[0][:2] == (
+        trainer.model,
+        Path(trainer.config.train.output_dir) / "safetensors" / "step_1",
+    )
+    export_context = exported[0][2]
+    assert export_context.training_step == 1
+    assert export_context.total_training_steps == 1
+    assert export_context.optimizer_steps_applied == 1
+    assert export_context.cosmos_run_id == formal_run_id
+    assert export_context.cosmos_run_id != Path(trainer.config.train.output_dir).name
+    assert export_context.cosmos_run_id != "cosmos"
+    assert events == ["resume", "resume_complete", "export"]
+
+
+def test_policy_native_export_failure_leaves_completed_resume_state(
+    cosmos_stubs: None,
+    tmp_path: Path,
+) -> None:
+    """A deployable-export failure occurs only after the resume commit."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
+    trainer.config, _formal_run_id = _canonical_checkpoint_test_config(tmp_path)
+    trainer.model = object()
+    trainer.optimizers = object()
+    trainer.lr_schedulers = object()
+    trainer._optimizer_steps_applied_in_training_step = 1
+    events: list[str] = []
+
+    def _fail_export(*args: object) -> None:
+        del args
+        events.append("export")
+        raise RuntimeError("candidate export failed")
+
+    trainer._policy_bundle = SimpleNamespace(
+        export_model_checkpoint=_fail_export,
+    )
+    trainer.ckpt_manager = SimpleNamespace(
+        save_checkpoint=lambda **kwargs: events.append("resume"),
+        save_check=lambda **kwargs: events.append("resume_complete"),
+    )
+
+    with pytest.raises(RuntimeError, match="candidate export failed"):
+        trainer._save_checkpoint(
+            current_step=1,
+            total_steps=1,
+            remain_samples_num=0,
+        )
+
+    assert events == ["resume", "resume_complete", "export"]
+
+
+def test_resume_failure_never_publishes_policy_native_candidate(
+    cosmos_stubs: None,
+    tmp_path: Path,
+) -> None:
+    """An uncommitted Cosmos training state cannot produce a candidate."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
+    trainer.config = SimpleNamespace(
+        train=SimpleNamespace(
+            output_dir=str(tmp_path),
+            param_dtype="float32",
+            ckpt=SimpleNamespace(export_safetensors=True),
+        ),
+    )
+    trainer.model = object()
+    trainer.optimizers = object()
+    trainer.lr_schedulers = object()
+    events: list[str] = []
+    trainer._policy_bundle = SimpleNamespace(
+        export_model_checkpoint=lambda *args: events.append("export"),
+    )
+
+    def _fail_resume(**kwargs: object) -> None:
+        del kwargs
+        events.append("resume")
+        raise RuntimeError("resume save failed")
+
+    trainer.ckpt_manager = SimpleNamespace(
+        save_checkpoint=_fail_resume,
+        save_check=lambda **kwargs: events.append("resume_complete"),
+    )
+
+    with pytest.raises(RuntimeError, match="resume save failed"):
+        trainer._save_checkpoint(
+            current_step=1,
+            total_steps=1,
+            remain_samples_num=0,
+        )
+
+    assert events == ["resume"]
+
+
+def test_checkpoint_context_rejects_authored_cosmos_root_as_run_identity(
+    cosmos_stubs: None,
+    tmp_path: Path,
+) -> None:
+    """The literal ``cosmos`` leaf cannot become candidate provenance."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    config, _formal_run_id = _canonical_checkpoint_test_config(tmp_path)
+    formal_run_dir = Path(config.train.output_dir).parents[1]
+    config.train.output_dir = str(formal_run_dir / "cosmos")
+    config.train.timestamp = "cosmos"
+
+    with pytest.raises(ValueError, match="runtime timestamp"):
+        trainer_module._policy_checkpoint_export_context(
+            config=config,
+            current_step=1,
+            total_steps=1,
+            optimizer_steps_applied=1,
+        )
+
+
+def test_public_terminal_checkpoint_uses_native_two_file_export(
+    cosmos_stubs: None,
+    tmp_path: Path,
+) -> None:
+    """A normal synthetic EOS cannot reach Cosmos's inherited HF exporter."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
+    trainer.config, formal_run_id = _canonical_checkpoint_test_config(tmp_path)
+    trainer.model = object()
+    trainer.optimizers = object()
+    trainer.lr_schedulers = object()
+    trainer._optimizer_steps_applied_in_training_step = 1
+    trainer._completed_policy_native_exports = {}
+    events: list[str] = []
+    exported_contexts: list[object] = []
+
+    def _native_export(model: object, path: Path, context: object) -> None:
+        assert model is trainer.model
+        path.mkdir(parents=True)
+        (path / "candidate_manifest.json").write_text("{}\n", encoding="utf-8")
+        (path / "trainable_overlay.safetensors").write_bytes(b"weights")
+        events.append("native_export")
+        exported_contexts.append(context)
+
+    trainer._policy_bundle = SimpleNamespace(export_model_checkpoint=_native_export)
+    trainer.export_safetensors = lambda **kwargs: pytest.fail(
+        f"generic HF exporter was called: {kwargs}"
+    )
+    trainer.ckpt_manager = SimpleNamespace(
+        save_checkpoint=lambda **kwargs: events.append("resume"),
+        save_check=lambda **kwargs: events.append("resume_complete"),
+    )
+
+    trainer.save_checkpoint(
+        current_step=1,
+        total_steps=1,
+        remain_samples_num=0,
+        is_final=True,
+    )
+
+    candidate = Path(trainer.config.train.output_dir) / "safetensors" / "step_1"
+    assert {entry.name for entry in candidate.iterdir()} == {
+        "candidate_manifest.json",
+        "trainable_overlay.safetensors",
+    }
+    assert exported_contexts[0].cosmos_run_id == formal_run_id
+    assert events == ["resume", "resume_complete", "native_export"]
+    assert (
+        trainer_module.AlpagymGRPOTrainer.__dict__["save_checkpoint"]
+        is trainer_module.AlpagymGRPOTrainer.save_checkpoint
+    )
+
+
+def test_synthetic_terminal_resave_preserves_immutable_candidate(
+    cosmos_stubs: None,
+    tmp_path: Path,
+) -> None:
+    """Real-step fallback followed by synthetic EOS exports exactly once."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
+    trainer.config, _formal_run_id = _canonical_checkpoint_test_config(tmp_path)
+    trainer.model = object()
+    trainer.optimizers = object()
+    trainer.lr_schedulers = object()
+    trainer._optimizer_steps_applied_in_training_step = 1
+    trainer._completed_policy_native_exports = {}
+    exports = 0
+    resume_saves = 0
+
+    def _native_export(model: object, path: Path, context: object) -> None:
+        nonlocal exports
+        del model, context
+        exports += 1
+        path.mkdir(parents=True)
+        (path / "candidate_manifest.json").write_text("manifest\n", encoding="utf-8")
+        (path / "trainable_overlay.safetensors").write_bytes(b"weights")
+
+    def _resume_save(**kwargs: object) -> None:
+        nonlocal resume_saves
+        del kwargs
+        resume_saves += 1
+
+    trainer._policy_bundle = SimpleNamespace(export_model_checkpoint=_native_export)
+    trainer.export_safetensors = lambda **kwargs: pytest.fail(
+        f"generic HF exporter was called: {kwargs}"
+    )
+    trainer.ckpt_manager = SimpleNamespace(
+        save_checkpoint=_resume_save,
+        save_check=lambda **kwargs: None,
+    )
+
+    trainer._save_checkpoint(current_step=2, total_steps=2, remain_samples_num=0)
+    candidate = Path(trainer.config.train.output_dir) / "safetensors" / "step_2"
+    before = {entry.name: entry.read_bytes() for entry in candidate.iterdir()}
+    trainer.save_checkpoint(
+        current_step=2,
+        total_steps=2,
+        remain_samples_num=0,
+        is_final=True,
+    )
+    after = {entry.name: entry.read_bytes() for entry in candidate.iterdir()}
+
+    assert exports == 1
+    assert resume_saves == 2
+    assert before == after
+    assert set(after) == {
+        "candidate_manifest.json",
+        "trainable_overlay.safetensors",
+    }
+
+
+def test_public_nonterminal_checkpoint_fails_before_writing(
+    cosmos_stubs: None,
+    tmp_path: Path,
+) -> None:
+    """An abnormal public/synthetic call cannot publish or mark a checkpoint."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
+    trainer.config, _formal_run_id = _canonical_checkpoint_test_config(tmp_path)
+    events: list[str] = []
+    trainer.ckpt_manager = SimpleNamespace(
+        save_checkpoint=lambda **kwargs: events.append("resume"),
+        save_check=lambda **kwargs: events.append("resume_complete"),
+    )
+
+    with pytest.raises(ValueError, match="synthetic terminal"):
+        trainer.save_checkpoint(
+            current_step=1,
+            total_steps=2,
+            remain_samples_num=0,
+            is_final=False,
+        )
+
+    assert events == []
+
+
+def test_synthetic_terminal_rejects_untracked_preexisting_candidate(
+    cosmos_stubs: None,
+    tmp_path: Path,
+) -> None:
+    """A stale/foreign step directory is never adopted or overwritten at EOS."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymGRPOTrainer)
+    trainer.config, _formal_run_id = _canonical_checkpoint_test_config(tmp_path)
+    trainer.model = object()
+    trainer.optimizers = object()
+    trainer.lr_schedulers = object()
+    trainer._optimizer_steps_applied_in_training_step = 1
+    trainer._completed_policy_native_exports = {}
+    candidate = Path(trainer.config.train.output_dir) / "safetensors" / "step_1"
+    candidate.mkdir(parents=True)
+    contaminant = candidate / "foreign.bin"
+    contaminant.write_bytes(b"do-not-touch")
+    events: list[str] = []
+
+    def _fail_closed_export(model: object, path: Path, context: object) -> None:
+        del model, context
+        events.append("native_export_attempt")
+        if path.exists():
+            raise FileExistsError("immutable candidate already exists")
+        raise AssertionError("preexisting candidate unexpectedly disappeared")
+
+    trainer._policy_bundle = SimpleNamespace(
+        export_model_checkpoint=_fail_closed_export
+    )
+    trainer.export_safetensors = lambda **kwargs: pytest.fail(
+        f"generic HF exporter was called: {kwargs}"
+    )
+    trainer.ckpt_manager = SimpleNamespace(
+        save_checkpoint=lambda **kwargs: events.append("resume"),
+        save_check=lambda **kwargs: events.append("resume_complete"),
+    )
+
+    with pytest.raises(FileExistsError, match="immutable"):
+        trainer.save_checkpoint(
+            current_step=1,
+            total_steps=1,
+            remain_samples_num=0,
+            is_final=True,
+        )
+
+    assert contaminant.read_bytes() == b"do-not-touch"
+    assert {entry.name for entry in candidate.iterdir()} == {"foreign.bin"}
+    assert events == ["resume", "resume_complete", "native_export_attempt"]
 
 
 def test_filter_rollouts_allows_empty_noop(cosmos_stubs: None) -> None:
@@ -1809,6 +2854,132 @@ class _ListLRScheduler:
         self.steps += 1
 
 
+def test_optimizer_learning_rates_use_nested_cosmos_leaf_groups(
+    cosmos_stubs: None,
+) -> None:
+    """A multi-part Cosmos container must ignore its synthetic top-level group."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    actor = torch.nn.Parameter(torch.tensor(0.0))
+    critic = torch.nn.Parameter(torch.tensor(0.0))
+    actor_optimizer = torch.optim.AdamW([actor], lr=5.0e-8)
+    critic_optimizer = torch.optim.AdamW([critic], lr=1.0e-4)
+    cosmos_container = SimpleNamespace(
+        # This matches the real multi-part OptimizersContainer group that
+        # triggered v22: it deliberately has no direct ``lr`` key.
+        param_groups=[
+            {
+                "params": [actor, critic],
+                "optimizers_args": [{"lr": 5.0e-8}, {"lr": 1.0e-4}],
+            }
+        ],
+        optimizers=[[actor_optimizer], [critic_optimizer]],
+    )
+
+    assert trainer_module._optimizer_learning_rates_before_scheduler(
+        cosmos_container
+    ) == pytest.approx([5.0e-8, 1.0e-4])
+
+
+def test_optimizer_learning_rates_reject_missing_leaf_lr(
+    cosmos_stubs: None,
+) -> None:
+    """Diagnostics fail closed when no real leaf learning rate is auditable."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    malformed_container = SimpleNamespace(
+        param_groups=[{"optimizers_args": [{}]}],
+        optimizers=[[SimpleNamespace(param_groups=[{"params": []}])]],
+    )
+
+    with pytest.raises(KeyError, match="leaf optimizer param group is missing lr"):
+        trainer_module._optimizer_learning_rates_before_scheduler(malformed_container)
+
+
+def test_receipt_optimizer_topology_fails_before_training_mutates(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An unauditable optimizer topology is rejected before the update loop."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = _ppo_step_guard_trainer(trainer_module)
+    trainer._write_ppo_update_diagnostic_receipts = True
+    trainer.ckpt_manager = SimpleNamespace(global_rank=0)
+    trainer.optimizers = SimpleNamespace(
+        param_groups=[{"optimizers_args": [{}]}],
+        optimizers=[[SimpleNamespace(param_groups=[{"params": []}])]],
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "filter_trainable_rollouts",
+        lambda rollouts, **kwargs: rollouts,
+    )
+    monkeypatch.setattr(trainer_module, "_load_run_config", lambda config: object())
+    monkeypatch.setattr(
+        trainer_module,
+        "_ppo_update_receipt_context",
+        lambda **kwargs: (tmp_path / "step_1_rank_0.json", {}),
+    )
+    mutated = False
+
+    def _unexpected_training(*args: Any) -> Any:
+        del args
+        nonlocal mutated
+        mutated = True
+        raise AssertionError("optimizer loop ran before topology validation")
+
+    trainer._run_training_loop = _unexpected_training
+
+    with pytest.raises(KeyError, match="leaf optimizer param group is missing lr"):
+        trainer.step_training(
+            rollouts=[SimpleNamespace(weight_version=0)],
+            current_step=1,
+            total_steps=1,
+            remain_samples_num=0,
+            inter_policy_nccl=object(),
+            is_master_replica=True,
+        )
+
+    assert mutated is False
+
+
+class _BacktrackActorCritic(torch.nn.Module):
+    """Minimal two-part model exposing the production actor/critic boundary."""
+
+    def __init__(self, *, actor_weight: float, critic_weight: float) -> None:
+        super().__init__()
+        self.actor = torch.nn.Linear(1, 1, bias=False)
+        self.critic = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            self.actor.weight.fill_(actor_weight)
+            self.critic.weight.fill_(critic_weight)
+
+    def separate_model_parts(self) -> list[torch.nn.Module]:
+        """Match the production ``[actor, critic]`` optimizer-part contract."""
+        return [self.actor, self.critic]
+
+
+def _actor_critic_optimizer_container(
+    model: _BacktrackActorCritic,
+    *,
+    swap_ownership: bool = False,
+) -> SimpleNamespace:
+    """Build two Cosmos-style leaves with exact, auditable parameter ownership."""
+    actor_parameters = list(model.actor.parameters())
+    critic_parameters = list(model.critic.parameters())
+    if swap_ownership:
+        actor_parameters, critic_parameters = critic_parameters, actor_parameters
+    actor_optimizer = SimpleNamespace(
+        param_groups=[{"lr": 0.1, "params": actor_parameters}]
+    )
+    critic_optimizer = SimpleNamespace(
+        param_groups=[{"lr": 0.2, "params": critic_parameters}]
+    )
+    return SimpleNamespace(optimizers=[[actor_optimizer], [critic_optimizer]])
+
+
 def _ppo_step_guard_trainer(trainer_module: Any) -> Any:
     """Build a stubbed PPO trainer whose KL-guard ordering is observable."""
     trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
@@ -1824,6 +2995,7 @@ def _ppo_step_guard_trainer(trainer_module: Any) -> Any:
     trainer._allowed_outdated_steps = 100
     trainer._on_policy = False
     trainer._target_behavior_kl = 0.1
+    trainer._write_ppo_update_diagnostic_receipts = False
     trainer.config = SimpleNamespace(
         train=SimpleNamespace(
             train_batch_per_replica=1,
@@ -1944,6 +3116,8 @@ def _trainer_for_ppo_accumulation_test(*, step_mini_batch: int) -> Any:
     trainer._value_huber_delta = None
     trainer._flow_chunk_density = False
     trainer._dual_clip_ratio = None
+    trainer._write_ppo_update_diagnostic_receipts = False
+    trainer.config = SimpleNamespace(train=SimpleNamespace(seed=31))
     trainer.model = _ScalarActorCriticModel()
     trainer.optimizers = _CountingSGD(trainer.model.parameters(), lr=0.05)
     trainer.data_packer = _StackingPpoPacker()

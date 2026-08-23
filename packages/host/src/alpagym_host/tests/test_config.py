@@ -23,6 +23,7 @@ from alpagym_host.config import (
     HumanoidExecutionProfile,
     HumanoidPolicyCameraProfile,
     HumanoidReferenceControllerProfile,
+    ProvenanceMode,
     RunConfig,
     SeparateNodesSlurmTopologyConfig,
     TransportKind,
@@ -31,7 +32,9 @@ from alpagym_host.config import (
 )
 from alpagym_host.config_validation import (
     _validate_humanoid_config,
+    _validate_provenance_config,
     _validate_vla_slurm_worker_mounts,
+    _validate_wizard_startup_config,
     validate_run_config,
 )
 from alpagym_host.humanoid_scene_identity import freeze_humanoid_scene_fingerprints
@@ -41,6 +44,62 @@ from alpagym_host.run_artifacts import (
     write_run_artifacts,
 )
 from hydra import compose, initialize_config_module
+
+
+def test_required_provenance_accepts_only_resolvable_local_humanoid_repos(
+    tmp_path: Path,
+) -> None:
+    """Formal provenance must own concrete local AlpaSim and Humanoid worktrees."""
+    alpasim_root = tmp_path / "alpasim"
+    humanoid_root = tmp_path / "humanoid"
+    alpasim_root.mkdir()
+    humanoid_root.mkdir()
+    config = _make_run_config(tmp_path)
+    config.execution.provenance_mode = ProvenanceMode.required
+    config.alpasim.repo_path = str(alpasim_root.resolve())
+    config.alpasim.humanoid = HumanoidAlpaSimConfig(
+        repo_path=str(humanoid_root.resolve()),
+        scene_store_path=str(tmp_path / "scenes"),
+        scenario_ids_by_scene={"stairs": "ascend"},
+    )
+
+    _validate_provenance_config(config=config, requested_command="run")
+
+    _validate_provenance_config(config=config, requested_command="rollout")
+
+    config.cosmos.train.ckpt.save_mode = "async"
+    with pytest.raises(ValueError, match="synchronous native checkpoint"):
+        _validate_provenance_config(config=config, requested_command="run")
+    _validate_provenance_config(config=config, requested_command="rollout")
+    config.cosmos.train.ckpt.save_mode = "sync"
+
+    config.execution.backend = ExecutionBackend.slurm
+    with pytest.raises(ValueError, match="only supports local_process"):
+        _validate_provenance_config(config=config, requested_command="run")
+
+    config.execution.backend = ExecutionBackend.local_process
+    with pytest.raises(ValueError, match="command=run or command=rollout only"):
+        _validate_provenance_config(config=config, requested_command="submit")
+
+
+def test_hq_stairs_experiment_requires_formal_provenance() -> None:
+    """The formal staircase training profile cannot silently disable evidence."""
+    register_config_schema()
+    with initialize_config_module(version_base=None, config_module="alpagym_host.conf"):
+        config = compose(
+            config_name="default",
+            overrides=[
+                "experiment=g1_vla_hq_stairs_local_1gpu",
+                "policy.model.path=/tmp/model",
+                "alpasim.humanoid.repo_path=/tmp/humanoid",
+                "alpasim.humanoid.scene_store_path=/tmp/scene_store",
+                "alpasim.humanoid.grail_root_path=/tmp/grail",
+                "alpasim.humanoid.visual_controller_release_path=/tmp/controller",
+                "alpasim.humanoid.scene_cache_path=/tmp/cache",
+            ],
+        )
+
+    assert config.execution.provenance_mode is ProvenanceMode.required
 
 
 def test_host_writes_and_loads_handoff_artifacts(
@@ -60,6 +119,7 @@ def test_host_writes_and_loads_handoff_artifacts(
                 f"policy.model.path={model_path.as_posix()}",
                 "dataset.scene_ids=[scene_a,scene_b]",
                 "cosmos.train.num_epochs=5",
+                "cosmos.train.seed=12345",
                 "cosmos.train.train_batch_per_replica=3",
                 "cosmos.train.train_policy.mini_batch=3",
                 "cosmos.train.train_policy.grpo_ratio_clip_low=0.1",
@@ -121,8 +181,10 @@ def test_host_writes_and_loads_handoff_artifacts(
     assert "grpo_ratio_clip_high" not in cosmos_config["train"]["train_policy"]
     assert "grpo_optimization_iterations" not in cosmos_config["train"]["train_policy"]
     assert cosmos_config["train"]["train_batch_per_replica"] == 3
+    assert cosmos_config["train"]["ckpt"]["save_mode"] == "sync"
     assert cosmos_config["train"]["epoch"] == 5
-    assert "seed" not in cosmos_config["train"]
+    assert cosmos_config["train"]["seed"] == 12345
+    assert cosmos_config["train"]["deterministic"] is False
     assert cosmos_config["logging"]["log_interval"] == 7
     assert cosmos_config["policy"]["model_name_or_path"] == model_path.as_posix()
     assert cosmos_config["policy"]["parallelism"]["tp_size"] == 2
@@ -178,6 +240,9 @@ def test_host_writes_alpagym_ppo_trainer_config(
         "gae_lambda": 0.9,
         "min_action_std": 0.02,
         "max_action_std": 2.0,
+        "behavior_kl_backtrack": False,
+        "behavior_kl_backtrack_margin": 0.9,
+        "behavior_kl_backtrack_max_attempts": 4,
     }
 
 
@@ -210,6 +275,9 @@ def test_host_writes_vla_flow_ppo_config(tmp_path: Path) -> None:
                 "cosmos.train.train_policy.ppo_gamma=0.99",
                 "cosmos.train.train_policy.ppo_gae_lambda=0.95",
                 "cosmos.train.train_policy.ppo_target_behavior_kl=0.05",
+                "cosmos.train.train_policy.ppo_behavior_kl_backtrack=true",
+                "cosmos.train.train_policy.ppo_behavior_kl_backtrack_margin=0.8",
+                "cosmos.train.train_policy.ppo_behavior_kl_backtrack_max_attempts=3",
                 "cosmos.train.train_policy.kl_beta=0.0",
             ],
         )
@@ -241,6 +309,9 @@ def test_host_writes_vla_flow_ppo_config(tmp_path: Path) -> None:
         "min_action_std": 0.02,
         "max_action_std": 2.0,
         "target_behavior_kl": 0.05,
+        "behavior_kl_backtrack": True,
+        "behavior_kl_backtrack_margin": 0.8,
+        "behavior_kl_backtrack_max_attempts": 3,
     }
 
 
@@ -261,6 +332,94 @@ def test_training_policy_config_rejects_invalid_target_behavior_kl(
     run_config.cosmos.train.train_policy.ppo_target_behavior_kl = target_behavior_kl
 
     with pytest.raises(ValueError, match="ppo_target_behavior_kl"):
+        validate_run_config(run_config, "run")
+
+
+def test_training_policy_backtrack_requires_target_behavior_kl(tmp_path: Path) -> None:
+    """Actor-step retries require an explicit behavior-policy KL target."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        f"policy.model.path={model_path.as_posix()}",
+    )
+    run_config.cosmos.train.train_policy.ppo_behavior_kl_backtrack = True
+
+    with pytest.raises(ValueError, match="requires ppo_target_behavior_kl"):
+        validate_run_config(run_config, "run")
+
+
+@pytest.mark.parametrize("iterations", (0, 2, True, 1.0))
+def test_training_policy_backtrack_requires_single_optimizer_iteration(
+    tmp_path: Path,
+    iterations: object,
+) -> None:
+    """Whole-step actor interpolation is valid only for one optimizer update."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        f"policy.model.path={model_path.as_posix()}",
+    )
+    train_policy = run_config.cosmos.train.train_policy
+    train_policy.ppo_target_behavior_kl = 0.003
+    train_policy.ppo_behavior_kl_backtrack = True
+    train_policy.grpo_optimization_iterations = iterations
+
+    with pytest.raises(
+        ValueError,
+        match="requires grpo_optimization_iterations == 1",
+    ):
+        validate_run_config(run_config, "run")
+
+
+def test_training_policy_backtrack_flag_must_be_boolean(tmp_path: Path) -> None:
+    """Backtracking cannot be activated by a truthy non-boolean value."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        f"policy.model.path={model_path.as_posix()}",
+    )
+    run_config.cosmos.train.train_policy.ppo_behavior_kl_backtrack = "true"
+
+    with pytest.raises(ValueError, match="ppo_behavior_kl_backtrack must be a boolean"):
+        validate_run_config(run_config, "run")
+
+
+@pytest.mark.parametrize(
+    "margin",
+    (0.0, 1.0, -0.1, float("nan"), float("inf"), True, "0.9"),
+)
+def test_training_policy_rejects_invalid_behavior_kl_backtrack_margin(
+    tmp_path: Path,
+    margin: object,
+) -> None:
+    """The retry acceptance margin must be finite and strictly inside (0, 1)."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        f"policy.model.path={model_path.as_posix()}",
+    )
+    run_config.cosmos.train.train_policy.ppo_behavior_kl_backtrack_margin = margin
+
+    with pytest.raises(ValueError, match="ppo_behavior_kl_backtrack_margin"):
+        validate_run_config(run_config, "run")
+
+
+@pytest.mark.parametrize("attempts", (0, -1, 1.5, True))
+def test_training_policy_rejects_invalid_behavior_kl_backtrack_attempts(
+    tmp_path: Path,
+    attempts: object,
+) -> None:
+    """Retry count is a strict positive integer, not a coercible scalar."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        f"policy.model.path={model_path.as_posix()}",
+    )
+    run_config.cosmos.train.train_policy.ppo_behavior_kl_backtrack_max_attempts = (
+        attempts
+    )
+
+    with pytest.raises(ValueError, match="ppo_behavior_kl_backtrack_max_attempts"):
         validate_run_config(run_config, "run")
 
 
@@ -954,6 +1113,53 @@ def test_vla_policy_rejects_direct_action_runtime_route() -> None:
         _validate_humanoid_config(config)
 
 
+def test_vla_policy_accepts_bounded_action_lr_calibration() -> None:
+    """Actor LR may decrease while optimizer-group order and critic LR stay pinned."""
+    config = _make_valid_vla_validation_config()
+    config.cosmos.train.optm_part_lrs = [2.5e-7, 1.0e-4]
+
+    _validate_humanoid_config(config)
+
+
+@pytest.mark.parametrize("seed", [None, 0, -1, 2**32, True])
+def test_vla_policy_rejects_non_reproducible_train_seed(seed: object) -> None:
+    """Formal VLA training must initialize its critic from one valid seed."""
+    config = _make_valid_vla_validation_config()
+    config.cosmos.train.seed = seed
+
+    with pytest.raises(ValueError, match="cosmos.train.seed"):
+        _validate_humanoid_config(config)
+
+
+def test_vla_policy_requires_deterministic_training() -> None:
+    """Formal VLA comparisons cannot silently use nondeterministic kernels."""
+    config = _make_valid_vla_validation_config()
+    config.cosmos.train.deterministic = False
+
+    with pytest.raises(ValueError, match="deterministic=true"):
+        _validate_humanoid_config(config)
+
+
+@pytest.mark.parametrize(
+    ("part_lrs", "message"),
+    [
+        ([2.5e-7], "exactly two optm_part_lrs"),
+        ([1.1e-6, 1.0e-4], "action_header optm_part_lrs\\[0\\]"),
+        ([2.5e-7, 5.0e-5], "critic optm_part_lrs\\[1\\]"),
+    ],
+)
+def test_vla_policy_rejects_unsafe_optimizer_group_lrs(
+    part_lrs: list[float],
+    message: str,
+) -> None:
+    """VLA calibration cannot increase actor LR or retune the critic group."""
+    config = _make_valid_vla_validation_config()
+    config.cosmos.train.optm_part_lrs = part_lrs
+
+    with pytest.raises(ValueError, match=message):
+        _validate_humanoid_config(config)
+
+
 @pytest.mark.parametrize("factory_spec", [None, "zero"])
 def test_vla_policy_requires_native_runtime_factory(
     factory_spec: str | None,
@@ -1108,6 +1314,14 @@ def test_vla_direct_v9_reward_requires_source_horizon() -> None:
     config.expected_valid_steps = 29
 
     with pytest.raises(ValueError, match="750-tick / 15-second horizon"):
+        _validate_humanoid_config(config)
+
+
+def test_vla_stable_support_reward_requires_thirty_second_horizon() -> None:
+    config = _make_valid_vla_validation_config()
+    config.alpasim.humanoid.reward_profile_id = "stable_support_route.v2"
+
+    with pytest.raises(ValueError, match="1500-tick / 30-second horizon"):
         _validate_humanoid_config(config)
 
 
@@ -1721,6 +1935,9 @@ def _make_valid_vla_validation_config() -> RunConfig:
                     expected_scene_fingerprints=fingerprints,
                     execution_profile=HumanoidExecutionProfile.motion_reference,
                     reward_profile_id="direct_v9_shaped.v1",
+                    reference_controller_profile=(
+                        HumanoidReferenceControllerProfile.sonic_visual
+                    ),
                     reference_frame_count=50,
                     policy_camera_profile=HumanoidPolicyCameraProfile.vla_d435_native,
                 ),
@@ -1735,6 +1952,8 @@ def _make_valid_vla_validation_config() -> RunConfig:
                 mode=CosmosRLMode.colocated,
                 rollout=SimpleNamespace(prefetch_rollout=False),
                 train=SimpleNamespace(
+                    seed=20260822,
+                    deterministic=True,
                     train_policy=SimpleNamespace(
                         trainer_type="alpagym_flow_ppo",
                         grpo_ratio_clip_low=0.2,
@@ -1836,3 +2055,24 @@ def _write_hf_bundle_tarball(
                     arcname=f"{member_prefix}model.safetensors.index.json",
                 )
     return tarball_path
+
+
+def test_alpasim_rejects_inner_outer_deadline_race(tmp_path: Path) -> None:
+    config = _make_run_config(tmp_path)
+    config.alpasim.runtime_rollout_timeout_s = 600.0
+    config.alpasim.simulation_cleanup_margin_s = 60.0
+    config.alpasim.simulation_timeout_s = 600.0
+
+    with pytest.raises(ValueError, match="structured timeout after bounded teardown"):
+        _validate_wizard_startup_config(config.alpasim, config.dataset)
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("inf"), float("nan"), True])
+def test_alpasim_deadlines_must_be_finite_positive(
+    tmp_path: Path, value: float
+) -> None:
+    config = _make_run_config(tmp_path)
+    config.alpasim.simulation_cleanup_margin_s = value
+
+    with pytest.raises(ValueError, match="simulation_cleanup_margin_s"):
+        _validate_wizard_startup_config(config.alpasim, config.dataset)

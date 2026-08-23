@@ -19,11 +19,10 @@ exclude-newer = "3 days"
 # at startup and AlpaGym does not use xformers fast attention.
 override-dependencies = [
   "xformers ; sys_platform == 'never'",
-  # alpamayo1-x-rl's pyproject pins cosmos-rl at 747d1bd. alpagym tracks
-  # a newer revision (~88 commits ahead). Force the alpagym rev to avoid
-  # a uv "conflicting URLs" error; cosmos-rl is fully backward-compatible
-  # for the APIs alpamayo1-x-rl exercises.
-  "cosmos-rl @ git+https://github.com/nvidia-cosmos/cosmos-rl.git@a367b4cc814ff153e846f386fde59919ab7247e3",
+  # alpamayo1-x-rl pins a different Cosmos-RL revision. Force AlpaGym's
+  # audited colocated-dispatch fix so a fresh resolve cannot silently fall
+  # back to the upstream revision that loses the first rollout batch.
+  "cosmos-rl @ git+https://github.com/thomasrantian/cosmos-rl.git@c64a08ff40b3652a4cee0790fe21d7188b11114c",
 ]
 # Restrict resolution to Linux x86_64 (CUDA). alpagym pulls vllm + flash-attn +
 # alpamayo1-x-rl which are Linux-only; resolving Windows/macOS splits fails.
@@ -77,8 +76,10 @@ alpamayo-r1 = { git = "https://github.com/NVlabs/alpamayo.git", rev = "4cda35d22
 # (NVlabs/alpamayo-recipes#thomast/expert_wrapper_file) merges; bump
 # the rev intentionally rather than tracking a moving branch.
 alpamayo-recipes = { git = "https://github.com/NVlabs/alpamayo-recipes.git", subdirectory = "src", rev = "4bc76779739461a028ee8bb9008bc4082a3328dd" }
-alpasim-grpc = { git = "https://github.com/chenyx09/alpasim.git", subdirectory = "src/grpc", rev = "3d99f0cdadbcc4575a9fa9dd1c07aacb008b0d2a" }
-cosmos-rl = { git = "https://github.com/nvidia-cosmos/cosmos-rl.git", rev = "a367b4cc814ff153e846f386fde59919ab7247e3" }
+# The AlpaSim fork is private; use SSH so authenticated fresh clones and uv
+# resolves use the same access path documented by the integration README.
+alpasim-grpc = { git = "ssh://git@github.com/chenyx09/alpasim.git", subdirectory = "src/grpc", rev = "6586e54b178a695750e71b4b511cd01012141d39" }
+cosmos-rl = { git = "https://github.com/thomasrantian/cosmos-rl.git", rev = "c64a08ff40b3652a4cee0790fe21d7188b11114c" }
 flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
 torch = { index = "pytorch-cu128" }
 torchaudio = { index = "pytorch-cu128" }

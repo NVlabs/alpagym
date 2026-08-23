@@ -4,8 +4,9 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
-from alpagym_host.config import CosmosRLMode, ExecutionBackend
+from alpagym_host.config import CosmosRLMode, ExecutionBackend, ProvenanceMode
 from alpagym_host.config_validation import _validate_rollout_qualification_config
 from alpagym_runtime.replay import ActionSelection, PolicyReplayData
 from alpagym_runtime.transport.disk import read_episode_json
@@ -45,13 +46,20 @@ def _policy_output() -> PolicyOutput:
 def _qualification_config(tmp_path: Path) -> SimpleNamespace:
     run_dir = tmp_path / "run"
     return SimpleNamespace(
-        execution=SimpleNamespace(backend=ExecutionBackend.local_process),
+        execution=SimpleNamespace(
+            backend=ExecutionBackend.local_process,
+            provenance_mode=ProvenanceMode.disabled,
+        ),
         dataset=SimpleNamespace(scene_ids=["hq_stairs"]),
         policy=SimpleNamespace(
             kind="humanoid",
             model=SimpleNamespace(
                 kind="g1_vla",
-                bundle_config={"sampling_mode": "native_ode_qualification"},
+                path=str(tmp_path / "models" / "attested-base"),
+                bundle_config={
+                    "sampling_mode": "native_ode_qualification",
+                    "qualification_model_source": "base_attested",
+                },
             ),
             inference=SimpleNamespace(return_trace_for_rl=False),
         ),
@@ -61,6 +69,8 @@ def _qualification_config(tmp_path: Path) -> SimpleNamespace:
             startup_timeout_s=10.0,
             simulation_timeout_s=20.0,
             humanoid=SimpleNamespace(
+                repo_path=str(tmp_path / "humanoid"),
+                scene_store_path=str(tmp_path / "scene_store"),
                 scenario_ids_by_scene={"hq_stairs": "ascend"},
                 rollout_seed_base=292285,
             ),
@@ -70,6 +80,8 @@ def _qualification_config(tmp_path: Path) -> SimpleNamespace:
             artifacts_dir=run_dir / "artifacts",
             alpasim_log_dir=run_dir / "alpasim",
             alpasim_scene_ids_path=run_dir / "alpasim_scene_ids.yaml",
+            resolved_config_path=run_dir / "resolved_config.yaml",
+            cosmos_config_path=run_dir / "cosmos_config.toml",
         ),
     )
 
@@ -85,6 +97,91 @@ def test_qualification_validation_is_native_ode_local_only(tmp_path: Path) -> No
         assert "return_trace_for_rl=false" in str(exc)
     else:
         raise AssertionError("qualification accepted PPO traces")
+
+
+def test_qualification_validation_requires_explicit_nonfallback_model_source(
+    tmp_path: Path,
+) -> None:
+    config = _qualification_config(tmp_path)
+    del config.policy.model.bundle_config["qualification_model_source"]
+    with pytest.raises(ValueError, match="explicit qualification_model_source"):
+        _validate_rollout_qualification_config(config)
+
+    config = _qualification_config(tmp_path)
+    config.policy.model.bundle_config["candidate_overlay_path"] = str(
+        tmp_path / "candidate"
+    )
+    with pytest.raises(ValueError, match="base_attested forbids"):
+        _validate_rollout_qualification_config(config)
+
+    config = _qualification_config(tmp_path)
+    config.policy.model.bundle_config["qualification_model_source"] = (
+        "candidate_overlay"
+    )
+    with pytest.raises(ValueError, match="requires candidate_overlay_path"):
+        _validate_rollout_qualification_config(config)
+
+    candidate = tmp_path / "candidate" / "step_3"
+    candidate.mkdir(parents=True)
+    (candidate / "candidate_manifest.json").write_text("{}", encoding="utf-8")
+    config.policy.model.bundle_config["candidate_overlay_path"] = str(candidate)
+    config.policy.model.bundle_config["expected_candidate_sha256"] = "a" * 64
+    _validate_rollout_qualification_config(config)
+
+
+def test_qualification_rejects_loaded_base_for_candidate_request(
+    tmp_path: Path,
+) -> None:
+    from alpagym_host.qualification_lifecycle import (
+        _require_loaded_source_matches_config,
+    )
+
+    candidate = tmp_path / "candidate" / "step_3"
+    candidate.mkdir(parents=True)
+    config = _qualification_config(tmp_path)
+    config.policy.model.bundle_config.update(
+        {
+            "qualification_model_source": "candidate_overlay",
+            "candidate_overlay_path": str(candidate),
+            "expected_candidate_sha256": "a" * 64,
+        }
+    )
+    with pytest.raises(ValueError, match="differs from the explicit config"):
+        _require_loaded_source_matches_config(
+            config=config,
+            loaded_source={"source_kind": "base_attested"},
+        )
+
+
+def test_qualification_rejects_loaded_candidate_with_a_different_digest(
+    tmp_path: Path,
+) -> None:
+    from alpagym_host.qualification_lifecycle import (
+        _require_loaded_source_matches_config,
+    )
+
+    candidate = tmp_path / "candidate" / "step_3"
+    candidate.mkdir(parents=True)
+    config = _qualification_config(tmp_path)
+    config.policy.model.bundle_config.update(
+        {
+            "qualification_model_source": "candidate_overlay",
+            "candidate_overlay_path": str(candidate),
+            "expected_candidate_sha256": "a" * 64,
+        }
+    )
+
+    with pytest.raises(ValueError, match="candidate SHA256"):
+        _require_loaded_source_matches_config(
+            config=config,
+            loaded_source={
+                "source_kind": "candidate_overlay",
+                "candidate_overlay": {
+                    "path": str(candidate),
+                    "candidate_sha256": "b" * 64,
+                },
+            },
+        )
 
 
 def test_cli_dispatches_rollout_without_entering_training(
@@ -116,17 +213,23 @@ def test_cli_dispatches_rollout_without_entering_training(
     assert f"Metrics manifest: {metrics}" in stdout
 
 
+@pytest.mark.parametrize(
+    "lifecycle_mode",
+    ("disabled", "formal", "formal_cleanup_failure", "formal_finalize_failure"),
+)
 def test_execute_qualification_rollout_bypasses_trainer_and_persists_raw_episode(
     tmp_path: Path,
     monkeypatch,
+    lifecycle_mode: str,
 ) -> None:
     from alpagym_host import qualification_lifecycle
     from alpagym_host.qualification_lifecycle import execute_qualification_rollout
-    from alpagym_runtime.alpasim.humanoid_policy_server import HumanoidSessionRecord
 
     config = _qualification_config(tmp_path)
+    if lifecycle_mode != "disabled":
+        config.execution.provenance_mode = ProvenanceMode.required
     output = _policy_output()
-    record = HumanoidSessionRecord(
+    record = SimpleNamespace(
         outputs=(output,),
         final_bootstrap_values={0: 1.25},
         behavior_policy_version=0,
@@ -160,6 +263,52 @@ def test_execute_qualification_rollout_bypasses_trainer_and_persists_raw_episode
         "resolve_alpasim_checkout",
         lambda config: tmp_path / "alpasim",
     )
+    provenance = None
+    if lifecycle_mode != "disabled":
+        monkeypatch.setattr(
+            qualification_lifecycle,
+            "_configure_formal_subprocess_environment",
+            lambda **kwargs: {"formal": "environment"},
+        )
+
+        class Provenance:
+            def capture_runtime_ready(self, **kwargs) -> None:
+                calls.append(("runtime_ready", kwargs))
+
+            def finalize(self, **kwargs) -> None:
+                calls.append(("finalize", kwargs))
+                if lifecycle_mode == "formal_finalize_failure":
+                    raise RuntimeError("formal finalization failed")
+
+        provenance = Provenance()
+
+        class ProvenanceFactory:
+            @staticmethod
+            def capture_prelaunch(**kwargs):
+                calls.append(("prelaunch", kwargs))
+                return provenance
+
+        monkeypatch.setattr(
+            qualification_lifecycle,
+            "FormalRunProvenance",
+            ProvenanceFactory,
+        )
+        monkeypatch.setattr(
+            qualification_lifecycle,
+            "_run_formal_import_probe",
+            lambda **kwargs: {"probe": "receipt"},
+        )
+
+        def cleanup_wizards(**kwargs) -> None:
+            calls.append(("formal_cleanup", kwargs))
+            if lifecycle_mode == "formal_cleanup_failure":
+                raise RuntimeError("formal cleanup failed")
+
+        monkeypatch.setattr(
+            qualification_lifecycle,
+            "_cleanup_wizard_processes",
+            cleanup_wizards,
+        )
 
     class Process:
         pass
@@ -189,6 +338,14 @@ def test_execute_qualification_rollout_bypasses_trainer_and_persists_raw_episode
     class Engine:
         requires_session_model_leases = False
 
+        def get_model(self):
+            return SimpleNamespace(
+                alpagym_inference_source_identity={
+                    "source_kind": "base_attested",
+                    "base_bundle": {"model_id": "test-base"},
+                }
+            )
+
         def run_loop(self) -> None:
             calls.append("engine_loop")
 
@@ -208,6 +365,11 @@ def test_execute_qualification_rollout_bypasses_trainer_and_persists_raw_episode
         qualification_lifecycle,
         "humanoid_policy_camera_required",
         lambda config: True,
+    )
+    monkeypatch.setattr(
+        qualification_lifecycle,
+        "build_simulation_request_proto",
+        lambda **kwargs: SimpleNamespace(**kwargs),
     )
 
     class Servicer:
@@ -261,16 +423,37 @@ def test_execute_qualification_rollout_bypasses_trainer_and_persists_raw_episode
 
     monkeypatch.setattr(qualification_lifecycle, "RuntimeServiceStub", RuntimeStub)
 
-    artifacts = execute_qualification_rollout(config)
+    if lifecycle_mode == "formal_cleanup_failure":
+        with pytest.raises(RuntimeError, match="formal cleanup failed"):
+            execute_qualification_rollout(config)
+    elif lifecycle_mode == "formal_finalize_failure":
+        with pytest.raises(RuntimeError, match="formal finalization failed"):
+            execute_qualification_rollout(config)
+    else:
+        execute_qualification_rollout(config)
 
-    episode = read_episode_json(artifacts.episode_manifest)
+    episode_path = next(config.artifact_paths.artifacts_dir.glob("hq_stairs_*.json"))
+    episode = read_episode_json(episode_path)
     assert episode.num_steps == 1
     assert episode.reward is not None and episode.reward.total == 3.5
     assert episode.policy_outputs[0].replay_data is not None
     assert "transition" not in episode.policy_outputs[0].replay_data.payload
-    assert artifacts.metrics_manifest.is_file()
-    metrics = artifacts.metrics_manifest.read_text(encoding="utf-8")
+    metrics_path = config.artifact_paths.artifacts_dir / "qualification_metrics.json"
+    assert metrics_path.is_file()
+    metrics = metrics_path.read_text(encoding="utf-8")
     assert '"humanoid_total_return": 3.5' in metrics
     assert '"humanoid_reward"' in metrics
+    assert '"source_kind": "base_attested"' in metrics
     assert not any(isinstance(call, tuple) and call[0] == "discard" for call in calls)
-    assert ("terminated", process) in calls
+    if lifecycle_mode == "disabled":
+        assert ("terminated", process) in calls
+    else:
+        runtime_ready = next(call for call in calls if call[0] == "runtime_ready")
+        assert runtime_ready[1]["workload_kind"] == "qualification_rollout"
+        assert runtime_ready[1]["import_probe"] == {"probe": "receipt"}
+        assert any(call[0] == "formal_cleanup" for call in calls)
+        finalize = next(call for call in calls if call[0] == "finalize")
+        assert finalize[1]["run_completed"] is True
+        assert (finalize[1]["cleanup_error"] is not None) is (
+            lifecycle_mode == "formal_cleanup_failure"
+        )

@@ -6,6 +6,11 @@ import re
 from pathlib import Path
 
 from alpagym_host.alpasim_dependency import validate_alpasim_checkout_cache
+from alpagym_host.checkpoint_resume import (
+    FORMAL_RUN_ID_PATTERN,
+    validate_checkpoint_resume_source,
+    validate_disabled_checkpoint_resume_contract,
+)
 from alpagym_host.config import (
     AllInOneSlurmTopologyConfig,
     AlpaSimConfig,
@@ -18,6 +23,7 @@ from alpagym_host.config import (
     HumanoidExecutionProfile,
     HumanoidPolicyCameraProfile,
     HumanoidReferenceControllerProfile,
+    ProvenanceMode,
     RunConfig,
     SeparateNodesSlurmTopologyConfig,
     SlurmConfig,
@@ -42,9 +48,16 @@ def validate_run_config(
     Raises:
         ValueError: The config cannot be executed safely.
     """
+    if config.cosmos.train.ckpt.save_mode not in {"sync", "async"}:
+        raise ValueError("cosmos.train.ckpt.save_mode must be 'sync' or 'async'")
     _validate_wizard_startup_config(
         config=config.alpasim,
         dataset=config.dataset,
+    )
+    _validate_provenance_config(config=config, requested_command=requested_command)
+    _validate_checkpoint_resume_config(
+        config=config,
+        requested_command=requested_command,
     )
     if requested_command == "rollout":
         _validate_rollout_qualification_config(config)
@@ -105,11 +118,183 @@ def validate_run_config(
         )
 
 
+def _validate_provenance_config(*, config: RunConfig, requested_command: str) -> None:
+    """Require resolvable local worktrees for fail-closed formal provenance."""
+    if config.execution.provenance_mode is ProvenanceMode.disabled:
+        return
+    if requested_command not in {"run", "rollout"}:
+        raise ValueError(
+            "execution.provenance_mode=required supports command=run or "
+            "command=rollout only"
+        )
+    if ExecutionBackend(config.execution.backend) is not ExecutionBackend.local_process:
+        raise ValueError(
+            "execution.provenance_mode=required only supports local_process"
+        )
+    if config.alpasim.repo_path is None:
+        raise ValueError(
+            "execution.provenance_mode=required needs an explicit alpasim.repo_path"
+        )
+    if (
+        requested_command == "run"
+        and config.cosmos.train.ckpt.enable_checkpoint
+        and config.cosmos.train.ckpt.save_mode != "sync"
+    ):
+        raise ValueError(
+            "execution.provenance_mode=required requires synchronous native "
+            "checkpoint persistence"
+        )
+    humanoid = config.alpasim.humanoid
+    if humanoid is None:
+        raise ValueError("execution.provenance_mode=required needs alpasim.humanoid")
+    for field_name, value in (
+        ("alpasim.repo_path", config.alpasim.repo_path),
+        ("alpasim.humanoid.repo_path", humanoid.repo_path),
+    ):
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            raise ValueError(f"{field_name} must be absolute for required provenance")
+        resolved = path.resolve(strict=True)
+        if not resolved.is_dir():
+            raise ValueError(
+                f"{field_name} must resolve to a directory for required provenance"
+            )
+
+
+def _validate_checkpoint_resume_config(
+    *,
+    config: RunConfig,
+    requested_command: str,
+) -> None:
+    """Admit only an exact checkpoint from a completed valid formal run."""
+
+    contract = config.cosmos.train.resume
+    if not contract.enabled:
+        validate_disabled_checkpoint_resume_contract(contract)
+        return
+    if requested_command != "run":
+        raise ValueError("cosmos.train.resume.enabled=true only supports command=run")
+    if config.execution.provenance_mode is not ProvenanceMode.required:
+        raise ValueError(
+            "cosmos.train.resume.enabled=true requires execution.provenance_mode=required"
+        )
+    current_run_id = Path(config.artifact_paths.run_dir).name
+    if FORMAL_RUN_ID_PATTERN.fullmatch(current_run_id) is None:
+        raise ValueError("checkpoint continuation requires a formal current run ID")
+    source = validate_checkpoint_resume_source(contract)
+    if source.prior_formal_run_dir == Path(config.artifact_paths.run_dir):
+        raise ValueError("checkpoint continuation cannot resume from its current run")
+    max_num_steps = config.cosmos.train.max_num_steps
+    if (
+        isinstance(max_num_steps, bool)
+        or not isinstance(max_num_steps, int)
+        or max_num_steps < (contract.expected_next_training_step or 0)
+    ):
+        raise ValueError(
+            "cosmos.train.max_num_steps must reach the declared "
+            "expected_next_training_step"
+        )
+    if config.cosmos.train.ckpt.enable_checkpoint is not True:
+        raise ValueError(
+            "checkpoint continuation requires cosmos.train.ckpt.enable_checkpoint=true"
+        )
+    scene_ids = config.dataset.scene_ids
+    if scene_ids is None or not scene_ids:
+        raise ValueError("checkpoint continuation requires explicit dataset.scene_ids")
+    n_generation = config.cosmos.rollout.n_generation
+    train_batch_per_replica = config.cosmos.train.train_batch_per_replica
+    policy_replicas = config.cosmos.launch.policy_replicas
+    num_epochs = config.cosmos.train.num_epochs
+    positive_integers = {
+        "cosmos.rollout.n_generation": n_generation,
+        "cosmos.train.train_batch_per_replica": train_batch_per_replica,
+        "cosmos.launch.policy_replicas": policy_replicas,
+        "cosmos.train.num_epochs": num_epochs,
+    }
+    for name, value in positive_integers.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer for continuation")
+    logical_samples = len(scene_ids) * n_generation * num_epochs
+    samples_per_update = train_batch_per_replica * policy_replicas
+    if logical_samples % samples_per_update != 0:
+        raise ValueError(
+            "checkpoint continuation requires the logical rollout sample count "
+            "to be divisible by the global training batch"
+        )
+    logical_total_steps = logical_samples // samples_per_update
+    checkpoint_step = contract.checkpoint_step
+    assert checkpoint_step is not None
+    if checkpoint_step >= logical_total_steps:
+        raise ValueError("checkpoint continuation source is already at the logical end")
+    expected_remaining_samples = (
+        logical_total_steps - checkpoint_step
+    ) * samples_per_update
+    if source.cursor.total_steps != logical_total_steps:
+        raise ValueError(
+            "checkpoint logical total_steps does not match the authored training horizon"
+        )
+    if source.cursor.remain_samples_num != expected_remaining_samples:
+        raise ValueError(
+            "checkpoint remaining sample cursor does not match the authored training horizon"
+        )
+    if source.cursor.is_final:
+        raise ValueError(
+            "checkpoint continuation cannot use a final logical checkpoint"
+        )
+    assert max_num_steps is not None
+    if max_num_steps > logical_total_steps:
+        raise ValueError(
+            "cosmos.train.max_num_steps cannot exceed the logical training horizon"
+        )
+    if (
+        config.cosmos.train.optm_warmup_steps != 0
+        or config.cosmos.train.optm_decay_type != "none"
+        or config.cosmos.train.optm_decay_ratio != 0.0
+    ):
+        raise ValueError(
+            "staged checkpoint continuation currently requires a constant LR schedule"
+        )
+    if config.alpasim.simulation_domain == "humanoid":
+        humanoid = config.alpasim.humanoid
+        if humanoid is None or humanoid.rollout_seed_base is None:
+            raise ValueError(
+                "humanoid checkpoint continuation requires rollout_seed_base"
+            )
+        resumed_seed_base = (
+            humanoid.rollout_seed_base + checkpoint_step * samples_per_update
+        )
+        if resumed_seed_base > (1 << 64) - 1:
+            raise ValueError("resumed rollout seed panel exceeds uint64")
+
+
 def _validate_wizard_startup_config(
     config: AlpaSimConfig,
     dataset: DatasetConfig,
 ) -> None:
     """Validate host-authored AlpaSim Wizard config before startup side effects."""
+    timeout_fields = {
+        "alpasim.startup_timeout_s": config.startup_timeout_s,
+        "alpasim.simulation_timeout_s": config.simulation_timeout_s,
+        "alpasim.runtime_rollout_timeout_s": config.runtime_rollout_timeout_s,
+        "alpasim.simulation_cleanup_margin_s": config.simulation_cleanup_margin_s,
+    }
+    for field_name, value in timeout_fields.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{field_name} must be finite and positive")
+    if (
+        config.runtime_rollout_timeout_s + config.simulation_cleanup_margin_s
+        > config.simulation_timeout_s
+    ):
+        raise ValueError(
+            "alpasim.simulation_timeout_s must be at least "
+            "runtime_rollout_timeout_s + simulation_cleanup_margin_s so AlpaSim "
+            "can return a structured timeout after bounded teardown"
+        )
     if not config.wizard_args.deploy:
         raise ValueError("config.wizard_args.deploy must be non-empty")
     if not config.wizard_args.topology:
@@ -244,6 +429,14 @@ def _validate_humanoid_config(config: RunConfig, *, training: bool = True) -> No
                 "motion_reference direct_v9_shaped.v1 requires the source "
                 "750-tick / 15-second horizon"
             )
+        if (
+            humanoid.reward_profile_id == "stable_support_route.v2"
+            and config.alpasim.wizard_args.n_sim_steps * outer_period_us != 30_000_000
+        ):
+            raise ValueError(
+                "motion_reference stable_support_route.v2 requires the "
+                "1500-tick / 30-second horizon"
+            )
         if config.policy.model.kind == "g1_vla":
             if (
                 humanoid.reference_controller_profile
@@ -263,6 +456,17 @@ def _validate_humanoid_config(config: RunConfig, *, training: bool = True) -> No
                 raise ValueError("g1_vla requires only vla_d435_policy_rgb")
             if training:
                 train_policy = config.cosmos.train.train_policy
+                train_seed = config.cosmos.train.seed
+                if (
+                    isinstance(train_seed, bool)
+                    or not isinstance(train_seed, int)
+                    or not 1 <= train_seed <= 2**32 - 1
+                ):
+                    raise ValueError(
+                        "g1_vla requires cosmos.train.seed in [1, 2**32 - 1]"
+                    )
+                if config.cosmos.train.deterministic is not True:
+                    raise ValueError("g1_vla requires cosmos.train.deterministic=true")
                 required_flow_values = {
                     "grpo_ratio_clip_low": 0.2,
                     "grpo_ratio_clip_high": 0.28,
@@ -294,8 +498,20 @@ def _validate_humanoid_config(config: RunConfig, *, training: bool = True) -> No
                         raise ValueError(f"g1_vla requires {name}={expected}")
                 if train_policy.ppo_normalize_advantages is not True:
                     raise ValueError("g1_vla requires ppo_normalize_advantages=true")
+                part_lrs = config.cosmos.train.optm_part_lrs
+                if len(part_lrs) != 2:
+                    raise ValueError(
+                        "g1_vla requires exactly two optm_part_lrs ordered as "
+                        "[action_header, critic]"
+                    )
+                action_lr, critic_lr = part_lrs
+                if action_lr > 1.0e-6:
+                    raise ValueError(
+                        "g1_vla action_header optm_part_lrs[0] must be at most 1e-6"
+                    )
+                if critic_lr != 1.0e-4:
+                    raise ValueError("g1_vla critic optm_part_lrs[1] must equal 0.0001")
                 required_optimizer_values = {
-                    "optm_part_lrs": [1.0e-6, 1.0e-4],
                     "epsilon": 1.0e-8,
                     "optm_weight_decay": 0.01,
                     "optm_betas": [0.9, 0.999],
@@ -303,7 +519,6 @@ def _validate_humanoid_config(config: RunConfig, *, training: bool = True) -> No
                     "optm_warmup_steps": 0,
                 }
                 actual_optimizer_values = {
-                    "optm_part_lrs": config.cosmos.train.optm_part_lrs,
                     "epsilon": config.cosmos.train.epsilon,
                     "optm_weight_decay": config.cosmos.train.optm_weight_decay,
                     "optm_betas": config.cosmos.train.optm_betas,
@@ -350,6 +565,55 @@ def _validate_rollout_qualification_config(config: RunConfig) -> None:
     if config.policy.inference.return_trace_for_rl:
         raise ValueError(
             "command=rollout requires policy.inference.return_trace_for_rl=false"
+        )
+    source_kind = config.policy.model.bundle_config.get("qualification_model_source")
+    candidate_value = config.policy.model.bundle_config.get("candidate_overlay_path")
+    expected_candidate_sha256 = config.policy.model.bundle_config.get(
+        "expected_candidate_sha256"
+    )
+    if source_kind == "base_attested":
+        if candidate_value not in (None, "") or expected_candidate_sha256 not in (
+            None,
+            "",
+        ):
+            raise ValueError(
+                "qualification_model_source=base_attested forbids "
+                "candidate_overlay_path and expected_candidate_sha256"
+            )
+    elif source_kind == "candidate_overlay":
+        if not isinstance(candidate_value, str) or not candidate_value:
+            raise ValueError(
+                "qualification_model_source=candidate_overlay requires "
+                "candidate_overlay_path"
+            )
+        candidate_path = Path(candidate_value).expanduser()
+        if not candidate_path.is_absolute():
+            raise ValueError("candidate_overlay_path must be an absolute path")
+        if (
+            not isinstance(expected_candidate_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_candidate_sha256) is None
+        ):
+            raise ValueError(
+                "qualification_model_source=candidate_overlay requires a lowercase "
+                "expected_candidate_sha256"
+            )
+        if candidate_path.is_symlink() or not candidate_path.is_dir():
+            raise ValueError(
+                "candidate_overlay_path must be an existing non-symlink directory"
+            )
+        manifest = candidate_path / "candidate_manifest.json"
+        if manifest.is_symlink() or not manifest.is_file():
+            raise ValueError(
+                "candidate_overlay_path must contain a regular candidate_manifest.json"
+            )
+        if candidate_path.resolve() == Path(config.policy.model.path).resolve():
+            raise ValueError(
+                "candidate overlay cannot replace the attested policy.model.path"
+            )
+    else:
+        raise ValueError(
+            "command=rollout requires an explicit qualification_model_source "
+            "of 'base_attested' or 'candidate_overlay'"
         )
 
 
@@ -624,6 +888,40 @@ def _validate_training_policy_config(config: RunConfig) -> None:
     ):
         raise ValueError(
             "PPO ppo_target_behavior_kl must be finite and positive when set"
+        )
+    if not isinstance(train_policy.ppo_behavior_kl_backtrack, bool):
+        raise ValueError("PPO ppo_behavior_kl_backtrack must be a boolean")
+    if (
+        train_policy.ppo_behavior_kl_backtrack
+        and train_policy.ppo_target_behavior_kl is None
+    ):
+        raise ValueError(
+            "PPO ppo_behavior_kl_backtrack requires ppo_target_behavior_kl"
+        )
+    if train_policy.ppo_behavior_kl_backtrack and (
+        isinstance(train_policy.grpo_optimization_iterations, bool)
+        or not isinstance(train_policy.grpo_optimization_iterations, int)
+        or train_policy.grpo_optimization_iterations != 1
+    ):
+        raise ValueError(
+            "PPO ppo_behavior_kl_backtrack requires grpo_optimization_iterations == 1"
+        )
+    if (
+        isinstance(train_policy.ppo_behavior_kl_backtrack_margin, bool)
+        or not isinstance(train_policy.ppo_behavior_kl_backtrack_margin, (int, float))
+        or not math.isfinite(train_policy.ppo_behavior_kl_backtrack_margin)
+        or not 0.0 < train_policy.ppo_behavior_kl_backtrack_margin < 1.0
+    ):
+        raise ValueError(
+            "PPO ppo_behavior_kl_backtrack_margin must be finite and in (0, 1)"
+        )
+    if (
+        isinstance(train_policy.ppo_behavior_kl_backtrack_max_attempts, bool)
+        or not isinstance(train_policy.ppo_behavior_kl_backtrack_max_attempts, int)
+        or train_policy.ppo_behavior_kl_backtrack_max_attempts <= 0
+    ):
+        raise ValueError(
+            "PPO ppo_behavior_kl_backtrack_max_attempts must be a positive integer"
         )
 
 

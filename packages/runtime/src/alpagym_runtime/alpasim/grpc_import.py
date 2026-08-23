@@ -14,6 +14,7 @@ from typing import Any, Mapping
 
 
 _HUMANOID_REQUIRED_FIELDS: Mapping[str, frozenset[str]] = {
+    "HumanoidSessionAbortRequest": frozenset({"session_uuid"}),
     "HumanoidPolicySessionRequest": frozenset(
         {
             "joint_names",
@@ -89,6 +90,15 @@ _HUMANOID_REQUIRED_FIELDS: Mapping[str, frozenset[str]] = {
     ),
 }
 
+_HUMANOID_REQUIRED_SERVICE_METHOD_INPUTS: Mapping[str, Mapping[str, str]] = {
+    "HumanoidPolicyService": {
+        "abort_session": "HumanoidSessionAbortRequest",
+    },
+    "HumanoidDynamicsService": {
+        "abort_session": "HumanoidSessionAbortRequest",
+    },
+}
+
 _HUMANOID_POLICY_CAMERA_REQUIRED_FIELDS: Mapping[str, frozenset[str]] = {
     "HumanoidPolicySessionRequest": frozenset({"policy_camera_spec"}),
     "HumanoidPolicyCameraSpec": frozenset(
@@ -117,8 +127,19 @@ _HUMANOID_POLICY_CAMERA_REQUIRED_FIELDS: Mapping[str, frozenset[str]] = {
             "camera_contract_sha256",
             "image_sha256",
             "render_receipt_sha256",
+            "scene_fingerprint",
+            "model_signature_sha256",
+            "camera_to_world_sha256",
+            "renderer_binding_sha256",
         }
     ),
+}
+
+_HUMANOID_POLICY_CAMERA_EVIDENCE_FIELD_NUMBERS: Mapping[str, int] = {
+    "scene_fingerprint": 13,
+    "model_signature_sha256": 14,
+    "camera_to_world_sha256": 15,
+    "renderer_binding_sha256": 16,
 }
 
 _HUMANOID_REQUIRED_ENUM_VALUES: Mapping[str, frozenset[str]] = {
@@ -156,9 +177,11 @@ _RUNTIME_REQUIRED_FIELDS: Mapping[str, frozenset[str]] = {
 def ensure_alpasim_grpc_source(root: str | Path | None = None) -> None:
     """Optionally prepend an explicit local AlpaSim gRPC development tree.
 
-    Normal runs use the exact ``alpasim-grpc`` revision in ``uv.lock``.
-    ``ALPASIM_GRPC_ROOT`` is an opt-in override for testing uncommitted generated
-    protobuf sources; the host lifecycle never sets it automatically.
+    Portable runs use the exact ``alpasim-grpc`` revision in ``uv.lock``.
+    ``ALPASIM_GRPC_ROOT`` is an explicit override for a matching local AlpaSim
+    source tree. Formal local-repository runs set it in their recorded launch
+    environment and validate the imported module origins and descriptors before
+    starting runtime services.
     """
     configured_root = root if root is not None else os.environ.get("ALPASIM_GRPC_ROOT")
     if configured_root is None:
@@ -203,7 +226,8 @@ def ensure_humanoid_policy_camera_abi() -> None:
         raise RuntimeError(
             "strict humanoid policy camera requires a matching alpasim-grpc "
             "build with HumanoidPolicyCameraSpec, image/render receipt fields, "
-            "and alpasim_grpc.v0.humanoid_contracts. Install the matching "
+            "renderer evidence fields, and alpasim_grpc.v0.humanoid_contracts. "
+            "Install the matching "
             "AlpaSim gRPC package or set ALPASIM_GRPC_ROOT to its src/grpc "
             "directory."
         ) from exc
@@ -241,6 +265,18 @@ def _validate_humanoid_policy_camera_abi(
         source=source,
     )
     messages = descriptor.message_types_by_name
+    camera_image = messages["HumanoidCameraImage"]
+    for (
+        field_name,
+        expected_number,
+    ) in _HUMANOID_POLICY_CAMERA_EVIDENCE_FIELD_NUMBERS.items():
+        actual_number = getattr(camera_image.fields_by_name[field_name], "number", None)
+        if actual_number != expected_number:
+            raise RuntimeError(
+                f"{source} is incompatible with the strict humanoid wire ABI: "
+                f"field {field_name!r} must use protobuf tag {expected_number}, "
+                f"got {actual_number!r}"
+            )
     _validate_message_field_type(
         owner=messages["HumanoidPolicySessionRequest"],
         field_name="policy_camera_spec",
@@ -257,6 +293,7 @@ def _validate_humanoid_policy_camera_abi(
     expected_schemas = {
         "HUMANOID_RENDER_STATE_SCHEMA": "humanoid_render_state_qpos.v1",
         "HUMANOID_RENDER_RECEIPT_SCHEMA": "humanoid_render_receipt.v1",
+        "HUMANOID_RENDER_RECEIPT_V2_SCHEMA": "humanoid_render_receipt.v2",
     }
     for name, expected in expected_schemas.items():
         if getattr(humanoid_contracts, name, None) != expected:
@@ -267,6 +304,7 @@ def _validate_humanoid_policy_camera_abi(
         "HumanoidRenderState",
         "humanoid_image_sha256",
         "humanoid_render_receipt_sha256",
+        "humanoid_render_receipt_v2_sha256",
     ):
         if not callable(getattr(humanoid_contracts, name, None)):
             raise RuntimeError(
@@ -347,6 +385,11 @@ def _validate_humanoid_grpc_abi() -> None:
         _HUMANOID_REQUIRED_FIELDS,
         source="alpasim_grpc.v0.humanoid_pb2",
     )
+    _validate_descriptor_service_methods(
+        humanoid_pb2.DESCRIPTOR,
+        _HUMANOID_REQUIRED_SERVICE_METHOD_INPUTS,
+        source="alpasim_grpc.v0.humanoid_pb2",
+    )
     _validate_humanoid_reference_decode_context_abi(
         humanoid_pb2.DESCRIPTOR,
         humanoid_contracts,
@@ -394,6 +437,41 @@ def _validate_descriptor_fields(
                 "Use the matching AlpaSim checkout or set ALPASIM_GRPC_ROOT to its "
                 "src/grpc directory."
             )
+
+
+def _validate_descriptor_service_methods(
+    descriptor: Any,
+    requirements: Mapping[str, Mapping[str, str]],
+    *,
+    source: str,
+) -> None:
+    """Require lifecycle RPCs and bind each one to its exact request type."""
+    messages = descriptor.message_types_by_name
+    services = descriptor.services_by_name
+    for service_name, required_methods in requirements.items():
+        service = services.get(service_name)
+        if service is None:
+            raise RuntimeError(
+                f"{source} is incompatible with the humanoid PPO ABI: "
+                f"missing service {service_name!r}. Use the matching AlpaSim "
+                "checkout or set ALPASIM_GRPC_ROOT to its src/grpc directory."
+            )
+        for method_name, request_name in required_methods.items():
+            method = service.methods_by_name.get(method_name)
+            if method is None:
+                raise RuntimeError(
+                    f"{source} is incompatible with the humanoid PPO ABI: service "
+                    f"{service_name!r} is missing method {method_name!r}. Use the "
+                    "matching AlpaSim checkout or set ALPASIM_GRPC_ROOT to its "
+                    "src/grpc directory."
+                )
+            expected_input = messages.get(request_name)
+            if expected_input is None or method.input_type is not expected_input:
+                raise RuntimeError(
+                    f"{source} is incompatible with the humanoid PPO ABI: service "
+                    f"{service_name!r} method {method_name!r} must accept "
+                    f"{request_name!r}"
+                )
 
 
 def _validate_descriptor_enums(

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ from alpagym_host.config import (
     ExecutionBackend,
     HumanoidExecutionProfile,
     HumanoidReferenceControllerProfile,
+    HumanoidSceneCachePolicy,
     alpagym_project_root,
 )
 
@@ -32,6 +34,8 @@ _MOTION_REFERENCE_RESERVED_OVERRIDE_PREFIXES = (
     "runtime.humanoid.controller",
     "runtime.humanoid.policy_camera",
     "runtime.humanoid.num_envs",
+    "runtime.humanoid.session_cleanup_timeout_s",
+    "runtime.rollout_timeout_s",
     "defines.humanoid_repo",
     "defines.humanoid_scene_store",
     "defines.humanoid_scene_cache",
@@ -110,6 +114,7 @@ def _build_wizard_command(
         f"runtime.simulation_config.force_gt_duration_us={wizard_args.force_gt_duration_us}",
         f"runtime.simulation_config.control_timestep_us={wizard_args.control_timestep_us}",
         f"runtime.simulation_config.n_sim_steps={wizard_args.n_sim_steps}",
+        f"runtime.rollout_timeout_s={config.runtime_rollout_timeout_s}",
     ]
     if wizard_args.driver is not None:
         argv.append(f"driver={wizard_args.driver}")
@@ -156,6 +161,8 @@ def _build_wizard_command(
                     "cameras="
                     f"{config.humanoid.policy_camera_profile.wizard_config_group}",
                     f"defines.humanoid_scene_cache={config.humanoid.scene_cache_path}",
+                    "runtime.humanoid.policy_camera.options.cache_policy="
+                    + config.humanoid.scene_cache_policy.value,
                 )
             )
         # Direct-action tasks consume these through registration_options;
@@ -236,6 +243,10 @@ def _build_wizard_command(
                     "defines.humanoid_robot_physics_profile="
                     + json.dumps(config.humanoid.robot_physics_profile)
                 )
+                argv.append(
+                    "runtime.humanoid.controller.options.visual_cache_policy="
+                    + config.humanoid.scene_cache_policy.value
+                )
                 if config.humanoid.policy_camera_profile is None:
                     argv.append(
                         "defines.humanoid_scene_cache="
@@ -246,6 +257,18 @@ def _build_wizard_command(
         _reject_motion_reference_reserved_overrides(extra_overrides)
     argv.extend(extra_overrides)
     if reference_mode:
+        checkout_root = checkout_root.resolve()
+        argv.extend(
+            (
+                f"services.runtime.volumes.3={checkout_root / 'src'}:/repo/src:ro",
+                "services.runtime.volumes.4="
+                f"{checkout_root / 'plugins'}:/repo/plugins:ro",
+                "services.humanoid_dynamics.volumes.0="
+                f"{checkout_root / 'src'}:/repo/src:ro",
+                "services.humanoid_dynamics.volumes.1="
+                f"{checkout_root / 'plugins'}:/repo/plugins:ro",
+            )
+        )
         # The motion-reference wire contract advances the trusted controller at
         # 20 ms inside each host-authored outer policy step. Derive its terminal
         # horizon from the outer rollout horizon so the two cannot drift.
@@ -290,7 +313,17 @@ def start_wizard(
         is HumanoidReferenceControllerProfile.sonic_visual
     ):
         assert config.humanoid.scene_cache_path is not None
-        Path(config.humanoid.scene_cache_path).mkdir(parents=True, exist_ok=True)
+        scene_cache_path = Path(config.humanoid.scene_cache_path)
+        if (
+            config.humanoid.scene_cache_policy
+            is HumanoidSceneCachePolicy.build_if_missing
+        ):
+            scene_cache_path.mkdir(parents=True, exist_ok=True)
+        elif not scene_cache_path.is_dir():
+            raise FileNotFoundError(
+                "required humanoid scene cache directory does not exist: "
+                f"{scene_cache_path}"
+            )
     argv = _build_wizard_command(
         config=config,
         execution_backend=execution_backend,
@@ -308,6 +341,7 @@ def start_wizard(
     env = os.environ.copy()
     env.pop("UV_PROJECT_ENVIRONMENT", None)
     env.pop("VIRTUAL_ENV", None)
+    env["COMPOSE_PROJECT_NAME"] = wizard_compose_project(alpasim_run_dir)
     logging.info("Starting AlpaSim Wizard in %s: %s", cwd, argv)
     # `start_new_session=True` puts Wizard in its own process group so the caller
     # can SIGTERM the whole tree (Wizard + docker-compose children) via
@@ -319,6 +353,15 @@ def start_wizard(
         env=env,
         text=True,
     )
+
+
+def wizard_compose_project(alpasim_run_dir: Path) -> str:
+    """Return the exact Docker Compose project pinned into one Wizard launch."""
+    normalized_path = os.fsencode(alpasim_run_dir.expanduser().resolve())
+    digest = hashlib.sha256(
+        b"alpagym.wizard.compose_project.v1\0" + normalized_path
+    ).hexdigest()[:24]
+    return f"alpagym_{digest}"
 
 
 def ensure_process_terminated(

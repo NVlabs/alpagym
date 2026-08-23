@@ -5,7 +5,10 @@ defaults:
   - override /topology: local_colocated_1gpu
 
 # One-GPU colocated Flow-PPO rollout with a one-second H50 buffer.
-expected_valid_steps: 30
+expected_valid_steps: 60
+
+execution:
+  provenance_mode: required
 
 dataset:
   test_suite_id: null
@@ -17,6 +20,12 @@ policy:
 
 alpasim:
   simulation_domain: humanoid
+  # A cold 30 s visual-SONIC episode can take ~12 wall-clock minutes on one
+  # GPU.  Keep the runtime's deterministic timeout below the host gRPC
+  # deadline, with a full minute for bounded teardown and response delivery.
+  runtime_rollout_timeout_s: 1200.0
+  simulation_cleanup_margin_s: 60.0
+  simulation_timeout_s: 1260.0
   humanoid:
     repo_path: ???
     scene_store_path: ???
@@ -33,6 +42,9 @@ alpasim:
     robot_physics_profile: sonic.isaac_training.g1_cylinder_model_12.mujoco_port.v1
     policy_camera_profile: vla_d435_native
     scene_cache_path: ???
+    # Simulation consumes a prebuilt, fingerprint-bound cache. Cache generation
+    # belongs to scene preparation and is never an implicit training side effect.
+    scene_cache_policy: require
     num_envs: 1
     rollout_seed_base: 292285
     # ckpt1500 in-distribution qualification start. This changes only the
@@ -43,34 +55,46 @@ alpasim:
     # The base humanoid image omits Open3D/Embree/gsplat/MuJoCo-Warp.  Use a
     # dependency-complete combined runtime+dynamics image for the local profile.
     service_image: alpasim-humanoid-nurec:local
-    # Pinned local V9 MuJoCo formula snapshot. In motion-reference mode its
-    # action terms use the 23-D VideoMimic equivalent of GRAIL's executed 29-D
-    # position target; the checkpoint itself does not embed a reward hash.
-    reward_profile_id: direct_v9_shaped.v1
+    # Controller-independent task reward over realized route progress and
+    # contact-certified foot support. The checkpoint does not embed a reward hash.
+    reward_profile_id: stable_support_route.v2
   wizard_args:
     force_gt_duration_us: 0
     # Match the native evaluator's action_exec_horizon=15: one policy decision
     # owns 0.5 s = 25 Visual Sonic controller ticks.
     control_timestep_us: 500_000
-    n_sim_steps: 30
+    n_sim_steps: 60
 
 cosmos:
   train:
     train_batch_per_replica: 4
     max_num_steps: 1
     num_epochs: 1
-    optm_lr: 1.0e-6
+    # The critic is initialized with the trainer RNG before its first rollout.
+    # Pin both the RNG and deterministic kernels so LR/reward comparisons share
+    # the same initial value function and minibatch order.
+    seed: 20260822
+    deterministic: true
+    # Real replay calibration places 2.5e-9 near the 0.003 behavior-KL trust
+    # region; actor-step backtracking supplies the hard bound across batches.
+    optm_lr: 2.5e-9
     # Cosmos applies these to separate_model_parts(): action head, then critic.
-    optm_part_lrs: [1.0e-6, 1.0e-4]
+    optm_part_lrs: [2.5e-9, 1.0e-4]
     optm_warmup_steps: 0
     epsilon: 1.0e-8
     optm_weight_decay: 0.01
     optm_betas: [0.9, 0.999]
     optm_grad_norm_clip: 1.0
-    # VLA's current export loader is content-attested against the original
-    # source bundle and is not a standalone Hugging Face checkpoint.
+    # Save portable, content-addressed trainable overlays alongside Cosmos's
+    # optimizer/resume checkpoints.  The single-GPU cycle stops for frozen dev
+    # qualification every five updates, so every boundary must be loadable and
+    # all ten boundaries plus the initial/final safety margin are retained.
     ckpt:
-      export_safetensors: false
+      enable_checkpoint: true
+      save_freq: 5
+      save_mode: sync
+      export_safetensors: true
+      max_keep: 11
     train_policy:
       trainer_type: alpagym_flow_ppo
       allowed_outdated_steps: 0
@@ -95,8 +119,12 @@ cosmos:
       ppo_value_clip_range: 0.2
       ppo_value_huber_delta: 10.0
       ppo_normalize_advantages: true
-      # Calibrate from observed post-update behavior KL before enabling a guard.
-      ppo_target_behavior_kl: null
+      # Keep every accepted actor update within the measured behavior-policy
+      # trust region; retry an oversized step instead of publishing it.
+      ppo_target_behavior_kl: 0.003
+      ppo_behavior_kl_backtrack: true
+      ppo_behavior_kl_backtrack_margin: 0.9
+      ppo_behavior_kl_backtrack_max_attempts: 4
   rollout:
     n_generation: 4
     batch_size: 1

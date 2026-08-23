@@ -18,7 +18,7 @@ import yaml
 from alpagym_runtime.alpasim.grpc_import import ensure_alpasim_grpc_source
 
 ensure_alpasim_grpc_source()
-from alpagym_host.config import ExecutionBackend, load_run_config
+from alpagym_host.config import ExecutionBackend, RunConfig, load_run_config
 from alpagym_host.endpoint_registry import (
     FileTopologyRegistry,
     TopologyEndpoint,
@@ -46,6 +46,35 @@ from alpagym_runtime.policies.factory import (
 logger = logging.getLogger(__name__)
 
 _MAX_GRPC_MSG_SIZE = 256 * 1024 * 1024  # 256 MiB; matches AlpaSim runtime defaults.
+
+
+def _effective_humanoid_rollout_seed_base(run_config: RunConfig) -> int | None:
+    """Advance the deterministic rollout panel past a resumed checkpoint.
+
+    Each completed policy update consumes one global training batch.  A staged
+    continuation must therefore start after every rollout assigned to the
+    completed updates instead of replaying the original seed panel.
+    """
+
+    humanoid = run_config.alpasim.humanoid
+    if humanoid is None:
+        raise ValueError("humanoid simulation requires alpasim.humanoid config")
+    seed_base = humanoid.rollout_seed_base
+    resume = run_config.cosmos.train.resume
+    if not resume.enabled:
+        return seed_base
+    if seed_base is None:
+        raise ValueError("checkpoint continuation requires rollout_seed_base")
+    if resume.checkpoint_step is None:
+        raise ValueError("enabled checkpoint continuation requires checkpoint_step")
+    rollouts_per_update = (
+        run_config.cosmos.train.train_batch_per_replica
+        * run_config.cosmos.launch.policy_replicas
+    )
+    effective_seed_base = seed_base + resume.checkpoint_step * rollouts_per_update
+    if effective_seed_base > (1 << 64) - 1:
+        raise ValueError("resumed rollout seed panel exceeds uint64")
+    return effective_seed_base
 
 
 @RolloutRegistry.register("alpagym_rollout", allow_override=True)
@@ -221,7 +250,9 @@ class AlpagymRollout(RolloutBase):
                 control_timestep_us=self._run_config.alpasim.wizard_args.control_timestep_us,
                 expected_num_envs=humanoid_config.num_envs,
                 max_transition_rows=self._run_config.expected_valid_steps,
-                rollout_seed_base=humanoid_config.rollout_seed_base,
+                rollout_seed_base=_effective_humanoid_rollout_seed_base(
+                    self._run_config
+                ),
             )
         self._worker = StreamingRolloutWorker(**worker_kwargs)
 

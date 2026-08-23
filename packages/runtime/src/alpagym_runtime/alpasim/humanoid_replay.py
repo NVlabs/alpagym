@@ -300,6 +300,8 @@ def _motion_reference_receipt(
             raise ValueError("predecessor replay has invalid reference identity")
 
     primitive_rewards: list[float] = []
+    actor_primitive_rewards: list[float] = []
+    actor_primitive_reward_mask: list[bool] = []
     previous_timestamp: int | None = None
     applied_hashes: list[str] = []
     seen_source = False
@@ -393,6 +395,39 @@ def _motion_reference_receipt(
         if not math.isfinite(reward):
             raise ValueError("feedback tick reward is non-finite")
         primitive_rewards.append(reward)
+        tick_metrics = tick.get("metrics", {})
+        if not isinstance(tick_metrics, Mapping):
+            raise TypeError("feedback tick metrics must be a mapping")
+        stable_dense_names = (
+            "stable_support_reward_progress",
+            "stable_support_reward_height",
+        )
+        stable_reward_tick = any(name in tick_metrics for name in stable_dense_names)
+        predecessor_owned_name = "stable_support_reward_dense_predecessor_owned"
+        if stable_reward_tick and predecessor_owned_name not in tick_metrics:
+            raise ValueError(
+                "stable-support feedback is missing predecessor-owned dense reward"
+            )
+        predecessor_owned_dense = float(tick_metrics.get(predecessor_owned_name, 0.0))
+        if not math.isfinite(predecessor_owned_dense) or predecessor_owned_dense < 0.0:
+            raise ValueError(
+                "predecessor-owned dense reward must be finite and non-negative"
+            )
+        if stable_reward_tick:
+            stable_dense_reward = sum(
+                float(tick_metrics.get(name, 0.0)) for name in stable_dense_names
+            )
+            if (
+                not math.isfinite(stable_dense_reward)
+                or predecessor_owned_dense > max(stable_dense_reward, 0.0) + 1.0e-6
+            ):
+                raise ValueError(
+                    "predecessor-owned dense reward exceeds stable-support dense reward"
+                )
+        actor_primitive_rewards.append(
+            reward - predecessor_owned_dense if segment == "source" else reward
+        )
+        actor_primitive_reward_mask.append(segment == "source")
         tick_terminated = bool(tick.get("terminated", False))
         tick_truncated = bool(tick.get("truncated", False))
         if tick_terminated and tick_truncated:
@@ -426,6 +461,8 @@ def _motion_reference_receipt(
         {
             "primitive_rewards": primitive_rewards,
             "primitive_reward_mask": [True] * len(primitive_rewards),
+            "actor_primitive_rewards": actor_primitive_rewards,
+            "actor_primitive_reward_mask": actor_primitive_reward_mask,
             "duration_ticks": len(ticks),
             "owning_reference_executed_ticks": source_tick_count,
             "actor_valid": source_tick_count > 0,

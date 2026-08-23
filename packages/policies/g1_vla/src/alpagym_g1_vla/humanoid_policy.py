@@ -18,6 +18,7 @@ from alpasim_grpc.v0.humanoid_contracts import (
 )
 from alpagym_runtime.alpasim.humanoid_policy_server import (
     HUMANOID_EXECUTION_MODE_MOTION_REFERENCE,
+    HUMANOID_VISUAL_INPUT_MANIFEST_SCHEMA,
     MOTION_REFERENCE_JOINT_NAMES,
     HumanoidCameraFrame,
     HumanoidMotionReference,
@@ -26,6 +27,8 @@ from alpagym_runtime.alpasim.humanoid_policy_server import (
     HumanoidPolicyInput,
     HumanoidPolicyStepOutput,
     HumanoidRealizedFeedbackTrace,
+    humanoid_model_input_tensor_sha256,
+    humanoid_visual_input_manifest_sha256,
 )
 from alpagym_runtime.replay import ActionSelection, PolicyReplayData
 
@@ -39,6 +42,7 @@ from alpagym_g1_vla.bundle import (
 )
 from alpagym_g1_vla.history import (
     VlaImageHistory,
+    VlaImageSourceIdentity,
     decode_legacy_d455_letterbox,
     decode_native_d435,
     stable_episode_int,
@@ -286,10 +290,12 @@ class G1VlaHumanoidPolicy:
         for policy_input in policy_inputs:
             lane = self._lane(policy_input, actor_critic)
             self._validate_lifecycle(policy_input, sample_actions=sample_actions)
-            visual_inputs, replay_visual = self._observation_inputs(
-                lane=lane,
-                policy_input=policy_input,
-                actor_critic=actor_critic,
+            visual_inputs, replay_visual, visual_input_manifest = (
+                self._observation_inputs(
+                    lane=lane,
+                    policy_input=policy_input,
+                    actor_critic=actor_critic,
+                )
             )
             rtc = self._rtc_inputs(
                 lane=lane,
@@ -333,6 +339,7 @@ class G1VlaHumanoidPolicy:
                 policy_input=policy_input,
                 sample=sample,
                 replay_visual=replay_visual,
+                visual_input_manifest=visual_input_manifest,
                 rtc=rtc,
                 actor_critic=actor_critic,
             )
@@ -531,12 +538,31 @@ class G1VlaHumanoidPolicy:
         lane: _Lane,
         policy_input: HumanoidPolicyInput,
         actor_critic: VlaPsiActorCritic,
-    ) -> tuple[_VisualInputs, dict[str, torch.Tensor]]:
+    ) -> tuple[_VisualInputs, dict[str, torch.Tensor], dict[str, object]]:
         """Build and freeze the exact native Psi visual/proprio condition."""
         if len(policy_input.camera_frames) != 1:
             raise ValueError("VLA policy requires exactly one current D435 frame")
         frame = policy_input.camera_frames[0]
         self._validate_same_shot_state(policy_input, frame)
+        if hashlib.sha256(frame.image_bytes).hexdigest() != frame.image_sha256:
+            raise ValueError("VLA source JPEG digest changed after camera routing")
+        source_identity = VlaImageSourceIdentity(
+            env_id=frame.env_id,
+            frame_start_us=frame.frame_start_us,
+            frame_end_us=frame.frame_end_us,
+            logical_id=frame.logical_id,
+            byte_length=len(frame.image_bytes),
+            render_timestamp_us=frame.render_timestamp_us,
+            observation_decision_id=frame.observation_decision_id,
+            render_state_sha256=frame.render_state_sha256,
+            camera_contract_sha256=frame.camera_contract_sha256,
+            image_sha256=frame.image_sha256,
+            render_receipt_sha256=frame.render_receipt_sha256,
+            scene_fingerprint=frame.scene_fingerprint,
+            model_signature_sha256=frame.model_signature_sha256,
+            camera_to_world_sha256=frame.camera_to_world_sha256,
+            renderer_binding_sha256=frame.renderer_binding_sha256,
+        )
         preprocess_profile = self._bundle_profile.camera_preprocess_profile
         if preprocess_profile == (
             "psi_resize_nearest_224x224_center_crop_224x224_no_letterbox.v1"
@@ -552,8 +578,7 @@ class G1VlaHumanoidPolicy:
             raise ValueError("VLA bundle uses an unsupported camera preprocess ABI")
         selected = lane.history.select_with_current(
             current,
-            timestamp_us=frame.render_timestamp_us,
-            capture_receipt_sha256=frame.render_receipt_sha256,
+            source_identity=source_identity,
         )
         prepared: tuple[Any, ...] = ()
         try:
@@ -661,7 +686,39 @@ class G1VlaHumanoidPolicy:
         }
         replay_visual["effective_image_grid_thw"] = _cpu_clone(effective_grid)
         replay_visual["visual_pool_factors"] = _cpu_clone(pool_factors)
-        return model_inputs, replay_visual
+        selected_identities = lane.history.last_selected_source_identities
+        if len(selected_identities) != image_count:
+            raise AssertionError(
+                "VLA selected image identities differ from processor input"
+            )
+        source_frames = [
+            identity.manifest_entry(
+                role="current" if index == image_count - 1 else "history"
+            )
+            for index, identity in enumerate(selected_identities)
+        ]
+        visual_input_manifest: dict[str, object] = {
+            "schema": HUMANOID_VISUAL_INPUT_MANIFEST_SCHEMA,
+            "session_uuid": policy_input.session_uuid,
+            "episode_id": int(policy_input.episode_id),
+            "step_index": int(policy_input.step_index),
+            "timestamp_us": int(policy_input.timestamp_us),
+            "env_id": int(policy_input.env_id),
+            "decision_id": int(policy_input.decision_id),
+            "camera_logical_id": frame.logical_id,
+            "image_format": self._image_format,
+            "preprocess_profile": preprocess_profile,
+            "instruction_sha256": self._instruction_sha256,
+            "source_frames": source_frames,
+            "pixel_values": {
+                "dtype": str(replay_visual["pixel_values"].dtype),
+                "shape": list(replay_visual["pixel_values"].shape),
+                "sha256": humanoid_model_input_tensor_sha256(
+                    replay_visual["pixel_values"]
+                ),
+            },
+        }
+        return model_inputs, replay_visual, visual_input_manifest
 
     @staticmethod
     def _apply_checkpoint_eval_image_transform(
@@ -839,6 +896,7 @@ class G1VlaHumanoidPolicy:
         policy_input: HumanoidPolicyInput,
         sample: VlaPolicySample | VlaQualificationSample | Any,
         replay_visual: dict[str, torch.Tensor],
+        visual_input_manifest: dict[str, object],
         rtc: _RtcInputs,
         actor_critic: VlaPsiActorCritic,
     ) -> HumanoidPolicyStepOutput:
@@ -934,6 +992,9 @@ class G1VlaHumanoidPolicy:
         ):
             raise AssertionError("VLA sampler changed the fixed RTC prefix")
         payload: dict[str, Any] = dict(replay_visual)
+        visual_input_manifest_sha256 = humanoid_visual_input_manifest_sha256(
+            visual_input_manifest
+        )
         payload.update(
             {
                 "sampling_mode": self._sampling_mode,
@@ -953,6 +1014,7 @@ class G1VlaHumanoidPolicy:
                 "camera_render_receipt_sha256": policy_input.camera_frames[
                     0
                 ].render_receipt_sha256,
+                "visual_input_manifest_sha256": visual_input_manifest_sha256,
                 "humanoid": {"vla_raw_action_rows": rows.clone()},
             }
         )
@@ -1090,6 +1152,7 @@ class G1VlaHumanoidPolicy:
             value=value,
             replay_data=replay,
             model_extra={
+                "humanoid_visual_input_manifest": visual_input_manifest,
                 "vla_history_frame_count": int(
                     replay_visual["selected_history_indices"].numel()
                 ),

@@ -52,6 +52,7 @@ from alpasim_grpc.v0.humanoid_pb2 import (
     HumanoidPolicyRequest,
     HumanoidPolicyResponse,
     HumanoidPolicySessionRequest,
+    HumanoidSessionAbortRequest,
     HumanoidSessionCloseRequest,
 )
 from alpasim_grpc.v0.humanoid_pb2_grpc import (
@@ -69,6 +70,7 @@ logger = logging.getLogger(__name__)
 
 _LOWERCASE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MOTION_REFERENCE_SCHEMA_H50 = "g1_motion_reference_29d_50hz_h50.v1"
+HUMANOID_VISUAL_INPUT_MANIFEST_SCHEMA = "alpagym.humanoid_visual_input.v1"
 HUMANOID_FEEDBACK_STATE_CONTRACT_SCHEMA = (
     "alpagym.humanoid_feedback_state.named_joint_order.v1"
 )
@@ -121,6 +123,10 @@ class HumanoidCameraFrame:
     camera_contract_sha256: str
     image_sha256: str
     render_receipt_sha256: str
+    scene_fingerprint: str
+    model_signature_sha256: str
+    camera_to_world_sha256: str
+    renderer_binding_sha256: str
 
     @property
     def policy_joint_position(self) -> tuple[float, ...]:
@@ -146,6 +152,10 @@ class HumanoidCameraFrameIdentity:
     camera_contract_sha256: str
     image_sha256: str
     render_receipt_sha256: str
+    scene_fingerprint: str
+    model_signature_sha256: str
+    camera_to_world_sha256: str
+    renderer_binding_sha256: str
 
 
 @dataclass(frozen=True)
@@ -325,6 +335,9 @@ class _Session:
     outputs: list[PolicyOutput] = field(default_factory=list)
     final_bootstrap_values: dict[int, float] = field(default_factory=dict)
     last_control_episode_steps: dict[int, int] = field(default_factory=dict)
+    routed_current_camera_ledger: dict[
+        tuple[int, int], list[HumanoidCameraFrameIdentity]
+    ] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def consume_step_index(self) -> int:
@@ -338,6 +351,56 @@ class _Session:
         """Append policy outputs in env-lane order."""
         with self.lock:
             self.outputs.extend(outputs)
+
+    def prior_current_camera_identities(
+        self,
+        policy_input: HumanoidPolicyInput,
+    ) -> tuple[HumanoidCameraFrameIdentity, ...]:
+        """Return the previously accepted strict-camera ledger for one episode lane."""
+
+        if self.policy_camera_contract is None:
+            return ()
+        key = (int(policy_input.episode_id), int(policy_input.env_id))
+        with self.lock:
+            return tuple(self.routed_current_camera_ledger.get(key, ()))
+
+    def record_validated_current_camera_identities(
+        self,
+        policy_inputs: tuple[HumanoidPolicyInput, ...],
+    ) -> None:
+        """Commit routed current identities only after all outputs validate."""
+
+        if self.policy_camera_contract is None:
+            return
+        with self.lock:
+            pending = {
+                key: list(identities)
+                for key, identities in self.routed_current_camera_ledger.items()
+            }
+            for policy_input in policy_inputs:
+                if len(policy_input.camera_frames) != 1:
+                    raise ValueError(
+                        "strict policy-camera ledger requires one current frame"
+                    )
+                identity = _camera_frame_identity(policy_input.camera_frames[0])
+                if identity.sha256 != identity.image_sha256:
+                    raise ValueError(
+                        "strict policy-camera ledger encoded-image identity changed"
+                    )
+                key = (int(policy_input.episode_id), int(policy_input.env_id))
+                prior = pending.setdefault(key, [])
+                if prior and (
+                    identity.render_timestamp_us <= prior[-1].render_timestamp_us
+                ):
+                    raise ValueError(
+                        "strict policy-camera ledger current frames must advance in time"
+                    )
+                if identity in prior:
+                    raise ValueError(
+                        "strict policy-camera ledger contains a duplicate current frame"
+                    )
+                prior.append(identity)
+            self.routed_current_camera_ledger = pending
 
     def attach_feedback_traces(
         self,
@@ -959,8 +1022,12 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
                     action_values=action_values,
                     motion_reference=motion_reference,
                     reference_sha256=reference_sha256,
+                    prior_current_frame_identities=(
+                        session.prior_current_camera_identities(policy_input)
+                    ),
                 )
             )
+        session.record_validated_current_camera_identities(policy_inputs)
         session.record_outputs(tuple(recorded))
         return HumanoidPolicyResponse(
             actions=actions,
@@ -990,6 +1057,20 @@ class HumanoidPolicyGrpcServicer(HumanoidPolicyServiceServicer):
             session_uuid,
             len(self._session_records[session_uuid].outputs),
         )
+        return Empty()
+
+    def abort_session(
+        self,
+        request: HumanoidSessionAbortRequest,
+        context: grpc.ServicerContext,
+    ) -> Empty:
+        """Idempotently discard a failed session without publishing replay."""
+        del context
+        session_uuid = str(request.session_uuid)
+        if not session_uuid:
+            raise ValueError("humanoid abort requires a session_uuid")
+        self.discard_session(session_uuid)
+        logger.info("Aborted AlpaGym humanoid policy session=%s", session_uuid)
         return Empty()
 
     def pop_session_record(self, session_uuid: str) -> HumanoidSessionRecord:
@@ -1244,6 +1325,10 @@ def _route_camera_frames(
             camera_contract_sha256=str(getattr(image, "camera_contract_sha256", "")),
             image_sha256=str(getattr(image, "image_sha256", "")),
             render_receipt_sha256=str(getattr(image, "render_receipt_sha256", "")),
+            scene_fingerprint=str(getattr(image, "scene_fingerprint", "")),
+            model_signature_sha256=str(getattr(image, "model_signature_sha256", "")),
+            camera_to_world_sha256=str(getattr(image, "camera_to_world_sha256", "")),
+            renderer_binding_sha256=str(getattr(image, "renderer_binding_sha256", "")),
         )
         if (
             policy_camera_contract is not None
@@ -1304,11 +1389,18 @@ def _route_camera_frames(
                 "policy camera render_receipt_sha256",
                 frame.render_receipt_sha256,
             )
+            for name, digest in (
+                ("scene_fingerprint", frame.scene_fingerprint),
+                ("model_signature_sha256", frame.model_signature_sha256),
+                ("camera_to_world_sha256", frame.camera_to_world_sha256),
+                ("renderer_binding_sha256", frame.renderer_binding_sha256),
+            ):
+                _require_lowercase_sha256(f"policy camera {name}", digest)
             from alpasim_grpc.v0.humanoid_contracts import (
                 HUMANOID_RENDER_STATE_SCHEMA,
                 HumanoidRenderState,
                 humanoid_image_sha256,
-                humanoid_render_receipt_sha256,
+                humanoid_render_receipt_v2_sha256,
             )
 
             render_state = HumanoidRenderState(
@@ -1325,16 +1417,22 @@ def _route_camera_frames(
                 raise ValueError("policy camera render-state receipt is invalid")
             if frame.image_sha256 != humanoid_image_sha256(frame.image_bytes):
                 raise ValueError("policy camera encoded-image receipt is invalid")
-            expected_render_receipt = humanoid_render_receipt_sha256(
+            expected_render_receipt = humanoid_render_receipt_v2_sha256(
                 render_state_sha256=frame.render_state_sha256,
                 camera_contract_sha256=frame.camera_contract_sha256,
                 image_sha256=frame.image_sha256,
                 image_format=policy_camera_contract.image_format,
                 width=policy_camera_contract.width,
                 height=policy_camera_contract.height,
+                scene_fingerprint=frame.scene_fingerprint,
+                model_signature_sha256=frame.model_signature_sha256,
+                camera_to_world_sha256=frame.camera_to_world_sha256,
+                renderer_binding_sha256=frame.renderer_binding_sha256,
             )
             if frame.render_receipt_sha256 != expected_render_receipt:
-                raise ValueError("policy camera combined render receipt is invalid")
+                raise ValueError(
+                    "policy camera state/pixel/renderer-evidence receipt is invalid"
+                )
         grouped[env_id].append(frame)
     all_frames_by_env = {
         env_id: tuple(
@@ -1411,6 +1509,10 @@ def _camera_frame_identity(frame: HumanoidCameraFrame) -> HumanoidCameraFrameIde
         camera_contract_sha256=frame.camera_contract_sha256,
         image_sha256=frame.image_sha256,
         render_receipt_sha256=frame.render_receipt_sha256,
+        scene_fingerprint=frame.scene_fingerprint,
+        model_signature_sha256=frame.model_signature_sha256,
+        camera_to_world_sha256=frame.camera_to_world_sha256,
+        renderer_binding_sha256=frame.renderer_binding_sha256,
     )
 
 
@@ -1904,6 +2006,40 @@ def _require_lowercase_sha256(name: str, value: object) -> str:
     return digest
 
 
+def humanoid_model_input_tensor_sha256(value: torch.Tensor) -> str:
+    """Hash one dense model-input tensor including dtype, shape, and exact bytes."""
+
+    if not isinstance(value, torch.Tensor) or value.layout != torch.strided:
+        raise TypeError("humanoid model input must be one dense tensor")
+    tensor = value.detach().cpu().clone(memory_format=torch.contiguous_format)
+    descriptor = json.dumps(
+        {"dtype": str(tensor.dtype), "shape": list(tensor.shape)},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    digest = hashlib.sha256(b"alpagym.humanoid.model_input_tensor.v1\0")
+    digest.update(len(descriptor).to_bytes(8, byteorder="big", signed=False))
+    digest.update(descriptor)
+    digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def humanoid_visual_input_manifest_sha256(manifest: Mapping[str, object]) -> str:
+    """Hash one canonical JSON visual-input manifest with domain separation."""
+
+    canonical = json.dumps(
+        dict(manifest),
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(
+        b"alpagym.humanoid.visual_input_manifest.v1\0" + canonical
+    ).hexdigest()
+
+
 def _ordered_joint_names_sha256(joint_names: tuple[str, ...]) -> str:
     """Hash a non-empty ordered joint tuple with a stable JSON encoding."""
 
@@ -2038,6 +2174,315 @@ def _policy_input_from_state(
     )
 
 
+def _visual_source_frame_entry(
+    identity: HumanoidCameraFrameIdentity,
+    *,
+    role: str,
+) -> dict[str, object]:
+    """Project one server-routed identity onto the policy manifest contract."""
+
+    return {
+        "role": role,
+        "env_id": identity.env_id,
+        "frame_start_us": identity.frame_start_us,
+        "frame_end_us": identity.frame_end_us,
+        "logical_id": identity.logical_id,
+        "byte_length": identity.byte_length,
+        "render_timestamp_us": identity.render_timestamp_us,
+        "observation_decision_id": identity.observation_decision_id,
+        "render_state_sha256": identity.render_state_sha256,
+        "camera_contract_sha256": identity.camera_contract_sha256,
+        "image_sha256": identity.image_sha256,
+        "render_receipt_sha256": identity.render_receipt_sha256,
+        "scene_fingerprint": identity.scene_fingerprint,
+        "model_signature_sha256": identity.model_signature_sha256,
+        "camera_to_world_sha256": identity.camera_to_world_sha256,
+        "renderer_binding_sha256": identity.renderer_binding_sha256,
+    }
+
+
+def _validate_recorded_visual_input_manifest(
+    *,
+    model_extra: Mapping[str, object],
+    payload: Mapping[str, object],
+    policy_input: HumanoidPolicyInput,
+    step_index: int,
+    prior_current_frame_identities: tuple[HumanoidCameraFrameIdentity, ...] = (),
+) -> None:
+    """Bind one policy-authored visual manifest to its exact replay tensor.
+
+    The render receipt is provenance evidence, not a cryptographic signature: this
+    validator assumes a trusted renderer producer and local AlpaSim/AlpaGym transport.
+    Recomputing it here rejects stale or mix-and-match frame evidence in replay.
+    """
+
+    manifest_value = model_extra.get("humanoid_visual_input_manifest")
+    digest_value = payload.get("visual_input_manifest_sha256")
+    if manifest_value is None and digest_value is None:
+        if "pixel_values" in payload and policy_input.camera_frames:
+            raise ValueError("humanoid visual replay is missing its input manifest")
+        return
+    if not isinstance(manifest_value, Mapping) or digest_value is None:
+        raise ValueError(
+            "humanoid visual input requires both manifest and replay digest"
+        )
+    manifest = dict(manifest_value)
+    expected_manifest_keys = {
+        "schema",
+        "session_uuid",
+        "episode_id",
+        "step_index",
+        "timestamp_us",
+        "env_id",
+        "decision_id",
+        "camera_logical_id",
+        "image_format",
+        "preprocess_profile",
+        "instruction_sha256",
+        "source_frames",
+        "pixel_values",
+    }
+    if set(manifest) != expected_manifest_keys:
+        raise ValueError("humanoid visual input manifest has invalid fields")
+    expected_identity = {
+        "schema": HUMANOID_VISUAL_INPUT_MANIFEST_SCHEMA,
+        "session_uuid": policy_input.session_uuid,
+        "episode_id": int(policy_input.episode_id),
+        "step_index": int(step_index),
+        "timestamp_us": int(policy_input.timestamp_us),
+        "env_id": int(policy_input.env_id),
+        "decision_id": int(policy_input.decision_id),
+    }
+    for name, expected in expected_identity.items():
+        if manifest[name] != expected:
+            raise ValueError(f"humanoid visual input manifest {name} changed")
+    for name in (
+        "camera_logical_id",
+        "preprocess_profile",
+    ):
+        if not isinstance(manifest[name], str) or not manifest[name]:
+            raise ValueError(f"humanoid visual input manifest {name} must be non-empty")
+    image_format = manifest["image_format"]
+    if image_format not in {"jpeg", "png"}:
+        raise ValueError(
+            "humanoid visual input manifest image_format must be 'jpeg' or 'png'"
+        )
+    instruction_sha256 = _require_lowercase_sha256(
+        "humanoid visual input instruction_sha256", manifest["instruction_sha256"]
+    )
+    if payload.get("instruction_sha256") != instruction_sha256:
+        raise ValueError("humanoid visual input instruction digest differs from replay")
+
+    source_frames = manifest["source_frames"]
+    if not isinstance(source_frames, list) or not source_frames:
+        raise ValueError("humanoid visual input source_frames must be non-empty")
+    frame_keys = {
+        "role",
+        "env_id",
+        "frame_start_us",
+        "frame_end_us",
+        "logical_id",
+        "byte_length",
+        "render_timestamp_us",
+        "observation_decision_id",
+        "render_state_sha256",
+        "camera_contract_sha256",
+        "image_sha256",
+        "render_receipt_sha256",
+        "scene_fingerprint",
+        "model_signature_sha256",
+        "camera_to_world_sha256",
+        "renderer_binding_sha256",
+    }
+    typed_frames: list[dict[str, object]] = []
+    for index, frame_value in enumerate(source_frames):
+        if not isinstance(frame_value, Mapping):
+            raise TypeError("humanoid visual input source frame must be a mapping")
+        frame = dict(frame_value)
+        if set(frame) != frame_keys:
+            raise ValueError("humanoid visual input source frame has invalid fields")
+        expected_role = "current" if index == len(source_frames) - 1 else "history"
+        if frame["role"] != expected_role:
+            raise ValueError("humanoid visual input source frame order is invalid")
+        for name in (
+            "env_id",
+            "frame_start_us",
+            "frame_end_us",
+            "byte_length",
+            "render_timestamp_us",
+            "observation_decision_id",
+        ):
+            if type(frame[name]) is not int or int(frame[name]) < 0:
+                raise ValueError(
+                    f"humanoid visual input source frame {name} must be non-negative"
+                )
+        if frame["env_id"] != int(policy_input.env_id) or frame["byte_length"] == 0:
+            raise ValueError("humanoid visual input source frame identity is invalid")
+        if (
+            frame["frame_start_us"] != frame["render_timestamp_us"]
+            or frame["frame_end_us"] != frame["render_timestamp_us"]
+        ):
+            raise ValueError("humanoid visual input source frame is not zero-shutter")
+        if not isinstance(frame["logical_id"], str) or not frame["logical_id"]:
+            raise ValueError("humanoid visual input logical_id must be non-empty")
+        for name in (
+            "render_state_sha256",
+            "camera_contract_sha256",
+            "image_sha256",
+            "render_receipt_sha256",
+            "scene_fingerprint",
+            "model_signature_sha256",
+            "camera_to_world_sha256",
+            "renderer_binding_sha256",
+        ):
+            _require_lowercase_sha256(
+                f"humanoid visual input source frame {name}", frame[name]
+            )
+        typed_frames.append(frame)
+
+    render_timestamps = [int(frame["render_timestamp_us"]) for frame in typed_frames]
+    if any(
+        current <= previous
+        for previous, current in zip(render_timestamps, render_timestamps[1:])
+    ):
+        raise ValueError("humanoid visual input source frames are not chronological")
+    image_grid = payload.get("image_grid_thw")
+    selected_history_indices = payload.get("selected_history_indices")
+    if (
+        not isinstance(image_grid, torch.Tensor)
+        or image_grid.ndim != 2
+        or image_grid.shape[1] != 3
+        or not isinstance(selected_history_indices, torch.Tensor)
+        or selected_history_indices.ndim != 1
+    ):
+        raise ValueError(
+            "humanoid visual input replay is missing processor image-order metadata"
+        )
+    if len(typed_frames) != int(image_grid.shape[0]) or len(typed_frames) != (
+        int(selected_history_indices.numel()) + 1
+    ):
+        raise ValueError(
+            "humanoid visual input source order differs from processor image order"
+        )
+    current_frame = typed_frames[-1]
+    if len(policy_input.camera_frames) != 1:
+        raise ValueError("humanoid visual input requires one current policy camera")
+    policy_frame = policy_input.camera_frames[0]
+    if (
+        hashlib.sha256(policy_frame.image_bytes).hexdigest()
+        != policy_frame.image_sha256
+    ):
+        raise ValueError("humanoid visual input current JPEG digest is invalid")
+    expected_current = {
+        "role": "current",
+        "env_id": policy_frame.env_id,
+        "frame_start_us": policy_frame.frame_start_us,
+        "frame_end_us": policy_frame.frame_end_us,
+        "logical_id": policy_frame.logical_id,
+        "byte_length": len(policy_frame.image_bytes),
+        "render_timestamp_us": policy_frame.render_timestamp_us,
+        "observation_decision_id": policy_frame.observation_decision_id,
+        "render_state_sha256": policy_frame.render_state_sha256,
+        "camera_contract_sha256": policy_frame.camera_contract_sha256,
+        "image_sha256": policy_frame.image_sha256,
+        "render_receipt_sha256": policy_frame.render_receipt_sha256,
+        "scene_fingerprint": policy_frame.scene_fingerprint,
+        "model_signature_sha256": policy_frame.model_signature_sha256,
+        "camera_to_world_sha256": policy_frame.camera_to_world_sha256,
+        "renderer_binding_sha256": policy_frame.renderer_binding_sha256,
+    }
+    if current_frame != expected_current:
+        raise ValueError(
+            "humanoid visual input current frame differs from policy input"
+        )
+    if manifest["camera_logical_id"] != policy_frame.logical_id:
+        raise ValueError("humanoid visual input camera logical_id changed")
+    for frame in typed_frames:
+        if (
+            frame["logical_id"] != current_frame["logical_id"]
+            or frame["camera_contract_sha256"]
+            != current_frame["camera_contract_sha256"]
+            or frame["scene_fingerprint"] != current_frame["scene_fingerprint"]
+            or frame["model_signature_sha256"]
+            != current_frame["model_signature_sha256"]
+        ):
+            raise ValueError(
+                "humanoid visual input history changed camera, scene, or renderer model"
+            )
+    native_width, native_height = _encoded_image_size(
+        policy_frame.image_bytes,
+        image_format,
+    )
+    for index, frame in enumerate(typed_frames):
+        expected_receipt = humanoid_contracts.humanoid_render_receipt_v2_sha256(
+            render_state_sha256=frame["render_state_sha256"],
+            camera_contract_sha256=frame["camera_contract_sha256"],
+            image_sha256=frame["image_sha256"],
+            image_format=image_format,
+            width=native_width,
+            height=native_height,
+            scene_fingerprint=frame["scene_fingerprint"],
+            model_signature_sha256=frame["model_signature_sha256"],
+            camera_to_world_sha256=frame["camera_to_world_sha256"],
+            renderer_binding_sha256=frame["renderer_binding_sha256"],
+        )
+        if frame["render_receipt_sha256"] != expected_receipt:
+            raise ValueError(
+                "humanoid visual input source frame render receipt is invalid "
+                f"at index {index}"
+            )
+
+    history_frames = typed_frames[:-1]
+    prior_entries: list[dict[str, object]] = []
+    for identity in prior_current_frame_identities:
+        if identity.env_id != int(policy_input.env_id):
+            raise ValueError("humanoid visual input camera ledger crossed an env lane")
+        if identity.sha256 != identity.image_sha256:
+            raise ValueError(
+                "humanoid visual input camera ledger encoded-image identity changed"
+            )
+        prior_entries.append(_visual_source_frame_entry(identity, role="history"))
+    matched_prior_indices: set[int] = set()
+    current_timestamp_us = int(current_frame["render_timestamp_us"])
+    for history in history_frames:
+        matches = [
+            index for index, prior in enumerate(prior_entries) if prior == history
+        ]
+        if len(matches) != 1 or matches[0] in matched_prior_indices:
+            raise ValueError(
+                "humanoid visual input history was not a unique previously routed "
+                "current frame"
+            )
+        if int(history["render_timestamp_us"]) >= current_timestamp_us:
+            raise ValueError(
+                "humanoid visual input history is not strictly earlier than current"
+            )
+        matched_prior_indices.add(matches[0])
+
+    pixel_value = manifest["pixel_values"]
+    if not isinstance(pixel_value, Mapping):
+        raise TypeError("humanoid visual input pixel_values must be a mapping")
+    pixel_descriptor = dict(pixel_value)
+    if set(pixel_descriptor) != {"dtype", "shape", "sha256"}:
+        raise ValueError("humanoid visual input pixel descriptor has invalid fields")
+    replay_pixels = payload.get("pixel_values")
+    if not isinstance(replay_pixels, torch.Tensor):
+        raise TypeError("humanoid visual input replay is missing pixel_values tensor")
+    expected_pixel_descriptor = {
+        "dtype": str(replay_pixels.dtype),
+        "shape": list(replay_pixels.shape),
+        "sha256": humanoid_model_input_tensor_sha256(replay_pixels),
+    }
+    if pixel_descriptor != expected_pixel_descriptor:
+        raise ValueError("humanoid visual input pixel tensor identity changed")
+    manifest_sha256 = humanoid_visual_input_manifest_sha256(manifest)
+    if (
+        _require_lowercase_sha256("humanoid visual input manifest digest", digest_value)
+        != manifest_sha256
+    ):
+        raise ValueError("humanoid visual input manifest digest is invalid")
+
+
 def _recorded_policy_output(
     *,
     step_index: int,
@@ -2046,6 +2491,7 @@ def _recorded_policy_output(
     action_values: torch.Tensor | None,
     motion_reference: HumanoidMotionReference | None,
     reference_sha256: str | None = None,
+    prior_current_frame_identities: tuple[HumanoidCameraFrameIdentity, ...] = (),
 ) -> PolicyOutput:
     model_extra = dict(output.model_extra or {})
     server_owned_metadata = {
@@ -2075,6 +2521,10 @@ def _recorded_policy_output(
             "camera_contract_sha256": identity.camera_contract_sha256,
             "image_sha256": identity.image_sha256,
             "render_receipt_sha256": identity.render_receipt_sha256,
+            "scene_fingerprint": identity.scene_fingerprint,
+            "model_signature_sha256": identity.model_signature_sha256,
+            "camera_to_world_sha256": identity.camera_to_world_sha256,
+            "renderer_binding_sha256": identity.renderer_binding_sha256,
         }
         for identity in audited_identities
     ]
@@ -2102,6 +2552,13 @@ def _recorded_policy_output(
     replay_data = output.replay_data
     if replay_data is not None:
         payload = dict(replay_data.payload)
+        _validate_recorded_visual_input_manifest(
+            model_extra=model_extra,
+            payload=payload,
+            policy_input=policy_input,
+            step_index=step_index,
+            prior_current_frame_identities=prior_current_frame_identities,
+        )
         humanoid_payload = dict(payload.get("humanoid", {}))
         for name, expected in (
             ("env_id", int(output.env_id)),

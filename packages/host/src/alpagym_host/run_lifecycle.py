@@ -9,7 +9,7 @@ import shutil
 import subprocess
 from contextlib import nullcontext
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import grpc
 import yaml
@@ -25,9 +25,20 @@ from alpagym_host.alpasim_wizard import (
     ensure_process_terminated,
     start_wizard,
     wait_for_runtime_ready,
+    wizard_compose_project,
 )
-from alpagym_host.config import ExecutionBackend, RunConfig, alpagym_project_root
+from alpagym_host.config import (
+    ExecutionBackend,
+    ProvenanceMode,
+    RunConfig,
+    alpagym_project_root,
+)
 from alpagym_host.endpoint_registry import FileTopologyRegistry, TopologyEndpoint
+from alpagym_host.formal_run_provenance import (
+    FormalRunProvenance,
+    RepositorySource,
+    build_import_probe_receipt,
+)
 from alpagym_host.log_organizer import organize_role_logs, tee_role_logs
 from alpagym_host.run_topology import (
     RunHostPlan,
@@ -42,6 +53,64 @@ from alpagym_host.slurm import (
     prepare_container_image,
 )
 from alpagym_host.transport_env import apply_transport_env_vars
+
+
+_LOCAL_COMPOSE_DOWN_TIMEOUT_S = 30.0
+_FORMAL_IMPORT_PROBE_MARKER = "ALPAGYM_FORMAL_IMPORT_PROBE="
+_FORMAL_IMPORT_PROBE_SCRIPT = """
+import importlib
+import json
+
+module_names = (
+    "alpagym_host",
+    "alpagym_runtime",
+    "alpagym_g1_vla",
+    "alpasim_grpc.v0.humanoid_pb2",
+    "alpasim_grpc.v0.humanoid_pb2_grpc",
+)
+modules = {name: importlib.import_module(name) for name in module_names}
+humanoid_pb2 = modules["alpasim_grpc.v0.humanoid_pb2"]
+humanoid_pb2_grpc = modules["alpasim_grpc.v0.humanoid_pb2_grpc"]
+
+class _ProbeChannel:
+    def unary_unary(self, *args, **kwargs):
+        del args, kwargs
+        return object()
+
+policy_stub = humanoid_pb2_grpc.HumanoidPolicyServiceStub(_ProbeChannel())
+dynamics_stub = humanoid_pb2_grpc.HumanoidDynamicsServiceStub(_ProbeChannel())
+payload = {
+    "module_origins": {
+        name: str(module.__file__) for name, module in modules.items()
+    },
+    "descriptor_fields": {
+        name: {field.name: field.number for field in descriptor.fields}
+        for name, descriptor in humanoid_pb2.DESCRIPTOR.message_types_by_name.items()
+    },
+    "descriptor_services": {
+        name: {
+            method.name: method.input_type.full_name
+            for method in descriptor.methods
+        }
+        for name, descriptor in humanoid_pb2.DESCRIPTOR.services_by_name.items()
+    },
+    "grpc_bindings": {
+        "policy_stub_abort_session": hasattr(policy_stub, "abort_session"),
+        "dynamics_stub_abort_session": hasattr(dynamics_stub, "abort_session"),
+        "policy_servicer_abort_session": callable(getattr(
+            humanoid_pb2_grpc.HumanoidPolicyServiceServicer,
+            "abort_session",
+            None,
+        )),
+        "dynamics_servicer_abort_session": callable(getattr(
+            humanoid_pb2_grpc.HumanoidDynamicsServiceServicer,
+            "abort_session",
+            None,
+        )),
+    },
+}
+print("ALPAGYM_FORMAL_IMPORT_PROBE=" + json.dumps(payload, sort_keys=True))
+""".strip()
 
 
 def fetch_runtime_info(host: str, port: int, timeout_s: float) -> tuple[int, list[str]]:
@@ -143,9 +212,43 @@ def execute_run(config: RunConfig) -> None:
 
     _log_topology(topology)
     alpasim_checkout_root = resolve_alpasim_checkout(config=config.alpasim)
+    if config.cosmos.train.deterministic:
+        workspace_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+        if workspace_config not in (None, ":4096:8"):
+            raise ValueError(
+                "deterministic training requires CUBLAS_WORKSPACE_CONFIG=:4096:8"
+            )
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    provenance: FormalRunProvenance | None = None
+    critical_environment: dict[str, str] | None = None
+    if config.execution.provenance_mode is ProvenanceMode.required:
+        humanoid = config.alpasim.humanoid
+        if humanoid is None:
+            raise AssertionError("required provenance escaped humanoid validation")
+        critical_environment = _configure_formal_subprocess_environment(
+            config=config,
+            alpasim_checkout_root=alpasim_checkout_root,
+        )
+        provenance = FormalRunProvenance.capture_prelaunch(
+            provenance_dir=config.artifact_paths.run_dir / "provenance",
+            repositories=(
+                RepositorySource(name="alpagym", root=alpagym_project_root()),
+                RepositorySource(
+                    name="alpasim",
+                    root=alpasim_checkout_root,
+                    capture_ignored_generated_pb2=True,
+                ),
+                RepositorySource(name="humanoid", root=Path(humanoid.repo_path)),
+            ),
+            resolved_config_path=config.artifact_paths.resolved_config_path,
+            cosmos_config_path=config.artifact_paths.cosmos_config_path,
+            critical_environment=critical_environment,
+        )
     registry = FileTopologyRegistry(config.artifact_paths.topology_registry_dir)
     wizard_processes: list[subprocess.Popen[str]] = []
     alpasim_hosts = topology.alpasim_host_plans
+    run_completed = False
+    run_error: BaseException | None = None
     try:
         logging.info("Starting %d AlpaSim Wizard process(es)", len(alpasim_hosts))
         for runtime_index, host in enumerate(alpasim_hosts):
@@ -214,6 +317,22 @@ def execute_run(config: RunConfig) -> None:
             topology=topology,
             container_image=container_image,
         )
+        if provenance is not None:
+            assert critical_environment is not None
+            import_probe = _run_formal_import_probe(
+                cosmos_command=cosmos_command,
+                critical_environment=critical_environment,
+            )
+            provenance.capture_runtime_ready(
+                wizard_log_dirs=tuple(
+                    _wizard_log_dir(config=config, runtime_index=runtime_index)
+                    for runtime_index in range(len(alpasim_hosts))
+                ),
+                workload_kind="cosmos_training",
+                workload_command=cosmos_command,
+                scene_store_root=Path(humanoid.scene_store_path),
+                import_probe=import_probe,
+            )
         logging.info(
             "Starting Cosmos launcher: backend=%s cosmos_hosts=%s log_dir=%s",
             execution_backend.value,
@@ -248,14 +367,289 @@ def execute_run(config: RunConfig) -> None:
                 check=True,
                 text=True,
             )
+        run_completed = True
         logging.info("Cosmos launcher completed")
+    except BaseException as exc:
+        run_error = exc
+        raise
     finally:
         if wizard_processes:
             logging.info(
                 "Stopping %d AlpaSim Wizard process(es)", len(wizard_processes)
             )
-        for process in wizard_processes:
+        cleanup_error: BaseException | None = None
+        try:
+            _cleanup_wizard_processes(
+                config=config,
+                execution_backend=execution_backend,
+                wizard_processes=wizard_processes,
+                provenance=provenance,
+            )
+        except BaseException as exc:
+            cleanup_error = exc
+        provenance_error: BaseException | None = None
+        if provenance is not None:
+            try:
+                provenance.finalize(
+                    run_completed=run_completed,
+                    cleanup_error=cleanup_error,
+                )
+            except BaseException as exc:
+                provenance_error = exc
+        _raise_lifecycle_failures(
+            run_error=run_error,
+            cleanup_error=cleanup_error,
+            provenance_error=provenance_error,
+        )
+
+
+def _configure_formal_subprocess_environment(
+    *, config: RunConfig, alpasim_checkout_root: Path
+) -> dict[str, str]:
+    """Pin source resolution and bytecode behavior before any formal subprocess."""
+    grpc_source = (alpasim_checkout_root / "src" / "grpc").resolve(strict=True)
+    pycache_prefix = (config.artifact_paths.run_dir / "formal_python_cache").resolve()
+    if os.path.lexists(pycache_prefix):
+        raise FileExistsError(
+            f"formal Python cache prefix must be fresh: {pycache_prefix}"
+        )
+    pycache_prefix.mkdir(parents=True)
+    environment = {
+        "ALPASIM_GRPC_ROOT": str(grpc_source),
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        "PYTHONPATH": str(grpc_source),
+        "PYTHONPYCACHEPREFIX": str(pycache_prefix),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    os.environ.update(environment)
+    return environment
+
+
+def _run_formal_import_probe(
+    *, cosmos_command: list[str], critical_environment: dict[str, str]
+) -> dict[str, Any]:
+    """Probe imports through the exact no-sync Python prefix used by Cosmos."""
+    try:
+        python_index = cosmos_command.index("python")
+    except ValueError as exc:
+        raise ValueError("formal Cosmos command has no Python launcher") from exc
+    probe_command = [
+        *cosmos_command[: python_index + 1],
+        "-c",
+        _FORMAL_IMPORT_PROBE_SCRIPT,
+    ]
+    if probe_command[:3] != ["uv", "run", "--no-sync"]:
+        raise RuntimeError(
+            "formal import probe requires the exact no-sync Cosmos prefix"
+        )
+    environment = os.environ.copy()
+    for name, expected in critical_environment.items():
+        if environment.get(name) != expected:
+            raise RuntimeError(
+                f"formal import probe environment {name} differs from prelaunch"
+            )
+    result = subprocess.run(
+        probe_command,
+        check=True,
+        text=True,
+        capture_output=True,
+        env=environment,
+    )
+    payload_lines = [
+        line.removeprefix(_FORMAL_IMPORT_PROBE_MARKER)
+        for line in result.stdout.splitlines()
+        if line.startswith(_FORMAL_IMPORT_PROBE_MARKER)
+    ]
+    if len(payload_lines) != 1:
+        raise RuntimeError(
+            "formal import probe did not return exactly one structured payload"
+        )
+    payload = yaml.safe_load(payload_lines[0])
+    if not isinstance(payload, dict):
+        raise TypeError("formal import probe payload must be an object")
+    return build_import_probe_receipt(
+        command=probe_command,
+        environment=critical_environment,
+        payload=payload,
+    )
+
+
+def _cleanup_wizard_processes(
+    *,
+    config: RunConfig,
+    execution_backend: ExecutionBackend,
+    wizard_processes: list[subprocess.Popen[str]],
+    provenance: FormalRunProvenance | None = None,
+) -> None:
+    """Terminate Wizards and down only their exact local Compose projects.
+
+    Process-group termination alone is not sufficient: interrupting Wizard can
+    leave Compose containers alive. For local runs, every generated Compose file
+    belonging to this lifecycle is therefore passed to an explicit, bounded
+    ``docker compose --file ... down``. Failures are collected so one broken
+    Wizard cannot prevent cleanup of the remaining exact projects.
+    """
+    failures: list[BaseException] = []
+    for process in wizard_processes:
+        try:
             ensure_process_terminated(process)
+        except BaseException as exc:
+            failures.append(exc)
+
+    if not execution_backend.is_slurm_run:
+        for runtime_index in range(len(wizard_processes)):
+            wizard_log_dir = _wizard_log_dir(config=config, runtime_index=runtime_index)
+            compose_path = wizard_log_dir / "docker-compose.yaml"
+            compose_project = wizard_compose_project(wizard_log_dir)
+            if not os.path.lexists(compose_path):
+                failures.append(
+                    FileNotFoundError(
+                        "started local Wizard has no exact generated Compose file: "
+                        f"{compose_path}"
+                    )
+                )
+            elif compose_path.is_symlink() or not compose_path.is_file():
+                failures.append(
+                    RuntimeError(
+                        "local Wizard cleanup found a non-regular exact Compose "
+                        f"path: {compose_path}"
+                    )
+                )
+
+            if provenance is not None:
+                try:
+                    _compose_sha256, admitted_project = (
+                        provenance.cleanup_compose_identity(compose_path)
+                    )
+                    if admitted_project != compose_project:
+                        raise RuntimeError(
+                            "formal runtime Compose project differs from its immutable "
+                            f"launch identity: {admitted_project!r} != "
+                            f"{compose_project!r}"
+                        )
+                except BaseException as exc:
+                    failures.append(exc)
+
+            compose_prefix = [
+                "docker",
+                "compose",
+                "--project-name",
+                compose_project,
+                "--file",
+                str(compose_path),
+            ]
+            try:
+                subprocess.run(
+                    [*compose_prefix, "down"],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    timeout=_LOCAL_COMPOSE_DOWN_TIMEOUT_S,
+                )
+            except BaseException as exc:
+                failures.append(exc)
+
+            try:
+                remaining_container_ids = _compose_project_container_ids(
+                    compose_project
+                )
+            except BaseException as exc:
+                failures.append(exc)
+                remaining_container_ids = ()
+            if remaining_container_ids:
+                failures.append(
+                    RuntimeError(
+                        "exact Wizard Compose down required label-scoped forced "
+                        f"container removal: {compose_project}: "
+                        f"{list(remaining_container_ids)}"
+                    )
+                )
+                try:
+                    subprocess.run(
+                        ["docker", "rm", "--force", *remaining_container_ids],
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                        timeout=_LOCAL_COMPOSE_DOWN_TIMEOUT_S,
+                    )
+                except BaseException as exc:
+                    failures.append(exc)
+                try:
+                    remaining_after_removal = _compose_project_container_ids(
+                        compose_project
+                    )
+                    if remaining_after_removal:
+                        raise RuntimeError(
+                            "exact Wizard Compose project still has containers after "
+                            "label-scoped forced removal: "
+                            f"{compose_project}: {list(remaining_after_removal)}"
+                        )
+                except BaseException as exc:
+                    failures.append(exc)
+
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        raise BaseExceptionGroup(
+            "one or more Wizard cleanup operations failed", failures
+        )
+
+
+def _compose_project_container_ids(compose_project: str) -> tuple[str, ...]:
+    """Return containers carrying one immutable Wizard launch-project label."""
+    result = subprocess.run(
+        [
+            "docker",
+            "ps",
+            "--all",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={compose_project}",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=_LOCAL_COMPOSE_DOWN_TIMEOUT_S,
+    )
+    container_ids = tuple(
+        line.strip() for line in (result.stdout or "").splitlines() if line.strip()
+    )
+    if any(
+        len(container_id) < 12
+        or any(character not in "0123456789abcdef" for character in container_id)
+        for container_id in container_ids
+    ):
+        raise RuntimeError(
+            "Docker returned an invalid container ID for exact project cleanup: "
+            f"{container_ids}"
+        )
+    return container_ids
+
+
+def _raise_lifecycle_failures(
+    *,
+    run_error: BaseException | None,
+    cleanup_error: BaseException | None,
+    provenance_error: BaseException | None,
+) -> None:
+    """Preserve every lifecycle failure instead of masking teardown evidence."""
+    additional_failures = [
+        failure for failure in (cleanup_error, provenance_error) if failure is not None
+    ]
+    if run_error is not None:
+        if additional_failures:
+            raise BaseExceptionGroup(
+                "run and finalization both failed",
+                [run_error, *additional_failures],
+            ) from None
+        return
+    if len(additional_failures) == 2:
+        raise BaseExceptionGroup(
+            "Wizard cleanup and formal provenance finalization both failed",
+            additional_failures,
+        ) from None
+    if additional_failures:
+        raise additional_failures[0]
 
 
 def _start_wizard_process(
@@ -330,7 +724,7 @@ def _build_cosmos_command(
         return _build_cosmos_launcher_command(
             config,
             project_root=alpagym_project_root(),
-            no_sync=False,
+            no_sync=True,
             worker_count=1,
             worker_index=0,
             controller_port=config.cosmos.launch.controller_port,
@@ -415,9 +809,9 @@ def _build_cosmos_launcher_command(
     if controller_port is not None and controller_url is not None:
         raise ValueError("Cosmos launcher command cannot set both port and url")
 
-    command = ["uv", "run"]
-    if no_sync:
-        command.append("--no-sync")
+    if not no_sync:
+        raise ValueError("Cosmos launcher must use uv --no-sync")
+    command = ["uv", "run", "--no-sync"]
     launcher_args = [
         "--project",
         str(project_root),

@@ -14,6 +14,11 @@ from typing import Any, Callable
 
 import torch
 
+from alpagym_g1_vla.candidate_overlay import (
+    apply_candidate_overlay,
+    export_model_checkpoint,
+    resolve_inference_source,
+)
 from alpagym_g1_vla.replay_collator import (
     collate_vla_replay_samples,
 )
@@ -92,13 +97,27 @@ def load_inference_model(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Any:
-    """Load the attested Psi PPO model for humanoid callbacks."""
+    """Load the attested base and, when explicit, one verified candidate."""
     register_vla_psi_ppo_model()
+    sampling_mode = vla_sampling_mode(run_config)
+    candidate, source_identity = resolve_inference_source(run_config)
+    if sampling_mode == FLOW_SDE_TRAINING and candidate is not None:
+        raise ValueError(
+            "VLA training startup cannot consume a rollout candidate overlay; "
+            "use Cosmos resume for trainer state"
+        )
     model = load_vla_rollout_model(
         Path(run_config.policy.model.path),
         device=device,
         dtype=dtype,
     )
+    if candidate is not None:
+        candidate = apply_candidate_overlay(model, candidate)
+        source_identity = candidate.artifact_identity()
+    # Qualification reads this identity from the actual loaded model and writes
+    # it beside episode metrics.  It is deliberately not inferred later from a
+    # raw Cosmos resume path or from an authored config string.
+    model.alpagym_inference_source_identity = source_identity
     return VlaNativeInferenceModel(model)
 
 
@@ -411,6 +430,7 @@ def get_bundle() -> PolicyBundle:
         install_runtime_bridge=install_runtime_bridge,
         load_inference_model=load_inference_model,
         build_model_inputs=build_model_inputs,
+        export_model_checkpoint=export_model_checkpoint,
     )
 
 

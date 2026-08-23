@@ -259,6 +259,23 @@ def install_alpasim_grpc_stubs() -> None:
         """Return the fixture's shared combined receipt."""
         return "f" * 64
 
+    def humanoid_render_receipt_v2_sha256(**values: object) -> str:
+        """Return the fixture's renderer-evidence-bound receipt."""
+        names = (
+            "render_state_sha256",
+            "camera_contract_sha256",
+            "image_sha256",
+            "image_format",
+            "width",
+            "height",
+            "scene_fingerprint",
+            "model_signature_sha256",
+            "camera_to_world_sha256",
+            "renderer_binding_sha256",
+        )
+        encoded = "\0".join(str(values[name]) for name in names).encode()
+        return hashlib.sha256(b"test-render-receipt-v2\0" + encoded).hexdigest()
+
     def humanoid_reference_sha256(spec: object, update: object) -> str:
         """Expose distinct fixture identities for the shared v1/v2 branches."""
         del update
@@ -266,6 +283,9 @@ def install_alpasim_grpc_stubs() -> None:
 
     class HumanoidSessionCloseRequest:
         """Tiny stand-in for humanoid.HumanoidSessionCloseRequest."""
+
+    class HumanoidSessionAbortRequest:
+        """Tiny stand-in for humanoid.HumanoidSessionAbortRequest."""
 
     class HumanoidPolicyServiceServicer:
         """Tiny stand-in for generated humanoid policy servicer base."""
@@ -380,6 +400,7 @@ def install_alpasim_grpc_stubs() -> None:
     humanoid_pb2.HumanoidPolicyResponse = HumanoidPolicyResponse
     humanoid_pb2.HumanoidPolicySessionRequest = HumanoidPolicySessionRequest
     humanoid_pb2.HumanoidReferenceDecodeContext = HumanoidReferenceDecodeContext
+    humanoid_pb2.HumanoidSessionAbortRequest = HumanoidSessionAbortRequest
     humanoid_pb2.HumanoidSessionCloseRequest = HumanoidSessionCloseRequest
     humanoid_pb2.HUMANOID_EXECUTION_MODE_DIRECT_ACTION = 1
     humanoid_pb2.HUMANOID_EXECUTION_MODE_MOTION_REFERENCE = 2
@@ -389,6 +410,7 @@ def install_alpasim_grpc_stubs() -> None:
     humanoid_pb2.HUMANOID_POLICY_REQUEST_KIND_FINALIZE_WITH_FEEDBACK = 4
     humanoid_contracts.HUMANOID_RENDER_STATE_SCHEMA = "humanoid_render_state_qpos.v1"
     humanoid_contracts.HUMANOID_RENDER_RECEIPT_SCHEMA = "humanoid_render_receipt.v1"
+    humanoid_contracts.HUMANOID_RENDER_RECEIPT_V2_SCHEMA = "humanoid_render_receipt.v2"
     humanoid_contracts.HUMANOID_FULL_ROTATION_LOCAL_XY_DECODE_CONTEXT_SCHEMA = (
         "full_pelvis_rotation_local_xy_completed_z/v1"
     )
@@ -400,6 +422,9 @@ def install_alpasim_grpc_stubs() -> None:
     humanoid_contracts.humanoid_image_sha256 = humanoid_image_sha256
     humanoid_contracts.humanoid_reference_sha256 = humanoid_reference_sha256
     humanoid_contracts.humanoid_render_receipt_sha256 = humanoid_render_receipt_sha256
+    humanoid_contracts.humanoid_render_receipt_v2_sha256 = (
+        humanoid_render_receipt_v2_sha256
+    )
     humanoid_pb2_grpc.HumanoidPolicyServiceServicer = HumanoidPolicyServiceServicer
     humanoid_pb2_grpc.add_HumanoidPolicyServiceServicer_to_server = (
         add_HumanoidPolicyServiceServicer_to_server
@@ -415,13 +440,15 @@ def install_alpasim_grpc_stubs() -> None:
     def _descriptor_message(*fields: str, nested=None):
         return SimpleNamespace(
             fields_by_name={
-                field: SimpleNamespace(message_type=None) for field in fields
+                field: SimpleNamespace(message_type=None, number=number)
+                for number, field in enumerate(fields, start=1)
             },
             nested_types_by_name=nested or {},
         )
 
     humanoid_pb2.DESCRIPTOR = SimpleNamespace(
         message_types_by_name={
+            "HumanoidSessionAbortRequest": _descriptor_message("session_uuid"),
             "HumanoidPolicySessionRequest": _descriptor_message(
                 "joint_names",
                 "observation_schema",
@@ -465,13 +492,17 @@ def install_alpasim_grpc_stubs() -> None:
                 "image_bytes",
                 "logical_id",
                 "env_id",
-                "camera_contract_sha256",
+                "render_timestamp_us",
                 "observation_decision_id",
                 "render_qpos",
                 "render_state_sha256",
-                "render_timestamp_us",
+                "camera_contract_sha256",
                 "image_sha256",
                 "render_receipt_sha256",
+                "scene_fingerprint",
+                "model_signature_sha256",
+                "camera_to_world_sha256",
+                "renderer_binding_sha256",
             ),
             "HumanoidPolicyResponse": _descriptor_message(
                 "actions",
@@ -546,8 +577,25 @@ def install_alpasim_grpc_stubs() -> None:
                 }
             ),
         },
+        services_by_name={},
     )
     humanoid_messages = humanoid_pb2.DESCRIPTOR.message_types_by_name
+    abort_request_descriptor = humanoid_messages["HumanoidSessionAbortRequest"]
+    humanoid_pb2.DESCRIPTOR.services_by_name.update(
+        {
+            service_name: SimpleNamespace(
+                methods_by_name={
+                    "abort_session": SimpleNamespace(
+                        input_type=abort_request_descriptor
+                    )
+                }
+            )
+            for service_name in (
+                "HumanoidPolicyService",
+                "HumanoidDynamicsService",
+            )
+        }
+    )
     humanoid_messages["HumanoidPolicySessionRequest"].fields_by_name[
         "policy_camera_spec"
     ].message_type = humanoid_messages["HumanoidPolicyCameraSpec"]

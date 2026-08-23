@@ -15,11 +15,14 @@ import torch
 from PIL import Image
 from alpagym_runtime.alpasim.humanoid_policy_server import (
     HUMANOID_EXECUTION_MODE_MOTION_REFERENCE,
+    HUMANOID_VISUAL_INPUT_MANIFEST_SCHEMA,
     MOTION_REFERENCE_JOINT_NAMES,
     HumanoidCameraFrame,
     HumanoidPolicyInput,
     HumanoidRealizedControlTick,
     HumanoidRealizedFeedbackTrace,
+    humanoid_model_input_tensor_sha256,
+    humanoid_visual_input_manifest_sha256,
 )
 
 from alpagym_g1_vla.bundle import (
@@ -30,6 +33,7 @@ from alpagym_g1_vla.bundle import (
 from alpagym_g1_vla.flow import VlaFlowSchedule
 from alpagym_g1_vla.history import (
     VlaImageHistory,
+    VlaImageSourceIdentity,
     decode_native_d435,
     image_array,
     select_bats_history_indices,
@@ -457,6 +461,34 @@ def _jpeg(
     return stream.getvalue()
 
 
+def _source_identity(
+    index: int,
+    *,
+    timestamp_us: int,
+    receipt_value: int | None = None,
+) -> VlaImageSourceIdentity:
+    """Build one complete renderer identity for history contract tests."""
+
+    receipt_value = index + 20 if receipt_value is None else receipt_value
+    return VlaImageSourceIdentity(
+        env_id=0,
+        frame_start_us=timestamp_us,
+        frame_end_us=timestamp_us,
+        logical_id="d435_rgb",
+        byte_length=100 + index,
+        render_timestamp_us=timestamp_us,
+        observation_decision_id=index + 1,
+        render_state_sha256=f"{index + 1:064x}",
+        camera_contract_sha256="6" * 64,
+        image_sha256=f"{index + 10:064x}",
+        render_receipt_sha256=f"{receipt_value:064x}",
+        scene_fingerprint="8" * 64,
+        model_signature_sha256="9" * 64,
+        camera_to_world_sha256=f"{index + 30:064x}",
+        renderer_binding_sha256=f"{index + 40:064x}",
+    )
+
+
 def _input(
     *,
     step: int,
@@ -470,19 +502,24 @@ def _input(
     qpos[:3] = torch.tensor([0.1, -0.2, 0.8]) + step * 0.01
     qpos[3] = 1.0
     qpos[7:] = torch.linspace(-0.3, 0.4, 29) + step * 0.01
+    image_bytes = _jpeg(color)
     frame = HumanoidCameraFrame(
         env_id=0,
         frame_start_us=logical_timestamp_us,
         frame_end_us=logical_timestamp_us,
         logical_id="d435_rgb",
-        image_bytes=_jpeg(color),
+        image_bytes=image_bytes,
         render_timestamp_us=logical_timestamp_us,
         observation_decision_id=step + 1,
         render_qpos=tuple(float(value) for value in qpos),
         render_state_sha256="5" * 64,
         camera_contract_sha256="6" * 64,
-        image_sha256="7" * 64,
+        image_sha256=hashlib.sha256(image_bytes).hexdigest(),
         render_receipt_sha256=f"{step + 8:064x}",
+        scene_fingerprint="8" * 64,
+        model_signature_sha256="9" * 64,
+        camera_to_world_sha256=f"{step + 10:064x}",
+        renderer_binding_sha256=f"{step + 20:064x}",
     )
     return HumanoidPolicyInput(
         session_uuid="session",
@@ -629,8 +666,10 @@ def test_history_is_oldest_to_current_and_bats_is_frozen() -> None:
         current = Image.new("RGB", (224, 224), color=color)
         selected = history.select_with_current(
             current,
-            timestamp_us=index * 500_000,
-            capture_receipt_sha256=f"receipt-{index}",
+            source_identity=_source_identity(
+                index,
+                timestamp_us=index * 500_000,
+            ),
         )
         selected_colors.append(
             [int(np.asarray(image)[100, 100, 0]) for image in selected]
@@ -638,9 +677,19 @@ def test_history_is_oldest_to_current_and_bats_is_frozen() -> None:
         current.close()
         for image in selected:
             image.close()
-    history.close()
 
     assert selected_colors == [[10], [10, 20], [10, 20, 30]]
+    assert [
+        identity.render_timestamp_us
+        for identity in history.last_selected_source_identities
+    ] == [0, 500_000, 1_000_000]
+    assert [
+        identity.renderer_binding_sha256
+        for identity in history.last_selected_source_identities
+    ] == [f"{index + 40:064x}" for index in range(3)]
+    history.close()
+    assert history.last_selected_indices == ()
+    assert history.last_selected_source_identities == ()
     assert select_bats_history_indices(100, 17) == (
         0,
         9,
@@ -681,13 +730,16 @@ def test_history_defers_duplicate_current_capture_receipt() -> None:
     stale = Image.new("RGB", (224, 224), color=(10, 0, 0))
     fresh = Image.new("RGB", (224, 224), color=(30, 0, 0))
     selected_first = history.select_with_current(
-        first, timestamp_us=0, capture_receipt_sha256="receipt-a"
+        first,
+        source_identity=_source_identity(0, timestamp_us=0, receipt_value=100),
     )
     selected_stale = history.select_with_current(
-        stale, timestamp_us=500_000, capture_receipt_sha256="receipt-a"
+        stale,
+        source_identity=_source_identity(1, timestamp_us=500_000, receipt_value=100),
     )
     selected_fresh = history.select_with_current(
-        fresh, timestamp_us=1_000_000, capture_receipt_sha256="receipt-b"
+        fresh,
+        source_identity=_source_identity(2, timestamp_us=1_000_000, receipt_value=101),
     )
     try:
         assert len(selected_first) == 1
@@ -713,8 +765,10 @@ def test_history_remains_two_hz_when_policy_replans_at_ten_hz() -> None:
             selected_batches.append(
                 history.select_with_current(
                     current,
-                    timestamp_us=index * 100_000,
-                    capture_receipt_sha256=f"receipt-{index}",
+                    source_identity=_source_identity(
+                        index,
+                        timestamp_us=index * 100_000,
+                    ),
                 )
             )
             current.close()
@@ -891,6 +945,42 @@ def test_flow_sample_emits_h50_and_preserves_exact_raw_action_replay() -> None:
     )
     assert payload["flow_noise_level"] == 0.4
     assert payload["flow_ignore_last"] is True
+    assert output.model_extra is not None
+    manifest = output.model_extra["humanoid_visual_input_manifest"]
+    assert manifest["schema"] == HUMANOID_VISUAL_INPUT_MANIFEST_SCHEMA
+    assert manifest["instruction_sha256"] == payload["instruction_sha256"]
+    assert manifest["source_frames"] == [
+        {
+            "role": "current",
+            "env_id": 0,
+            "frame_start_us": 0,
+            "frame_end_us": 0,
+            "logical_id": "d435_rgb",
+            "byte_length": len(policy_input.camera_frames[0].image_bytes),
+            "render_timestamp_us": 0,
+            "observation_decision_id": 1,
+            "render_state_sha256": "5" * 64,
+            "camera_contract_sha256": "6" * 64,
+            "image_sha256": policy_input.camera_frames[0].image_sha256,
+            "render_receipt_sha256": "8".zfill(64),
+            "scene_fingerprint": "8" * 64,
+            "model_signature_sha256": "9" * 64,
+            "camera_to_world_sha256": "a".zfill(64),
+            "renderer_binding_sha256": "14".zfill(64),
+        }
+    ]
+    assert len(manifest["source_frames"]) == int(payload["image_grid_thw"].shape[0])
+    assert len(manifest["source_frames"]) == (
+        int(payload["selected_history_indices"].numel()) + 1
+    )
+    assert manifest["pixel_values"] == {
+        "dtype": str(payload["pixel_values"].dtype),
+        "shape": list(payload["pixel_values"].shape),
+        "sha256": humanoid_model_input_tensor_sha256(payload["pixel_values"]),
+    }
+    assert payload["visual_input_manifest_sha256"] == (
+        humanoid_visual_input_manifest_sha256(manifest)
+    )
     torch.testing.assert_close(
         payload["effective_image_grid_thw"], payload["image_grid_thw"]
     )
@@ -935,9 +1025,28 @@ def test_four_tuple_psi_rebuilds_checkpoint_training_visual_pooling() -> None:
         )
     )[0]
     assert second.replay_data is not None
+    assert second.model_extra is not None
     torch.testing.assert_close(
         second.replay_data.payload["visual_pool_factors"],
         torch.tensor([2, 1], dtype=torch.int64),
+    )
+    manifest = second.model_extra["humanoid_visual_input_manifest"]
+    assert [frame["role"] for frame in manifest["source_frames"]] == [
+        "history",
+        "current",
+    ]
+    assert [frame["render_timestamp_us"] for frame in manifest["source_frames"]] == [
+        0,
+        500_000,
+    ]
+    assert [
+        frame["renderer_binding_sha256"] for frame in manifest["source_frames"]
+    ] == ["14".zfill(64), "15".zfill(64)]
+    assert len(manifest["source_frames"]) == int(
+        second.replay_data.payload["image_grid_thw"].shape[0]
+    )
+    assert len(manifest["source_frames"]) == (
+        int(second.replay_data.payload["selected_history_indices"].numel()) + 1
     )
     assert psi.model_transform.seen_pool_factors == [[1], [2, 1]]
     policy.close()

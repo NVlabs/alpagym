@@ -50,6 +50,7 @@ def _run_config(
             model=SimpleNamespace(
                 bundle_config={
                     "sampling_mode": sampling_mode,
+                    "qualification_model_source": "base_attested",
                     "expected_schedule_sha256": expected_schedule_sha256,
                     "expected_flow_noise_level": 0.4,
                     "expected_flow_ignore_last": True,
@@ -454,6 +455,7 @@ def test_schedule_identity_is_required_and_loader_is_policy_owned(
 
     bundle = get_bundle()
     assert callable(bundle.load_inference_model)
+    assert callable(bundle.export_model_checkpoint)
     sentinel = torch.nn.Linear(2, 2)
     monkeypatch.setattr(
         "alpagym_g1_vla.bundle.load_vla_rollout_model",

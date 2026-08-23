@@ -22,6 +22,9 @@ execution:
   # The topology preset selects the backend (local_process or slurm); the deploy
   # preset fills the site settings (partition/account/image/caches) below.
   backend: ???
+  # Formal humanoid experiments override this to `required`. The lifecycle then
+  # refuses to launch Cosmos without immutable source and live-runtime receipts.
+  provenance_mode: disabled
   # Set only when executing a run that was already prepared and written to disk.
   # Leave null for command=run to prepare a new run from this Hydra config.
   resolved_config_path: null
@@ -73,6 +76,10 @@ alpasim:
   repo_ref: ${alpasim_grpc_repo_ref:}
   startup_timeout_s: 1200.0
   simulation_timeout_s: 600.0
+  # The AlpaSim worker expires first; the remaining wall-clock minute is
+  # reserved for cancellation, FINALIZE/session-close, and the RPC response.
+  runtime_rollout_timeout_s: 540.0
+  simulation_cleanup_margin_s: 60.0
   wizard_args:
     topology: 1gpu
     driver: null
@@ -113,6 +120,10 @@ cosmos:
     train_batch_per_replica: 1
     max_num_steps: 1
     num_epochs: 1
+    # Seed model initialization, minibatch ordering, and trainer-side sampling.
+    # Formal experiments also enable deterministic kernels in their profile.
+    seed: 42
+    deterministic: false
     optm_lr: 1.0e-6
     # Optional per-model-part learning rates. When non-empty, generated Cosmos
     # config uses this list as train.optm_lr instead of the scalar above.
@@ -123,6 +134,19 @@ cosmos:
     optm_grad_norm_clip: 1.0
     # Linear warmup steps for the learning rate (Cosmos-RL default: 20).
     optm_warmup_steps: 20
+    # Native Cosmos resume is disabled unless every identity field below is
+    # supplied. The path is the exact
+    # `<prior-run>/cosmos/<timestamp>/checkpoints/step_N/policy` directory.
+    # Host and trainer validation bind it to a completed valid formal run and
+    # reject any load failure instead of falling back to base/HF weights.
+    resume:
+      enabled: false
+      prior_formal_run_id: null
+      checkpoint_step: null
+      checkpoint_path: null
+      checkpoint_tree_sha256: null
+      prior_postrun_receipt_sha256: null
+      expected_next_training_step: null
     # Checkpoint settings. With `enable_checkpoint: true` the cosmos resume
     # bundle is written every `save_freq` steps and always on the last step;
     # with `export_safetensors: true` an HF-compatible weight set is also
@@ -133,6 +157,7 @@ cosmos:
       enable_checkpoint: true
       save_freq: 20
       save_freq_in_epoch: 0
+      save_mode: sync
       export_safetensors: true
       max_keep: 5
     train_policy:
@@ -169,6 +194,12 @@ cosmos:
       # Optional pre/post-update KL guard against the replay behavior policy.
       # This does not anchor training to the initial checkpoint.
       ppo_target_behavior_kl: null
+      # Optional Flow-PPO actor-step backtracking. Each retry reduces the
+      # candidate actor step using margin as a conservative scale factor;
+      # acceptance remains the hard behavior-KL target above.
+      ppo_behavior_kl_backtrack: false
+      ppo_behavior_kl_backtrack_margin: 0.9
+      ppo_behavior_kl_backtrack_max_attempts: 4
       # Flattened transition rows per PPO forward/backward microbatch,
       # independent from rollout/shard mini_batch above.
       step_mini_batch: null

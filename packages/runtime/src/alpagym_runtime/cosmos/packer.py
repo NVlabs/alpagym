@@ -70,6 +70,8 @@ _PRIMITIVE_REWARD_MASK_ALIASES = (
     "primitive_reward_mask",
     "controller_tick_reward_mask",
 )
+_ACTOR_PRIMITIVE_REWARD_ALIASES = ("actor_primitive_rewards",)
+_ACTOR_PRIMITIVE_REWARD_MASK_ALIASES = ("actor_primitive_reward_mask",)
 _DURATION_TICK_ALIASES = ("duration_ticks", "controller_ticks")
 
 
@@ -375,6 +377,22 @@ def _extract_transition_training_signal(
                     value, dtype=torch.bool
                 ).reshape(1, -1)
             break
+    for alias in _ACTOR_PRIMITIVE_REWARD_ALIASES:
+        if alias in transition_payload:
+            value = transition_payload[alias]
+            if value is not None:
+                signals["actor_primitive_rewards"] = torch.as_tensor(
+                    value, dtype=torch.float32
+                ).reshape(1, -1)
+            break
+    for alias in _ACTOR_PRIMITIVE_REWARD_MASK_ALIASES:
+        if alias in transition_payload:
+            value = transition_payload[alias]
+            if value is not None:
+                signals["actor_primitive_reward_mask"] = torch.as_tensor(
+                    value, dtype=torch.bool
+                ).reshape(1, -1)
+            break
     for alias in _DURATION_TICK_ALIASES:
         if alias in transition_payload:
             value = transition_payload[alias]
@@ -418,6 +436,54 @@ def _extract_transition_training_signal(
                 "g1_vla transition.actor_valid must equal "
                 "(owning_reference_executed_ticks > 0)"
             )
+        actor_reward_mask = signals.get("actor_primitive_reward_mask")
+        if actor_reward_mask is None:
+            raise ValueError(
+                "g1_vla motion-reference replay is missing "
+                "transition.actor_primitive_reward_mask"
+            )
+        actor_rewards = signals.get("actor_primitive_rewards")
+        if actor_rewards is None:
+            raise ValueError(
+                "g1_vla motion-reference replay is missing "
+                "transition.actor_primitive_rewards"
+            )
+        primitive_rewards = signals.get("primitive_rewards")
+        primitive_reward_mask = signals.get("primitive_reward_mask")
+        if primitive_rewards is None or primitive_reward_mask is None:
+            raise ValueError(
+                "g1_vla motion-reference replay requires primitive rewards and mask"
+            )
+        width = primitive_rewards.shape[1]
+        if duration > width:
+            raise ValueError("g1_vla duration_ticks exceeds primitive reward width")
+        if primitive_reward_mask.shape != primitive_rewards.shape:
+            raise ValueError(
+                "g1_vla primitive_reward_mask must match primitive rewards"
+            )
+        if actor_reward_mask.shape != primitive_rewards.shape:
+            raise ValueError(
+                "g1_vla actor_primitive_reward_mask must match primitive rewards"
+            )
+        if actor_rewards.shape != primitive_rewards.shape:
+            raise ValueError(
+                "g1_vla actor_primitive_rewards must match primitive rewards"
+            )
+        tick_indices = torch.arange(width)
+        expected_critic_mask = (tick_indices < duration).reshape(1, -1)
+        if not torch.equal(primitive_reward_mask.cpu(), expected_critic_mask):
+            raise ValueError(
+                "g1_vla primitive_reward_mask must be the chronological duration prefix"
+            )
+        actor_start = duration - owning_ticks_raw
+        expected_actor_mask = (
+            (tick_indices >= actor_start) & (tick_indices < duration)
+        ).reshape(1, -1)
+        if not torch.equal(actor_reward_mask.cpu(), expected_actor_mask):
+            raise ValueError(
+                "g1_vla actor_primitive_reward_mask must be the owning-reference "
+                "suffix within duration_ticks"
+            )
     return signals
 
 
@@ -451,6 +517,8 @@ def _zero_padding_transition_signal(
     for field_name in (
         "primitive_rewards",
         "primitive_reward_mask",
+        "actor_primitive_rewards",
+        "actor_primitive_reward_mask",
         "duration_ticks",
     ):
         value = getattr(template, field_name)

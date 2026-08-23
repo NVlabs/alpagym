@@ -24,7 +24,7 @@ members = [
     "alpagym-workspace",
 ]
 overrides = [
-    { name = "cosmos-rl", git = "https://github.com/nvidia-cosmos/cosmos-rl.git?rev=a367b4cc814ff153e846f386fde59919ab7247e3" },
+    { name = "cosmos-rl", git = "https://github.com/thomasrantian/cosmos-rl.git?rev=c64a08ff40b3652a4cee0790fe21d7188b11114c" },
     { name = "xformers", marker = "sys_platform == 'never'" },
 ]
 
@@ -173,7 +173,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "alpagym-plugins", editable = "packages/plugins" },
-    { name = "alpasim-grpc", git = "https://github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=3d99f0cdadbcc4575a9fa9dd1c07aacb008b0d2a" },
+    { name = "alpasim-grpc", git = "ssh://git@github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=6586e54b178a695750e71b4b511cd01012141d39" },
     { name = "grpcio" },
     { name = "hydra-core", specifier = ">=1.3.2" },
     { name = "pyyaml", specifier = ">=6.0.2" },
@@ -214,8 +214,8 @@ requires-dist = [
     { name = "alpagym-host", editable = "packages/host" },
     { name = "alpagym-plugins", editable = "packages/plugins" },
     { name = "alpamayo-recipes", git = "https://github.com/NVlabs/alpamayo-recipes.git?subdirectory=src&rev=4bc76779739461a028ee8bb9008bc4082a3328dd" },
-    { name = "alpasim-grpc", git = "https://github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=3d99f0cdadbcc4575a9fa9dd1c07aacb008b0d2a" },
-    { name = "cosmos-rl", extras = ["rl", "wfm"], git = "https://github.com/nvidia-cosmos/cosmos-rl.git?rev=a367b4cc814ff153e846f386fde59919ab7247e3" },
+    { name = "alpasim-grpc", git = "ssh://git@github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=6586e54b178a695750e71b4b511cd01012141d39" },
+    { name = "cosmos-rl", extras = ["rl", "wfm"], git = "https://github.com/thomasrantian/cosmos-rl.git?rev=c64a08ff40b3652a4cee0790fe21d7188b11114c" },
     { name = "einops" },
     { name = "flash-attn", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" },
     { name = "grouped-gemm", git = "https://github.com/fanshiqing/grouped_gemm?rev=v1.1.4" },
@@ -296,7 +296,7 @@ dependencies = [
 [[package]]
 name = "alpasim-grpc"
 version = "0.55.0"
-source = { git = "https://github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=3d99f0cdadbcc4575a9fa9dd1c07aacb008b0d2a#3d99f0cdadbcc4575a9fa9dd1c07aacb008b0d2a" }
+source = { git = "ssh://git@github.com/chenyx09/alpasim.git?subdirectory=src%2Fgrpc&rev=6586e54b178a695750e71b4b511cd01012141d39#6586e54b178a695750e71b4b511cd01012141d39" }
 dependencies = [
     { name = "dataclasses-json" },
     { name = "grpcio" },
@@ -522,8 +522,8 @@ wheels = [
 
 [[package]]
 name = "cosmos-rl"
-version = "0.4.3.post1.dev40+ga367b4cc8"
-source = { git = "https://github.com/nvidia-cosmos/cosmos-rl.git?rev=a367b4cc814ff153e846f386fde59919ab7247e3#a367b4cc814ff153e846f386fde59919ab7247e3" }
+version = "0.0.0.post1.dev544+gc64a08ff4"
+source = { git = "https://github.com/thomasrantian/cosmos-rl.git?rev=c64a08ff40b3652a4cee0790fe21d7188b11114c#c64a08ff40b3652a4cee0790fe21d7188b11114c" }
 dependencies = [
     { name = "accelerate" },
     { name = "blobfile" },

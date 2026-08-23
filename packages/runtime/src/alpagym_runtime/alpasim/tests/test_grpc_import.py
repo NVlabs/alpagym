@@ -12,6 +12,7 @@ from alpagym_runtime.alpasim.grpc_import import (
     _validate_humanoid_policy_camera_abi,
     _validate_humanoid_reference_decode_context_abi,
     _validate_descriptor_fields,
+    _validate_descriptor_service_methods,
     ensure_alpasim_grpc_source,
     ensure_humanoid_policy_camera_abi,
     ensure_humanoid_reference_decode_context_abi,
@@ -48,7 +49,13 @@ def _strict_camera_abi() -> tuple[object, object]:
         "camera_contract_sha256",
         "image_sha256",
         "render_receipt_sha256",
+        "scene_fingerprint",
+        "model_signature_sha256",
+        "camera_to_world_sha256",
+        "renderer_binding_sha256",
     )
+    for number, field in enumerate(camera_image.fields_by_name.values(), start=1):
+        field.number = number
     session = _message("policy_camera_spec")
     observation = _message("camera_images")
     session.fields_by_name["policy_camera_spec"].message_type = camera_spec
@@ -64,9 +71,11 @@ def _strict_camera_abi() -> tuple[object, object]:
     contracts = SimpleNamespace(
         HUMANOID_RENDER_STATE_SCHEMA="humanoid_render_state_qpos.v1",
         HUMANOID_RENDER_RECEIPT_SCHEMA="humanoid_render_receipt.v1",
+        HUMANOID_RENDER_RECEIPT_V2_SCHEMA="humanoid_render_receipt.v2",
         HumanoidRenderState=lambda **kwargs: kwargs,
         humanoid_image_sha256=lambda image_bytes: image_bytes,
         humanoid_render_receipt_sha256=lambda **kwargs: kwargs,
+        humanoid_render_receipt_v2_sha256=lambda **kwargs: kwargs,
     )
     return descriptor, contracts
 
@@ -137,6 +146,66 @@ def test_descriptor_gate_rejects_missing_bootstrap_field() -> None:
         )
 
 
+def _abort_service_descriptor() -> object:
+    abort_request = _message("session_uuid")
+    policy_abort = SimpleNamespace(input_type=abort_request)
+    dynamics_abort = SimpleNamespace(input_type=abort_request)
+    return SimpleNamespace(
+        message_types_by_name={"HumanoidSessionAbortRequest": abort_request},
+        services_by_name={
+            "HumanoidPolicyService": SimpleNamespace(
+                methods_by_name={"abort_session": policy_abort}
+            ),
+            "HumanoidDynamicsService": SimpleNamespace(
+                methods_by_name={"abort_session": dynamics_abort}
+            ),
+        },
+    )
+
+
+def _abort_service_requirements() -> dict[str, dict[str, str]]:
+    return {
+        "HumanoidPolicyService": {"abort_session": "HumanoidSessionAbortRequest"},
+        "HumanoidDynamicsService": {"abort_session": "HumanoidSessionAbortRequest"},
+    }
+
+
+def test_abort_service_gate_accepts_both_matching_methods() -> None:
+    _validate_descriptor_service_methods(
+        _abort_service_descriptor(),
+        _abort_service_requirements(),
+        source="humanoid_pb2",
+    )
+
+
+def test_abort_service_gate_rejects_missing_method() -> None:
+    descriptor = _abort_service_descriptor()
+    del descriptor.services_by_name["HumanoidPolicyService"].methods_by_name[
+        "abort_session"
+    ]
+
+    with pytest.raises(RuntimeError, match="missing method 'abort_session'"):
+        _validate_descriptor_service_methods(
+            descriptor,
+            _abort_service_requirements(),
+            source="humanoid_pb2",
+        )
+
+
+def test_abort_service_gate_rejects_wrong_request_type() -> None:
+    descriptor = _abort_service_descriptor()
+    descriptor.services_by_name["HumanoidDynamicsService"].methods_by_name[
+        "abort_session"
+    ].input_type = _message("session_uuid")
+
+    with pytest.raises(RuntimeError, match="must accept 'HumanoidSessionAbortRequest'"):
+        _validate_descriptor_service_methods(
+            descriptor,
+            _abort_service_requirements(),
+            source="humanoid_pb2",
+        )
+
+
 def test_strict_policy_camera_abi_accepts_matching_wire_and_shared_contracts() -> None:
     descriptor, contracts = _strict_camera_abi()
 
@@ -150,6 +219,28 @@ def test_strict_policy_camera_abi_rejects_missing_image_receipt_field() -> None:
     ]
 
     with pytest.raises(RuntimeError, match="render_receipt_sha256"):
+        _validate_humanoid_policy_camera_abi(descriptor, contracts)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "wire_number"),
+    (
+        ("scene_fingerprint", 13),
+        ("model_signature_sha256", 14),
+        ("camera_to_world_sha256", 15),
+        ("renderer_binding_sha256", 16),
+    ),
+)
+def test_strict_policy_camera_abi_rejects_renderer_evidence_tag_changes(
+    field_name: str,
+    wire_number: int,
+) -> None:
+    descriptor, contracts = _strict_camera_abi()
+    descriptor.message_types_by_name["HumanoidCameraImage"].fields_by_name[
+        field_name
+    ].number = wire_number + 100
+
+    with pytest.raises(RuntimeError, match=rf"{field_name!r}.*tag {wire_number}"):
         _validate_humanoid_policy_camera_abi(descriptor, contracts)
 
 
@@ -167,7 +258,7 @@ def test_strict_policy_camera_gate_explains_matching_package_requirement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     descriptor, contracts = _strict_camera_abi()
-    del contracts.humanoid_render_receipt_sha256
+    del contracts.humanoid_render_receipt_v2_sha256
     humanoid_pb2 = SimpleNamespace(DESCRIPTOR=descriptor)
 
     def import_module(name: str) -> object:

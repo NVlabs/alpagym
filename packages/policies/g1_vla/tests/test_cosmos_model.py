@@ -108,6 +108,10 @@ class _TinyPsi(nn.Module):
         super().__init__()
         self.vlm_model = _TinyVlm()
         self.action_header = nn.Linear(4, 4)
+        self.action_header.register_parameter(
+            "fixed_encoding",
+            nn.Parameter(torch.ones(4), requires_grad=False),
+        )
 
 
 def _run_config() -> dict[str, object]:
@@ -322,7 +326,9 @@ def test_meta_lifecycle_strict_load_and_trainable_ownership(
     vlm_model = model.actor_critic.psi_model.get_submodule("vlm_model")
     action_header = model.actor_critic.psi_model.get_submodule("action_header")
     assert all(not parameter.requires_grad for parameter in vlm_model.parameters())
-    assert all(parameter.requires_grad for parameter in action_header.parameters())
+    assert action_header.weight.requires_grad
+    assert action_header.bias.requires_grad
+    assert not action_header.fixed_encoding.requires_grad
     assert all(
         parameter.requires_grad for parameter in model.actor_critic.critic.parameters()
     )
@@ -343,6 +349,7 @@ def test_meta_lifecycle_strict_load_and_trainable_ownership(
     model.post_to_empty_hook(cosmos_config)
     for name, tensor in model.actor_critic.critic.state_dict().items():
         assert torch.equal(tensor, critic_after_first_hook[name])
+    assert not model.actor_critic.psi_model.action_header.fixed_encoding.requires_grad
 
 
 def test_post_to_empty_restores_nonpersistent_qwen_rotary_buffers(
@@ -393,17 +400,19 @@ def test_optimizer_parts_exactly_partition_trainable_parameters(
         model.actor_critic.psi_model.action_header,
         model.actor_critic.critic,
     ]
-    part_parameter_ids = [
-        {id(parameter) for parameter in part.parameters()} for part in parts
+    part_trainable_parameter_ids = [
+        {id(parameter) for parameter in part.parameters() if parameter.requires_grad}
+        for part in parts
     ]
-    assert part_parameter_ids[0].isdisjoint(part_parameter_ids[1])
+    assert part_trainable_parameter_ids[0].isdisjoint(part_trainable_parameter_ids[1])
     trainable_parameter_ids = {
         id(parameter) for parameter in model.parameters() if parameter.requires_grad
     }
-    assert part_parameter_ids[0] | part_parameter_ids[1] == trainable_parameter_ids
-    assert all(
-        parameter.requires_grad for part in parts for parameter in part.parameters()
+    assert (
+        part_trainable_parameter_ids[0] | part_trainable_parameter_ids[1]
+        == trainable_parameter_ids
     )
+    assert not model.actor_critic.psi_model.action_header.fixed_encoding.requires_grad
 
 
 def test_checkpoint_key_mismatch_fails_closed(
