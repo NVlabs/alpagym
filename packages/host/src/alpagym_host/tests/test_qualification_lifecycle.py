@@ -71,6 +71,8 @@ def _qualification_config(tmp_path: Path) -> SimpleNamespace:
             humanoid=SimpleNamespace(
                 repo_path=str(tmp_path / "humanoid"),
                 scene_store_path=str(tmp_path / "scene_store"),
+                scene_cache_path=str(tmp_path / "scene_cache"),
+                runtime_cache_path=str(tmp_path / "runtime_cache"),
                 scenario_ids_by_scene={"hq_stairs": "ascend"},
                 rollout_seed_base=292285,
             ),
@@ -451,6 +453,8 @@ def test_execute_qualification_rollout_bypasses_trainer_and_persists_raw_episode
         runtime_ready = next(call for call in calls if call[0] == "runtime_ready")
         assert runtime_ready[1]["workload_kind"] == "qualification_rollout"
         assert runtime_ready[1]["import_probe"] == {"probe": "receipt"}
+        assert runtime_ready[1]["scene_cache_root"] == tmp_path / "scene_cache"
+        assert runtime_ready[1]["runtime_cache_root"] == tmp_path / "runtime_cache"
         assert any(call[0] == "formal_cleanup" for call in calls)
         finalize = next(call for call in calls if call[0] == "finalize")
         assert finalize[1]["run_completed"] is True

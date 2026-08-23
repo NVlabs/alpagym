@@ -101,6 +101,8 @@ def test_formal_provenance_copies_effective_dirty_sources_and_invalidates_drift(
         wizard_log_dirs=(wizard_log_dir,),
         workload_command=["uv", "run", "cosmos"],
         scene_store_root=tmp_path / "scene_store",
+        scene_cache_root=tmp_path / "scene_cache",
+        runtime_cache_root=tmp_path / "runtime_cache",
         import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
     )
     (humanoid / "notes" / "new.txt").write_text("changed after launch\n")
@@ -148,6 +150,8 @@ def test_runtime_ready_rejects_incomplete_abort_abi_receipt(
             wizard_log_dirs=(wizard_log_dir,),
             workload_command=["uv", "run", "cosmos"],
             scene_store_root=tmp_path / "scene_store",
+            scene_cache_root=tmp_path / "scene_cache",
+            runtime_cache_root=tmp_path / "runtime_cache",
             import_probe=probe,
         )
     assert not (owner.provenance_dir / "runtime_ready.json").exists()
@@ -166,6 +170,8 @@ def test_runtime_ready_rejects_qualification_command_outside_host_invocation(
             workload_kind="qualification_rollout",
             workload_command=["python", "attacker.py"],
             scene_store_root=tmp_path / "scene_store",
+            scene_cache_root=tmp_path / "scene_cache",
+            runtime_cache_root=tmp_path / "runtime_cache",
             import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
         )
 
@@ -197,13 +203,16 @@ def test_runtime_ready_attests_the_exact_qualification_host_invocation(
         workload_kind="qualification_rollout",
         workload_command=expected_command,
         scene_store_root=tmp_path / "scene_store",
+        scene_cache_root=tmp_path / "scene_cache",
+        runtime_cache_root=tmp_path / "runtime_cache",
         import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
     )
 
     receipt = json.loads(receipt_path.read_text())
-    assert receipt["schema_id"] == "alpagym.formal_run_runtime_ready.v2"
+    assert receipt["schema_id"] == "alpagym.formal_run_runtime_ready.v3"
     assert receipt["workload_kind"] == "qualification_rollout"
     assert receipt["workload_command"] == expected_command
+    assert receipt["scene_cache_identity"]["file_count"] == 0
 
 
 def test_runtime_ready_receipt_records_actual_image_compose_and_mounts(
@@ -250,6 +259,8 @@ def test_runtime_ready_receipt_records_actual_image_compose_and_mounts(
         wizard_log_dirs=(wizard_log_dir,),
         workload_command=["uv", "run", "cosmos"],
         scene_store_root=tmp_path / "scene_store",
+        scene_cache_root=tmp_path / "scene_cache",
+        runtime_cache_root=tmp_path / "runtime_cache",
         import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
     )
 
@@ -281,6 +292,14 @@ def test_runtime_ready_receipt_records_actual_image_compose_and_mounts(
         and service["oci_platform_manifest_digest"] == "sha256:platform-manifest"
         for service in runtime["services"]
     )
+    for service in runtime["services"]:
+        mounts = {
+            mount["destination"]: mount
+            for mount in service["mounts"]
+            if mount["type"] == "bind"
+        }
+        assert mounts["/mnt/humanoid-scene-cache"]["rw"] is False
+        assert mounts["/root/.cache"]["rw"] is True
 
 
 def test_runtime_capture_queries_exact_wizard_project_and_isolates_other_project(
@@ -332,6 +351,8 @@ def test_runtime_capture_queries_exact_wizard_project_and_isolates_other_project
         wizard_log_dirs=(wizard_log_dir,),
         workload_command=["cosmos"],
         scene_store_root=tmp_path / "scene_store",
+        scene_cache_root=tmp_path / "scene_cache",
+        runtime_cache_root=tmp_path / "runtime_cache",
         import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
     )
 
@@ -366,6 +387,8 @@ def test_runtime_capture_rejects_container_from_wrong_compose_project(
             wizard_log_dirs=(wizard_log_dir,),
             workload_command=["cosmos"],
             scene_store_root=tmp_path / "scene_store",
+            scene_cache_root=tmp_path / "scene_cache",
+            runtime_cache_root=tmp_path / "runtime_cache",
             import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
         )
 
@@ -418,6 +441,8 @@ def test_runtime_ready_rejects_container_without_snapshotted_source_mount(
             wizard_log_dirs=(wizard_log_dir,),
             workload_command=["cosmos"],
             scene_store_root=tmp_path / "scene_store",
+            scene_cache_root=tmp_path / "scene_cache",
+            runtime_cache_root=tmp_path / "runtime_cache",
             import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
         )
     assert not (tmp_path / "run" / "provenance" / "runtime_ready.json").exists()
@@ -449,6 +474,8 @@ def test_runtime_ready_rehashes_sources_before_any_docker_inspection(
             wizard_log_dirs=(wizard_log_dir,),
             workload_command=["cosmos"],
             scene_store_root=tmp_path / "scene_store",
+            scene_cache_root=tmp_path / "scene_cache",
+            runtime_cache_root=tmp_path / "runtime_cache",
             import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
         )
 
@@ -566,6 +593,8 @@ def test_runtime_ready_rejects_compose_and_live_agreement_on_wrong_destination(
             wizard_log_dirs=(wizard_log_dir,),
             workload_command=["cosmos"],
             scene_store_root=tmp_path / "scene_store",
+            scene_cache_root=tmp_path / "scene_cache",
+            runtime_cache_root=tmp_path / "runtime_cache",
             import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
         )
 
@@ -598,10 +627,202 @@ def test_runtime_ready_rejects_compose_and_live_agreement_on_read_write_source(
             wizard_log_dirs=(wizard_log_dir,),
             workload_command=["cosmos"],
             scene_store_root=tmp_path / "scene_store",
+            scene_cache_root=tmp_path / "scene_cache",
+            runtime_cache_root=tmp_path / "runtime_cache",
             import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
         )
 
     assert not (owner.provenance_dir / "runtime_ready.json").exists()
+
+
+def test_runtime_ready_requires_runtime_cache_to_be_read_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mutable native/JIT cache cannot be mounted read-only."""
+    owner, alpagym, alpasim, humanoid = _prepare_formal_owner(tmp_path, monkeypatch)
+    wizard_log_dir = _write_compose_runtime(
+        tmp_path,
+        alpasim,
+        humanoid,
+        runtime_cache_read_only=True,
+    )
+    monkeypatch.setattr(
+        "alpagym_host.formal_run_provenance._run_command",
+        _mock_docker_command(
+            alpasim=alpasim,
+            humanoid=humanoid,
+            compose_path=wizard_log_dir / "docker-compose.yaml",
+            runtime_cache_read_only=True,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="shadowing canonical destination"):
+        owner.capture_runtime_ready(
+            wizard_log_dirs=(wizard_log_dir,),
+            workload_command=["cosmos"],
+            scene_store_root=tmp_path / "scene_store",
+            scene_cache_root=tmp_path / "scene_cache",
+            runtime_cache_root=tmp_path / "runtime_cache",
+            import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
+        )
+
+
+def test_runtime_ready_rejects_overlapping_scene_and_runtime_cache_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A writable cache cannot alias any part of immutable scene provenance."""
+    owner, alpagym, alpasim, humanoid = _prepare_formal_owner(tmp_path, monkeypatch)
+    wizard_log_dir = _write_compose_runtime(tmp_path, alpasim, humanoid)
+    monkeypatch.setattr(
+        "alpagym_host.formal_run_provenance._run_command",
+        _mock_docker_command(
+            alpasim=alpasim,
+            humanoid=humanoid,
+            compose_path=wizard_log_dir / "docker-compose.yaml",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="runtime cache must be disjoint"):
+        owner.capture_runtime_ready(
+            wizard_log_dirs=(wizard_log_dir,),
+            workload_command=["cosmos"],
+            scene_store_root=tmp_path / "scene_store",
+            scene_cache_root=tmp_path / "scene_cache",
+            runtime_cache_root=tmp_path / "scene_cache",
+            import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
+        )
+
+
+def test_runtime_ready_rejects_runtime_cache_overlapping_read_only_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A writable cache cannot expose a child of any read-only bind."""
+    owner, alpagym, alpasim, humanoid = _prepare_formal_owner(tmp_path, monkeypatch)
+    protected = tmp_path / "runtime_cache" / "controller-release"
+    protected.mkdir(parents=True)
+    extra_mounts = ((protected, "/mnt/controller-release", False),)
+    wizard_log_dir = _write_compose_runtime(
+        tmp_path,
+        alpasim,
+        humanoid,
+        extra_bind_mounts=extra_mounts,
+    )
+    monkeypatch.setattr(
+        "alpagym_host.formal_run_provenance._run_command",
+        _mock_docker_command(
+            alpasim=alpasim,
+            humanoid=humanoid,
+            compose_path=wizard_log_dir / "docker-compose.yaml",
+            extra_bind_mounts=extra_mounts,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="remounts canonical source"):
+        owner.capture_runtime_ready(
+            wizard_log_dirs=(wizard_log_dir,),
+            workload_command=["cosmos"],
+            scene_store_root=tmp_path / "scene_store",
+            scene_cache_root=tmp_path / "scene_cache",
+            runtime_cache_root=tmp_path / "runtime_cache",
+            import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
+        )
+
+
+def test_runtime_ready_supports_non_visual_runtime_without_cache_mounts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Formal non-visual humanoid runs do not require renderer caches."""
+    owner, alpagym, alpasim, humanoid = _prepare_formal_owner(tmp_path, monkeypatch)
+    wizard_log_dir = _write_compose_runtime(
+        tmp_path,
+        alpasim,
+        humanoid,
+        include_visual_caches=False,
+    )
+    monkeypatch.setattr(
+        "alpagym_host.formal_run_provenance._run_command",
+        _mock_docker_command(
+            alpasim=alpasim,
+            humanoid=humanoid,
+            compose_path=wizard_log_dir / "docker-compose.yaml",
+            include_visual_caches=False,
+        ),
+    )
+
+    receipt = owner.capture_runtime_ready(
+        wizard_log_dirs=(wizard_log_dir,),
+        workload_command=["cosmos"],
+        scene_store_root=tmp_path / "scene_store",
+        scene_cache_root=None,
+        runtime_cache_root=None,
+        import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
+    )
+
+    assert receipt.is_file()
+
+
+@pytest.mark.parametrize("cache_service", ("runtime-0", "humanoid_dynamics-0"))
+def test_runtime_ready_supports_one_visual_cache_lane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cache_service: str,
+) -> None:
+    """Camera-only and controller-only profiles mount caches in one service."""
+    owner, alpagym, alpasim, humanoid = _prepare_formal_owner(tmp_path, monkeypatch)
+    cache_services = (cache_service,)
+    wizard_log_dir = _write_compose_runtime(
+        tmp_path,
+        alpasim,
+        humanoid,
+        cache_services=cache_services,
+    )
+    monkeypatch.setattr(
+        "alpagym_host.formal_run_provenance._run_command",
+        _mock_docker_command(
+            alpasim=alpasim,
+            humanoid=humanoid,
+            compose_path=wizard_log_dir / "docker-compose.yaml",
+            cache_services=cache_services,
+        ),
+    )
+
+    receipt_path = owner.capture_runtime_ready(
+        wizard_log_dirs=(wizard_log_dir,),
+        workload_command=["cosmos"],
+        scene_store_root=tmp_path / "scene_store",
+        scene_cache_root=tmp_path / "scene_cache",
+        runtime_cache_root=tmp_path / "runtime_cache",
+        import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
+    )
+
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    services = {entry["service"]: entry for entry in receipt["runtimes"][0]["services"]}
+    for service_name, service in services.items():
+        destinations = {mount["destination"] for mount in service["mounts"]}
+        assert ("/root/.cache" in destinations) is (service_name == cache_service)
+
+
+def test_finalize_rejects_scene_cache_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A coherent host-side cache replacement invalidates the formal run."""
+    owner, _alpagym, alpasim, humanoid = _prepare_formal_owner(tmp_path, monkeypatch)
+    _capture_valid_runtime(
+        owner=owner,
+        tmp_path=tmp_path,
+        alpasim=alpasim,
+        humanoid=humanoid,
+        monkeypatch=monkeypatch,
+    )
+    (tmp_path / "scene_cache" / "replacement.bin").write_bytes(b"changed")
+
+    with pytest.raises(RuntimeError, match="scene cache changed"):
+        owner.finalize(run_completed=True)
+
+    failure = json.loads(
+        (owner.provenance_dir / "postrun.json").read_text(encoding="utf-8")
+    )
+    assert failure["run_completed"] is True
 
 
 def test_runtime_ready_rejects_missing_humanoid_dynamics_service(
@@ -631,6 +852,8 @@ def test_runtime_ready_rejects_missing_humanoid_dynamics_service(
             wizard_log_dirs=(wizard_log_dir,),
             workload_command=["cosmos"],
             scene_store_root=tmp_path / "scene_store",
+            scene_cache_root=tmp_path / "scene_cache",
+            runtime_cache_root=tmp_path / "runtime_cache",
             import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
         )
 
@@ -666,6 +889,8 @@ def test_runtime_ready_rejects_read_write_shadow_under_canonical_destination(
             wizard_log_dirs=(wizard_log_dir,),
             workload_command=["cosmos"],
             scene_store_root=tmp_path / "scene_store",
+            scene_cache_root=tmp_path / "scene_cache",
+            runtime_cache_root=tmp_path / "runtime_cache",
             import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
         )
 
@@ -1493,6 +1718,8 @@ def _capture_valid_runtime(
         wizard_log_dirs=(wizard_log_dir,),
         workload_command=["uv", "run", "cosmos"],
         scene_store_root=tmp_path / "scene_store",
+        scene_cache_root=tmp_path / "scene_cache",
+        runtime_cache_root=tmp_path / "runtime_cache",
         import_probe=_test_import_probe(
             alpagym=next(
                 repository.root
@@ -1648,6 +1875,9 @@ def _write_compose_runtime(
     services: tuple[str, ...] = ("runtime-0", "humanoid_dynamics-0"),
     alpasim_src_destination: str = "/repo/src",
     alpasim_src_read_only: bool = True,
+    include_visual_caches: bool = True,
+    cache_services: tuple[str, ...] | None = None,
+    runtime_cache_read_only: bool = False,
     extra_bind_mounts: tuple[tuple[Path, str, bool], ...] = (),
 ) -> Path:
     """Write the generated Compose shape consumed by the receipt."""
@@ -1655,6 +1885,10 @@ def _write_compose_runtime(
     wizard_log_dir.mkdir()
     scene_store = tmp_path / "scene_store"
     scene_store.mkdir(exist_ok=True)
+    scene_cache = tmp_path / "scene_cache"
+    scene_cache.mkdir(exist_ok=True)
+    runtime_cache = tmp_path / "runtime_cache"
+    runtime_cache.mkdir(exist_ok=True)
     alpasim_src_mode = "ro" if alpasim_src_read_only else "rw"
     shared_volumes = [
         f"{alpasim / 'src'}:{alpasim_src_destination}:{alpasim_src_mode}",
@@ -1666,13 +1900,28 @@ def _write_compose_runtime(
             for source, destination, read_write in extra_bind_mounts
         ],
     ]
+    visual_cache_volumes = [
+        f"{scene_cache}:/mnt/humanoid-scene-cache:ro",
+        f"{runtime_cache}:/root/.cache:{'ro' if runtime_cache_read_only else 'rw'}",
+    ]
+    resolved_cache_services = set(
+        services if cache_services is None else cache_services
+    )
     (wizard_log_dir / "docker-compose.yaml").write_text(
         yaml.safe_dump(
             {
                 "services": {
                     service: {
                         "image": "runtime:local",
-                        "volumes": shared_volumes,
+                        "volumes": [
+                            *shared_volumes,
+                            *(
+                                visual_cache_volumes
+                                if include_visual_caches
+                                and service in resolved_cache_services
+                                else []
+                            ),
+                        ],
                     }
                     for service in services
                 }
@@ -1693,10 +1942,17 @@ def _mock_docker_command(
     services: tuple[str, ...] = ("runtime-0", "humanoid_dynamics-0"),
     alpasim_src_destination: str = "/repo/src",
     alpasim_src_read_only: bool = True,
+    include_visual_caches: bool = True,
+    cache_services: tuple[str, ...] | None = None,
+    runtime_cache_read_only: bool = False,
     extra_bind_mounts: tuple[tuple[Path, str, bool], ...] = (),
     compose_project: str | None = None,
 ):
     """Return a deterministic Docker command fake for a two-service runtime."""
+
+    resolved_cache_services = set(
+        services if cache_services is None else cache_services
+    )
 
     def run(command: list[str]) -> bytes:
         """Return Docker CLI JSON for the requested inspection."""
@@ -1716,6 +1972,10 @@ def _mock_docker_command(
                         omit_humanoid_mount=omit_humanoid_mount,
                         alpasim_src_destination=alpasim_src_destination,
                         alpasim_src_read_only=alpasim_src_read_only,
+                        include_visual_caches=(
+                            include_visual_caches and service in resolved_cache_services
+                        ),
+                        runtime_cache_read_only=runtime_cache_read_only,
                         extra_bind_mounts=extra_bind_mounts,
                         compose_project=compose_project,
                     )
@@ -1747,6 +2007,8 @@ def _container_inspection(
     omit_humanoid_mount: bool,
     alpasim_src_destination: str = "/repo/src",
     alpasim_src_read_only: bool = True,
+    include_visual_caches: bool = True,
+    runtime_cache_read_only: bool = False,
     extra_bind_mounts: tuple[tuple[Path, str, bool], ...] = (),
     compose_project: str | None = None,
 ) -> dict[str, object]:
@@ -1755,6 +2017,14 @@ def _container_inspection(
         (alpasim / "src", alpasim_src_destination),
         (alpasim / "plugins", "/repo/plugins"),
         (humanoid.parent / "scene_store", "/mnt/humanoid-scene-store"),
+        *(
+            [
+                (humanoid.parent / "scene_cache", "/mnt/humanoid-scene-cache"),
+                (humanoid.parent / "runtime_cache", "/root/.cache"),
+            ]
+            if include_visual_caches
+            else []
+        ),
     ]
     if not omit_humanoid_mount:
         sources.append((humanoid, "/repo/humanoid-rl-joint-sim"))
@@ -1795,6 +2065,10 @@ def _container_inspection(
                     "rw"
                     if (
                         (source == alpasim / "src" and not alpasim_src_read_only)
+                        or (
+                            source == humanoid.parent / "runtime_cache"
+                            and not runtime_cache_read_only
+                        )
                         or any(
                             source == extra_source and extra_read_write
                             for extra_source, _, extra_read_write in extra_bind_mounts
@@ -1804,6 +2078,10 @@ def _container_inspection(
                 ),
                 "RW": (
                     (source == alpasim / "src" and not alpasim_src_read_only)
+                    or (
+                        source == humanoid.parent / "runtime_cache"
+                        and not runtime_cache_read_only
+                    )
                     or any(
                         source == extra_source and extra_read_write
                         for extra_source, _, extra_read_write in extra_bind_mounts

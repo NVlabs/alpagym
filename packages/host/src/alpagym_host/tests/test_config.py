@@ -96,6 +96,7 @@ def test_hq_stairs_experiment_requires_formal_provenance() -> None:
                 "alpasim.humanoid.grail_root_path=/tmp/grail",
                 "alpasim.humanoid.visual_controller_release_path=/tmp/controller",
                 "alpasim.humanoid.scene_cache_path=/tmp/cache",
+                "alpasim.humanoid.runtime_cache_path=/tmp/runtime-cache",
             ],
         )
 
@@ -952,7 +953,7 @@ def test_humanoid_runtime_spawn_override_rejects_direct_action() -> None:
         )
 
 
-def test_humanoid_policy_camera_requires_typed_writable_cache() -> None:
+def test_humanoid_policy_camera_requires_scene_cache() -> None:
     with pytest.raises(ValueError, match="scene_cache_path is required"):
         HumanoidAlpaSimConfig(
             repo_path="/tmp/alpasim-humanoid",
@@ -966,11 +967,66 @@ def test_humanoid_policy_camera_requires_typed_writable_cache() -> None:
         )
 
 
+def test_humanoid_policy_camera_requires_disjoint_runtime_cache() -> None:
+    with pytest.raises(ValueError, match="runtime_cache_path is required"):
+        HumanoidAlpaSimConfig(
+            repo_path="/tmp/alpasim-humanoid",
+            scene_store_path="/tmp/humanoid-scenes",
+            scene_cache_path="/tmp/humanoid-cache",
+            scenario_ids_by_scene={"stairs": "ascend"},
+            execution_profile=HumanoidExecutionProfile.motion_reference,
+            grail_root_path="/tmp/GRAIL",
+            policy_camera_profile=HumanoidPolicyCameraProfile.vla_d455,
+            service_image="alpasim-humanoid-nurec:local",
+            reward_profile_id="reference_route_centered.v3",
+        )
+
+
+@pytest.mark.parametrize(
+    ("scene_cache_path", "runtime_cache_path", "match"),
+    (
+        ("/tmp/humanoid-cache", "relative-cache", "must be absolute"),
+        ("/tmp/humanoid-cache", "/tmp/humanoid-cache", "scene_cache_path"),
+        (
+            "/tmp/humanoid-cache",
+            "/tmp/alpasim-humanoid/native-cache",
+            "repo_path",
+        ),
+        (
+            "/tmp/humanoid-scenes/render-cache",
+            "/tmp/humanoid-runtime-cache",
+            "scene_store_path",
+        ),
+        (
+            "/tmp/humanoid-cache",
+            "/tmp/GRAIL/native-cache",
+            "grail_root_path",
+        ),
+        (
+            "/tmp/humanoid-cache",
+            "/tmp/visual-sonic-release/native-cache",
+            "visual_controller_release_path",
+        ),
+    ),
+)
+def test_managed_visual_cache_roots_are_disjoint(
+    scene_cache_path: str,
+    runtime_cache_path: str,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _visual_sonic_humanoid_config(
+            scene_cache_path=scene_cache_path,
+            runtime_cache_path=runtime_cache_path,
+        )
+
+
 def _visual_sonic_humanoid_config(**overrides: object) -> HumanoidAlpaSimConfig:
     values: dict[str, object] = {
         "repo_path": "/tmp/alpasim-humanoid",
         "scene_store_path": "/tmp/humanoid-scenes",
         "scene_cache_path": "/tmp/humanoid-cache",
+        "runtime_cache_path": "/tmp/humanoid-runtime-cache",
         "scenario_ids_by_scene": {"stairs": "ascend"},
         "execution_profile": HumanoidExecutionProfile.motion_reference,
         "grail_root_path": "/tmp/GRAIL",
@@ -1034,6 +1090,7 @@ def test_humanoid_policy_camera_profile_round_trips_resolved_config(
         repo_path="/tmp/alpasim-humanoid",
         scene_store_path="/tmp/humanoid-scenes",
         scene_cache_path="/tmp/humanoid-cache",
+        runtime_cache_path="/tmp/humanoid-runtime-cache",
         scenario_ids_by_scene={"stairs": "ascend"},
         execution_profile=HumanoidExecutionProfile.motion_reference,
         grail_root_path="/tmp/GRAIL",
@@ -1083,6 +1140,7 @@ def test_humanoid_motion_reference_without_camera_remains_supported() -> None:
 
     assert config.policy_camera_profile is None
     assert config.scene_cache_path is None
+    assert config.runtime_cache_path is None
 
 
 def test_vla_policy_rejects_av_runtime_route() -> None:
@@ -1100,6 +1158,16 @@ def test_vla_policy_rejects_av_policy_dispatch() -> None:
     config.policy.kind = "alpamayo"
 
     with pytest.raises(ValueError, match="policy.kind=humanoid"):
+        _validate_humanoid_config(config)
+
+
+def test_vla_runtime_cache_must_be_disjoint_from_policy_model() -> None:
+    """A renderer cache cannot write through the frozen VLA model tree."""
+    config = _make_valid_vla_validation_config()
+    assert config.alpasim.humanoid is not None
+    config.alpasim.humanoid.runtime_cache_path = f"{config.policy.model.path}/native"
+
+    with pytest.raises(ValueError, match="policy.model.path"):
         _validate_humanoid_config(config)
 
 
@@ -1196,6 +1264,7 @@ def test_humanoid_policy_camera_rejects_dynamics_only_image() -> None:
             repo_path="/tmp/alpasim-humanoid",
             scene_store_path="/tmp/humanoid-scenes",
             scene_cache_path="/tmp/humanoid-cache",
+            runtime_cache_path="/tmp/humanoid-runtime-cache",
             scenario_ids_by_scene={"stairs": "ascend"},
             execution_profile=HumanoidExecutionProfile.motion_reference,
             grail_root_path="/tmp/GRAIL",
@@ -1518,6 +1587,7 @@ def test_cosmos_config_accepts_grpo_batch_geometry(tmp_path: Path) -> None:
         "alpasim.humanoid.scene_store_path",
         "alpasim.humanoid.grail_root_path",
         "alpasim.humanoid.scene_cache_path",
+        "alpasim.humanoid.runtime_cache_path",
         "alpasim.repo_path",
     ],
 )
@@ -1534,6 +1604,7 @@ def test_vla_slurm_requires_every_worker_path_identity_mounted(
         "alpasim.humanoid.scene_store_path": tmp_path / "scene_store",
         "alpasim.humanoid.grail_root_path": tmp_path / "grail",
         "alpasim.humanoid.scene_cache_path": tmp_path / "scene_cache",
+        "alpasim.humanoid.runtime_cache_path": tmp_path / "runtime_cache",
         "alpasim.repo_path": tmp_path / "alpasim_repo",
     }
     mounts = [f"{model_root}:{model_root}"]
@@ -1563,6 +1634,9 @@ def test_vla_slurm_requires_every_worker_path_identity_mounted(
                 scene_cache_path=str(
                     required_paths["alpasim.humanoid.scene_cache_path"]
                 ),
+                runtime_cache_path=str(
+                    required_paths["alpasim.humanoid.runtime_cache_path"]
+                ),
             ),
         ),
     )
@@ -1583,6 +1657,7 @@ def test_vla_slurm_accepts_all_worker_mounts_and_local_needs_none(
         tmp_path / "scene_store",
         tmp_path / "grail",
         tmp_path / "scene_cache",
+        tmp_path / "runtime_cache",
         tmp_path / "alpasim_checkout_cache",
     ]
     config = SimpleNamespace(
@@ -1604,6 +1679,7 @@ def test_vla_slurm_accepts_all_worker_mounts_and_local_needs_none(
                 scene_store_path=str(worker_paths[2]),
                 grail_root_path=str(worker_paths[3]),
                 scene_cache_path=str(worker_paths[4]),
+                runtime_cache_path=str(worker_paths[5]),
             ),
         ),
     )
@@ -1638,6 +1714,7 @@ def test_vla_mount_preflight_precedes_unqualified_slurm_mode_rejection(
         "scene_store": tmp_path / "scene_store",
         "grail": tmp_path / "grail",
         "scene_cache": tmp_path / "scene_cache",
+        "runtime_cache": tmp_path / "runtime_cache",
     }
     run_config.alpasim.simulation_domain = "humanoid"
     run_config.alpasim.humanoid = HumanoidAlpaSimConfig(
@@ -1648,6 +1725,7 @@ def test_vla_mount_preflight_precedes_unqualified_slurm_mode_rejection(
         grail_root_path=str(humanoid_paths["grail"]),
         policy_camera_profile=HumanoidPolicyCameraProfile.vla_d435_native,
         scene_cache_path=str(humanoid_paths["scene_cache"]),
+        runtime_cache_path=str(humanoid_paths["runtime_cache"]),
         service_image="combined-humanoid:latest",
         reward_profile_id="reference_route_centered.v3",
     )
@@ -1908,6 +1986,7 @@ def _make_valid_vla_validation_config() -> RunConfig:
                 kind="humanoid",
                 model=SimpleNamespace(
                     kind="g1_vla",
+                    path="/tmp/vla-model",
                     step_dt_us=500_000,
                     use_cameras=["vla_d435_policy_rgb"],
                     bundle_config={
@@ -1928,6 +2007,7 @@ def _make_valid_vla_validation_config() -> RunConfig:
             ),
             alpasim=SimpleNamespace(
                 simulation_domain="humanoid",
+                repo_path="/tmp/alpasim",
                 humanoid=SimpleNamespace(
                     repo_path=humanoid_repo_path,
                     scene_store_path=scene_store_path,
@@ -1940,6 +2020,7 @@ def _make_valid_vla_validation_config() -> RunConfig:
                     ),
                     reference_frame_count=50,
                     policy_camera_profile=HumanoidPolicyCameraProfile.vla_d435_native,
+                    runtime_cache_path="/tmp/native-runtime-cache",
                 ),
                 wizard_args=SimpleNamespace(
                     control_timestep_us=500_000,

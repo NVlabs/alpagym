@@ -42,9 +42,9 @@ alpasim:
     robot_physics_profile: sonic.isaac_training.g1_cylinder_model_12.mujoco_port.v1
     policy_camera_profile: vla_d435_native
     scene_cache_path: ???
-    # Simulation consumes a prebuilt, fingerprint-bound cache. Cache generation
-    # belongs to scene preparation and is never an implicit training side effect.
-    scene_cache_policy: require
+    # Mutable Torch/Warp/native build caches live outside the immutable scene
+    # cache and all provenance-owned repositories/assets.
+    runtime_cache_path: ???
     num_envs: 1
     rollout_seed_base: 292285
     # ckpt1500 in-distribution qualification start. This changes only the

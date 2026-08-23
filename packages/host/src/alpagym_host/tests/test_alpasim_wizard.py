@@ -25,7 +25,6 @@ from alpagym_host.config import (
     HumanoidExecutionProfile,
     HumanoidPolicyCameraProfile,
     HumanoidReferenceControllerProfile,
-    HumanoidSceneCachePolicy,
 )
 
 
@@ -121,6 +120,7 @@ def test_wizard_command_selects_strict_motion_reference_profile(
         grail_root_path="/workspace/GRAIL",
         policy_camera_profile=HumanoidPolicyCameraProfile.vla_d455,
         scene_cache_path="/workspace/cache/hq_stairs",
+        runtime_cache_path="/workspace/runtime-cache",
         service_image="alpasim-humanoid-nurec:local",
         reward_profile_id="reference_route_centered.v3",
         expected_scene_fingerprints={"hq_stairs": "a" * 64},
@@ -162,6 +162,7 @@ def test_wizard_command_selects_strict_motion_reference_profile(
     assert derived_horizon_override in command
     assert command.count("cameras=humanoid_vla_d455") == 1
     assert command.count("defines.humanoid_scene_cache=/workspace/cache/hq_stairs") == 1
+    assert command.count("defines.humanoid_runtime_cache=/workspace/runtime-cache") == 1
     checkout_root = tmp_path.resolve()
     assert f"services.runtime.volumes.3={checkout_root / 'src'}:/repo/src:ro" in command
     assert (
@@ -205,7 +206,7 @@ def test_wizard_command_selects_visual_sonic_as_atomic_tracker_profile(
         ),
         policy_camera_profile=HumanoidPolicyCameraProfile.vla_d435_native,
         scene_cache_path="/workspace/cache/hq_stairs",
-        scene_cache_policy=HumanoidSceneCachePolicy.require,
+        runtime_cache_path="/workspace/runtime-cache",
         service_image="alpasim-humanoid-nurec:local",
         reward_profile_id="direct_v9_shaped.v1",
         expected_scene_fingerprints={"hq_stairs": "a" * 64},
@@ -228,19 +229,13 @@ def test_wizard_command_selects_visual_sonic_as_atomic_tracker_profile(
         '"sonic.isaac_training.g1_cylinder_model_12.mujoco_port.v1"'
     ) in command
     assert command.count("defines.humanoid_scene_cache=/workspace/cache/hq_stairs") == 1
+    assert command.count("defines.humanoid_runtime_cache=/workspace/runtime-cache") == 1
     assert 'runtime.humanoid.controller.options.max_control_ticks="750"' in command
     assert "runtime.simulation_config.control_timestep_us=100000" in command
     assert "runtime.simulation_config.n_sim_steps=150" in command
     assert "runtime.humanoid.reference.control_ticks_per_policy_step=5" in command
     assert command.count("cameras=humanoid_vla_d435_native") == 1
-    assert (
-        command.count("runtime.humanoid.policy_camera.options.cache_policy=require")
-        == 1
-    )
-    assert (
-        command.count("runtime.humanoid.controller.options.visual_cache_policy=require")
-        == 1
-    )
+    assert not any("cache_policy" in argument for argument in command)
 
 
 def test_wizard_command_sends_v9_reward_without_route_center_options(
@@ -345,6 +340,7 @@ def test_wizard_command_rejects_one_pose_for_multiple_scenes(tmp_path: Path) -> 
         "runtime.humanoid.policy_camera.schema=untrusted.v0",
         "runtime.humanoid.session_cleanup_timeout_s=9999",
         "defines.humanoid_scene_cache=/tmp/untrusted",
+        "defines.humanoid_runtime_cache=/tmp/untrusted",
         "defines={humanoid_robot_physics_profile:untrusted}",
         "runtime.humanoid={num_envs:99}",
         "services.runtime.volumes=[]",
@@ -420,11 +416,11 @@ def test_start_wizard_uses_separate_process_group(
     assert calls[0]["start_new_session"] is True
 
 
-def test_start_wizard_creates_typed_policy_camera_cache(
+def test_start_wizard_requires_scene_cache_and_creates_runtime_cache(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Creates the writable renderer cache before Wizard validates mounts."""
+    """Keeps scene inputs immutable while preparing mutable native caches."""
 
     class FakeProcess:
         """Minimal process returned by the patched launcher."""
@@ -441,11 +437,14 @@ def test_start_wizard_creates_typed_policy_camera_cache(
         )
     )
     config.simulation_domain = "humanoid"
-    cache_path = tmp_path / "render-cache"
+    cache_path = tmp_path / "scene-cache"
+    cache_path.mkdir()
+    runtime_cache_path = tmp_path / "runtime-cache"
     config.humanoid = HumanoidAlpaSimConfig(
         repo_path="/workspace/humanoid",
         scene_store_path="/workspace/scenes",
         scene_cache_path=str(cache_path),
+        runtime_cache_path=str(runtime_cache_path),
         scenario_ids_by_scene={"hq_stairs": "ascend"},
         execution_profile=HumanoidExecutionProfile.motion_reference,
         grail_root_path="/workspace/GRAIL",
@@ -463,6 +462,7 @@ def test_start_wizard_creates_typed_policy_camera_cache(
     )
 
     assert cache_path.is_dir()
+    assert runtime_cache_path.is_dir()
 
 
 def test_start_wizard_requires_existing_typed_scene_cache(
@@ -491,11 +491,12 @@ def test_start_wizard_requires_existing_typed_scene_cache(
     )
     config.simulation_domain = "humanoid"
     cache_path = tmp_path / "missing-render-cache"
+    runtime_cache_path = tmp_path / "runtime-cache"
     config.humanoid = HumanoidAlpaSimConfig(
         repo_path="/workspace/humanoid",
         scene_store_path="/workspace/scenes",
         scene_cache_path=str(cache_path),
-        scene_cache_policy=HumanoidSceneCachePolicy.require,
+        runtime_cache_path=str(runtime_cache_path),
         scenario_ids_by_scene={"hq_stairs": "ascend"},
         execution_profile=HumanoidExecutionProfile.motion_reference,
         grail_root_path="/workspace/GRAIL",
@@ -514,6 +515,7 @@ def test_start_wizard_requires_existing_typed_scene_cache(
         )
 
     assert not cache_path.exists()
+    assert not runtime_cache_path.exists()
     assert popen_called is False
 
 

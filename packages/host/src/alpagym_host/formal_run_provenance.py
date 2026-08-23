@@ -633,6 +633,8 @@ class FormalRunProvenance:
         workload_command: list[str],
         workload_kind: str = "cosmos_training",
         scene_store_root: Path,
+        scene_cache_root: Path | None,
+        runtime_cache_root: Path | None,
         import_probe: dict[str, Any],
     ) -> Path:
         """Freeze running Compose containers, images, mounts, and workload identity.
@@ -692,15 +694,32 @@ class FormalRunProvenance:
             alpasim_root=alpasim_root,
             critical_environment=self.prelaunch_manifest["critical_environment"],
         )
+        scene_cache_identity = (
+            _directory_tree_identity(scene_cache_root)
+            if scene_cache_root is not None
+            else None
+        )
         runtime_receipts = [
             _capture_compose_runtime(
                 wizard_log_dir=wizard_log_dir,
                 alpasim_root=alpasim_root,
                 humanoid_root=humanoid_root,
                 scene_store_root=scene_store_root,
+                scene_cache_root=scene_cache_root,
+                runtime_cache_root=runtime_cache_root,
             )
             for wizard_log_dir in wizard_log_dirs
         ]
+        if scene_cache_root is not None:
+            assert scene_cache_identity is not None
+            observed_scene_cache_identity = _directory_tree_identity(scene_cache_root)
+            if (
+                observed_scene_cache_identity["tree_sha256"]
+                != scene_cache_identity["tree_sha256"]
+            ):
+                raise RuntimeError(
+                    "formal scene cache changed during runtime-ready inspection"
+                )
         admission_watch_state = self._record_source_watch_checkpoint(
             filename="source_watch_runtime_ready.json",
             stage="runtime_ready_admission",
@@ -710,7 +729,7 @@ class FormalRunProvenance:
                 "formal source watch observed a mutation during runtime inspection"
             )
         receipt = {
-            "schema_id": "alpagym.formal_run_runtime_ready.v2",
+            "schema_id": "alpagym.formal_run_runtime_ready.v3",
             "captured_at_utc": datetime.now(UTC).isoformat(),
             "workload_kind": workload_kind,
             "workload_command": list(workload_command),
@@ -726,6 +745,7 @@ class FormalRunProvenance:
             ],
             "import_probe": validated_import_probe,
             "source_watch_receipt_sha256": admission_watch_state["receipt_sha256"],
+            "scene_cache_identity": scene_cache_identity,
             "runtimes": runtime_receipts,
         }
         receipt["receipt_sha256"] = _canonical_sha256(receipt)
@@ -804,6 +824,18 @@ class FormalRunProvenance:
                     ],
                     expected_receipt_sha256=self._runtime_ready_receipt_sha256,
                 )
+                expected_scene_cache = runtime_ready["scene_cache_identity"]
+                if expected_scene_cache is not None:
+                    observed_scene_cache = _directory_tree_identity(
+                        Path(expected_scene_cache["path_annotation"])
+                    )
+                    if (
+                        observed_scene_cache["tree_sha256"]
+                        != expected_scene_cache["tree_sha256"]
+                    ):
+                        raise RuntimeError(
+                            "formal scene cache changed after runtime admission"
+                        )
                 watch_state = self._record_source_watch_checkpoint(
                     filename="source_watch_postrun.json",
                     stage="postrun",
@@ -1780,6 +1812,134 @@ def _validate_source_watch_receipt(receipt: Any, *, expected_stage: str) -> None
         raise ValueError("formal source-watch receipt SHA256 is invalid")
 
 
+def _directory_tree_identity(root: Path) -> dict[str, Any]:
+    """Hash an immutable directory tree without following links."""
+
+    root = _normalized_absolute_path(root)
+    resolved_root = root.resolve(strict=True)
+    if root != resolved_root or not root.is_dir():
+        raise ValueError(
+            f"formal scene cache must be a canonical non-symlink directory: {root}"
+        )
+    files: list[dict[str, Any]] = []
+    directories: list[str] = []
+
+    def scan(directory: Path, relative_directory: PurePosixPath) -> None:
+        """Collect one stable directory level and recurse into real children."""
+
+        before = os.lstat(directory)
+        if not stat.S_ISDIR(before.st_mode):
+            raise ValueError(
+                f"formal scene cache entry is not a directory: {directory}"
+            )
+        with os.scandir(directory) as iterator:
+            entries = sorted(iterator, key=lambda entry: entry.name)
+        for entry in entries:
+            entry_path = directory / entry.name
+            relative_path = relative_directory / entry.name
+            metadata = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError(
+                    f"formal scene cache must not contain symlinks: {entry_path}"
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                directories.append(relative_path.as_posix())
+                scan(entry_path, relative_path)
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(
+                    f"formal scene cache contains a special file: {entry_path}"
+                )
+            identity = _file_identity(entry_path)
+            files.append(
+                {
+                    "relative_path": relative_path.as_posix(),
+                    "sha256": identity["sha256"],
+                    "size_bytes": identity["size_bytes"],
+                }
+            )
+        after = os.lstat(directory)
+        if _stable_file_metadata(before) != _stable_file_metadata(after):
+            raise RuntimeError(
+                f"formal scene cache directory changed while hashing: {directory}"
+            )
+
+    scan(root, PurePosixPath())
+    payload = {
+        "schema_id": "alpagym.scene_cache_tree.v1",
+        "directories": directories,
+        "files": files,
+    }
+    return {
+        "path_annotation": str(root),
+        "tree_sha256": _canonical_sha256(payload),
+        "file_count": len(files),
+        "total_size_bytes": sum(entry["size_bytes"] for entry in files),
+        "directories": directories,
+        "files": files,
+    }
+
+
+def _validate_directory_tree_identity(value: Any) -> None:
+    """Validate one optional scene-cache tree identity from a runtime receipt."""
+
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != {
+        "path_annotation",
+        "tree_sha256",
+        "file_count",
+        "total_size_bytes",
+        "directories",
+        "files",
+    }:
+        raise ValueError("formal scene cache identity has an unexpected schema")
+    if not Path(value["path_annotation"]).is_absolute():
+        raise ValueError("formal scene cache identity path must be absolute")
+    if (
+        not isinstance(value["tree_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["tree_sha256"]) is None
+    ):
+        raise ValueError("formal scene cache identity SHA256 is invalid")
+    if not isinstance(value["directories"], list) or not all(
+        isinstance(path, str) and path for path in value["directories"]
+    ):
+        if value["directories"] != []:
+            raise TypeError("formal scene cache directories must be strings")
+    if not isinstance(value["files"], list):
+        raise TypeError("formal scene cache files must be a list")
+    if value["file_count"] != len(value["files"]):
+        raise ValueError("formal scene cache file count is invalid")
+    total_size_bytes = 0
+    for entry in value["files"]:
+        if not isinstance(entry, dict) or set(entry) != {
+            "relative_path",
+            "sha256",
+            "size_bytes",
+        }:
+            raise ValueError("formal scene cache file identity is invalid")
+        relative_path = PurePosixPath(entry["relative_path"])
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError("formal scene cache file path is unsafe")
+        if (
+            not isinstance(entry["sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
+        ):
+            raise ValueError("formal scene cache file SHA256 is invalid")
+        if not isinstance(entry["size_bytes"], int) or entry["size_bytes"] < 0:
+            raise ValueError("formal scene cache file size is invalid")
+        total_size_bytes += entry["size_bytes"]
+    if value["total_size_bytes"] != total_size_bytes:
+        raise ValueError("formal scene cache total size is invalid")
+    payload = {
+        "schema_id": "alpagym.scene_cache_tree.v1",
+        "directories": value["directories"],
+        "files": value["files"],
+    }
+    if value["tree_sha256"] != _canonical_sha256(payload):
+        raise ValueError("formal scene cache tree SHA256 is invalid")
+
+
 def _read_runtime_ready_receipt(
     path: Path,
     *,
@@ -1805,12 +1965,13 @@ def _read_runtime_ready_receipt(
         "critical_environment_sha256",
         "import_probe",
         "source_watch_receipt_sha256",
+        "scene_cache_identity",
         "runtimes",
         "receipt_sha256",
     }
     if set(receipt) != expected_keys:
         raise ValueError("formal runtime receipt has an unexpected schema")
-    if receipt["schema_id"] != "alpagym.formal_run_runtime_ready.v2":
+    if receipt["schema_id"] != "alpagym.formal_run_runtime_ready.v3":
         raise ValueError("formal runtime receipt schema_id is not supported")
     stored_sha256 = receipt["receipt_sha256"]
     if not isinstance(stored_sha256, str) or len(stored_sha256) != 64:
@@ -1835,6 +1996,7 @@ def _read_runtime_ready_receipt(
             "formal runtime receipt critical environment differs from prelaunch"
         )
     _validate_import_probe_identity(receipt["import_probe"])
+    _validate_directory_tree_identity(receipt["scene_cache_identity"])
     source_watch = _read_json_regular(path.parent / "source_watch_runtime_ready.json")
     _validate_source_watch_receipt(
         source_watch, expected_stage="runtime_ready_admission"
@@ -1933,6 +2095,8 @@ def _capture_compose_runtime(
     alpasim_root: Path,
     humanoid_root: Path,
     scene_store_root: Path,
+    scene_cache_root: Path | None,
+    runtime_cache_root: Path | None,
 ) -> dict[str, Any]:
     """Capture and validate one Wizard-owned local Compose runtime."""
     wizard_log_dir = wizard_log_dir.resolve(strict=True)
@@ -2032,14 +2196,41 @@ def _capture_compose_runtime(
             "formal humanoid Compose runtime has no humanoid-dynamics service"
         )
     executable_services = runtime_services | dynamics_services
-    canonical_mounts = {
-        str((alpasim_root / "src").resolve(strict=True)): "/repo/src",
-        str((alpasim_root / "plugins").resolve(strict=True)): "/repo/plugins",
-        str(humanoid_root.resolve(strict=True)): "/repo/humanoid-rl-joint-sim",
-        str(scene_store_root.expanduser().resolve(strict=True)): (
-            "/mnt/humanoid-scene-store"
-        ),
+    alpasim_src = (alpasim_root / "src").resolve(strict=True)
+    alpasim_plugins = (alpasim_root / "plugins").resolve(strict=True)
+    humanoid_source = humanoid_root.resolve(strict=True)
+    scene_store = scene_store_root.expanduser().resolve(strict=True)
+    if (scene_cache_root is None) != (runtime_cache_root is None):
+        raise ValueError(
+            "formal scene and runtime cache roots must either both be set or both be absent"
+        )
+    common_mounts = {
+        str(alpasim_src): ("/repo/src", False),
+        str(alpasim_plugins): ("/repo/plugins", False),
+        str(humanoid_source): ("/repo/humanoid-rl-joint-sim", False),
+        str(scene_store): ("/mnt/humanoid-scene-store", False),
     }
+    cache_mounts: dict[str, tuple[str, bool]] = {}
+    if scene_cache_root is not None and runtime_cache_root is not None:
+        scene_cache = scene_cache_root.expanduser().resolve(strict=True)
+        runtime_cache = runtime_cache_root.expanduser().resolve(strict=True)
+        _require_cache_source_isolation(
+            scene_cache=scene_cache,
+            runtime_cache=runtime_cache,
+            protected_sources={
+                "AlpaSim source": alpasim_src,
+                "AlpaSim plugins": alpasim_plugins,
+                "Humanoid source": humanoid_source,
+                "SceneStore": scene_store,
+            },
+        )
+        cache_mounts[str(scene_cache)] = (
+            "/mnt/humanoid-scene-cache",
+            False,
+        )
+        cache_mounts[str(runtime_cache)] = ("/root/.cache", True)
+    canonical_mounts = {**common_mounts, **cache_mounts}
+    cache_service_count = 0
     for service in executable_services:
         inspection = service_inspections[service]
         actual_bind_mounts = sorted(
@@ -2068,17 +2259,42 @@ def _capture_compose_runtime(
             mounts=inspection["Mounts"],
             canonical_mounts=canonical_mounts,
         )
-        for source, destination in canonical_mounts.items():
+        for source, (destination, expected_rw) in common_mounts.items():
             source_mounts = [
                 mount for mount in actual_bind_mounts if mount["source"] == source
             ]
             if source_mounts != [
-                {"source": source, "destination": destination, "rw": False}
+                {"source": source, "destination": destination, "rw": expected_rw}
             ]:
+                access = "read-write" if expected_rw else "read-only"
                 raise RuntimeError(
-                    f"Compose service {service!r} violates canonical read-only mount "
-                    f"mapping {source} -> {destination}"
+                    f"Compose service {service!r} violates canonical {access} "
+                    f"mount mapping {source} -> {destination}"
                 )
+        if cache_mounts:
+            observed_cache_mounts = {
+                source: [
+                    mount for mount in actual_bind_mounts if mount["source"] == source
+                ]
+                for source in cache_mounts
+            }
+            if any(observed_cache_mounts.values()):
+                for source, (destination, expected_rw) in cache_mounts.items():
+                    expected = {
+                        "source": source,
+                        "destination": destination,
+                        "rw": expected_rw,
+                    }
+                    if observed_cache_mounts[source] != [expected]:
+                        raise RuntimeError(
+                            f"Compose service {service!r} must mount the complete "
+                            "scene/runtime cache pair with canonical access modes"
+                        )
+                cache_service_count += 1
+    if cache_mounts and cache_service_count == 0:
+        raise RuntimeError(
+            "formal visual runtime has no service with the canonical cache pair"
+        )
 
     image_ids = sorted({str(inspection["Image"]) for inspection in inspections})
     image_inspections = json.loads(
@@ -2168,14 +2384,14 @@ def _audit_canonical_mount_isolation(
     *,
     service: str,
     mounts: Any,
-    canonical_mounts: dict[str, str],
+    canonical_mounts: dict[str, tuple[str, bool]],
 ) -> None:
     """Reject bind/volume/tmpfs shadows around provenance-owned source roots."""
     if not isinstance(mounts, list):
         raise TypeError(f"Compose service {service!r} Mounts must be a list")
     canonical_sources = {
-        Path(source).resolve(strict=True): PurePosixPath(destination)
-        for source, destination in canonical_mounts.items()
+        Path(source).resolve(strict=True): (PurePosixPath(destination), expected_rw)
+        for source, (destination, expected_rw) in canonical_mounts.items()
     }
     for mount in mounts:
         if not isinstance(mount, dict):
@@ -2203,14 +2419,17 @@ def _audit_canonical_mount_isolation(
             mount_type == "bind"
             and source_path == canonical_source
             and destination == canonical_destination
-            and mount.get("RW") is False
-            for canonical_source, canonical_destination in canonical_sources.items()
+            and mount.get("RW") is expected_rw
+            for canonical_source, (
+                canonical_destination,
+                expected_rw,
+            ) in canonical_sources.items()
         )
         destination_overlaps = any(
             destination == canonical_destination
             or destination.is_relative_to(canonical_destination)
             or canonical_destination.is_relative_to(destination)
-            for canonical_destination in canonical_sources.values()
+            for canonical_destination, _expected_rw in canonical_sources.values()
         )
         if destination_overlaps and not allowed_canonical:
             raise RuntimeError(
@@ -2229,6 +2448,37 @@ def _audit_canonical_mount_isolation(
                     f"Compose service {service!r} remounts canonical source at an "
                     f"alternate location: {source_path} -> {destination}"
                 )
+
+
+def _require_cache_source_isolation(
+    *,
+    scene_cache: Path,
+    runtime_cache: Path,
+    protected_sources: dict[str, Path],
+) -> None:
+    """Reject cache roots that alias or contain provenance-owned source roots."""
+
+    pairs = [
+        ("runtime cache", runtime_cache, "scene cache", scene_cache),
+        *[
+            ("scene cache", scene_cache, label, source)
+            for label, source in protected_sources.items()
+        ],
+        *[
+            ("runtime cache", runtime_cache, label, source)
+            for label, source in protected_sources.items()
+        ],
+    ]
+    for first_label, first, second_label, second in pairs:
+        if (
+            first == second
+            or first.is_relative_to(second)
+            or second.is_relative_to(first)
+        ):
+            raise RuntimeError(
+                f"formal {first_label} must be disjoint from {second_label}: "
+                f"{first} versus {second}"
+            )
 
 
 def _configured_bind_mounts(

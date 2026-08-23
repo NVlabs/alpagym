@@ -268,6 +268,16 @@ def execute_qualification_rollout(config: RunConfig) -> QualificationArtifacts:
                 workload_kind="qualification_rollout",
                 workload_command=[str(Path(sys.executable).resolve()), *sys.argv],
                 scene_store_root=Path(humanoid.scene_store_path),
+                scene_cache_root=(
+                    Path(humanoid.scene_cache_path)
+                    if humanoid.scene_cache_path is not None
+                    else None
+                ),
+                runtime_cache_root=(
+                    Path(humanoid.runtime_cache_path)
+                    if humanoid.runtime_cache_path is not None
+                    else None
+                ),
                 import_probe=import_probe,
             )
 

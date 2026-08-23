@@ -78,7 +78,7 @@ alpamayo-r1 = { git = "https://github.com/NVlabs/alpamayo.git", rev = "4cda35d22
 alpamayo-recipes = { git = "https://github.com/NVlabs/alpamayo-recipes.git", subdirectory = "src", rev = "4bc76779739461a028ee8bb9008bc4082a3328dd" }
 # The AlpaSim fork is private; use SSH so authenticated fresh clones and uv
 # resolves use the same access path documented by the integration README.
-alpasim-grpc = { git = "ssh://git@github.com/chenyx09/alpasim.git", subdirectory = "src/grpc", rev = "e4037334f062009c2fc41c9648625d291f68e5fb" }
+alpasim-grpc = { git = "ssh://git@github.com/chenyx09/alpasim.git", subdirectory = "src/grpc", rev = "55a22b809a83eb3b50b4a658c1d811ad9754f7b9" }
 cosmos-rl = { git = "https://github.com/thomasrantian/cosmos-rl.git", rev = "c64a08ff40b3652a4cee0790fe21d7188b11114c" }
 flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
 torch = { index = "pytorch-cu128" }

@@ -167,13 +167,6 @@ class HumanoidPolicyCameraProfile(StrEnum):
                 return "humanoid_vla_d435_native"
 
 
-class HumanoidSceneCachePolicy(StrEnum):
-    """Lifecycle policy for the scene-bound NuRec renderer cache."""
-
-    build_if_missing = "build_if_missing"
-    require = "require"
-
-
 class HumanoidReferenceControllerProfile(StrEnum):
     """Dynamics-owned tracker selected for a motion-reference rollout."""
 
@@ -532,15 +525,11 @@ class HumanoidAlpaSimConfig:
     # Selects an atomic AlpaSim cameras config group.  A null value preserves
     # motion-reference policies that do not consume rendered observations.
     policy_camera_profile: HumanoidPolicyCameraProfile | None = None
-    # Writable host path mounted into the worker-local policy-camera renderer.
+    # Immutable, prebuilt scene-render cache mounted into managed visual services.
     scene_cache_path: str | None = None
-    # One host-owned policy is applied atomically to both the policy camera and
-    # Visual SONIC render lanes.  Formal qualification uses ``require`` so a
-    # rollout cannot silently build or switch cache identity; scene-preparation
-    # workflows may opt into ``build_if_missing`` explicitly.
-    scene_cache_policy: HumanoidSceneCachePolicy = (
-        HumanoidSceneCachePolicy.build_if_missing
-    )
+    # Mutable native/JIT cache mounted at /root/.cache.  This must be physically
+    # separate from the provenance-owned scene inputs above.
+    runtime_cache_path: str | None = None
     # Host-frozen identity snapshot.  Authored configs leave this empty; run
     # preparation fills it from every selected SceneStore manifest before the
     # resolved config is written.
@@ -593,6 +582,65 @@ class HumanoidAlpaSimConfig:
             and self.reference_controller_profile
             is HumanoidReferenceControllerProfile.sonic_visual
         )
+        managed_visual = (
+            self.policy_camera_profile is not None or visual_reference_controller
+        )
+        if managed_visual:
+            cache_paths = (
+                ("scene_cache_path", self.scene_cache_path),
+                ("runtime_cache_path", self.runtime_cache_path),
+            )
+            for field_name, value in cache_paths:
+                if not value:
+                    raise ValueError(
+                        f"HumanoidAlpaSimConfig.{field_name} is required for "
+                        "managed visual simulation"
+                    )
+                if not Path(value).expanduser().is_absolute():
+                    raise ValueError(
+                        f"HumanoidAlpaSimConfig.{field_name} must be absolute"
+                    )
+            assert self.scene_cache_path is not None
+            assert self.runtime_cache_path is not None
+            protected_paths = (
+                ("scene_cache_path", self.scene_cache_path),
+                ("repo_path", self.repo_path),
+                ("scene_store_path", self.scene_store_path),
+                ("grail_root_path", self.grail_root_path),
+                (
+                    "visual_controller_release_path",
+                    self.visual_controller_release_path,
+                ),
+            )
+            runtime_cache = Path(self.runtime_cache_path).expanduser().resolve()
+            for field_name, value in protected_paths:
+                if value is None:
+                    continue
+                protected = Path(value).expanduser().resolve()
+                if (
+                    runtime_cache == protected
+                    or runtime_cache.is_relative_to(protected)
+                    or protected.is_relative_to(runtime_cache)
+                ):
+                    raise ValueError(
+                        "HumanoidAlpaSimConfig.runtime_cache_path must be disjoint "
+                        f"from {field_name}"
+                    )
+            scene_cache = Path(self.scene_cache_path).expanduser().resolve()
+            for field_name, value in (
+                ("repo_path", self.repo_path),
+                ("scene_store_path", self.scene_store_path),
+            ):
+                protected = Path(value).expanduser().resolve()
+                if (
+                    scene_cache == protected
+                    or scene_cache.is_relative_to(protected)
+                    or protected.is_relative_to(scene_cache)
+                ):
+                    raise ValueError(
+                        "HumanoidAlpaSimConfig.scene_cache_path must be disjoint "
+                        f"from {field_name}"
+                    )
         if self.policy_camera_profile is not None:
             if self.execution_profile is not HumanoidExecutionProfile.motion_reference:
                 raise ValueError(
@@ -617,6 +665,11 @@ class HumanoidAlpaSimConfig:
         elif self.scene_cache_path is not None and not visual_reference_controller:
             raise ValueError(
                 "HumanoidAlpaSimConfig.scene_cache_path requires a policy camera "
+                "or visual reference controller"
+            )
+        if self.runtime_cache_path is not None and not managed_visual:
+            raise ValueError(
+                "HumanoidAlpaSimConfig.runtime_cache_path requires a policy camera "
                 "or visual reference controller"
             )
         if self.execution_profile is HumanoidExecutionProfile.motion_reference:

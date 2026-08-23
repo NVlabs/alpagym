@@ -20,7 +20,6 @@ from alpagym_host.config import (
     ExecutionBackend,
     HumanoidExecutionProfile,
     HumanoidReferenceControllerProfile,
-    HumanoidSceneCachePolicy,
     alpagym_project_root,
 )
 
@@ -39,6 +38,7 @@ _MOTION_REFERENCE_RESERVED_OVERRIDE_PREFIXES = (
     "defines.humanoid_repo",
     "defines.humanoid_scene_store",
     "defines.humanoid_scene_cache",
+    "defines.humanoid_runtime_cache",
     "defines.humanoid_policy_camera_profile",
     "defines.humanoid_scene_fingerprints_json",
     "defines.humanoid_grail_root",
@@ -154,16 +154,24 @@ def _build_wizard_command(
                 f"runtime.humanoid.num_envs={config.humanoid.num_envs}",
             )
         )
-        if config.humanoid.policy_camera_profile is not None:
+        managed_visual = config.humanoid.policy_camera_profile is not None or (
+            reference_mode
+            and config.humanoid.reference_controller_profile
+            is HumanoidReferenceControllerProfile.sonic_visual
+        )
+        if managed_visual:
             assert config.humanoid.scene_cache_path is not None
+            assert config.humanoid.runtime_cache_path is not None
             argv.extend(
                 (
-                    "cameras="
-                    f"{config.humanoid.policy_camera_profile.wizard_config_group}",
                     f"defines.humanoid_scene_cache={config.humanoid.scene_cache_path}",
-                    "runtime.humanoid.policy_camera.options.cache_policy="
-                    + config.humanoid.scene_cache_policy.value,
+                    "defines.humanoid_runtime_cache="
+                    + config.humanoid.runtime_cache_path,
                 )
+            )
+        if config.humanoid.policy_camera_profile is not None:
+            argv.append(
+                f"cameras={config.humanoid.policy_camera_profile.wizard_config_group}"
             )
         # Direct-action tasks consume these through registration_options;
         # motion-reference tasks consume them in the trusted controller plugin.
@@ -243,15 +251,6 @@ def _build_wizard_command(
                     "defines.humanoid_robot_physics_profile="
                     + json.dumps(config.humanoid.robot_physics_profile)
                 )
-                argv.append(
-                    "runtime.humanoid.controller.options.visual_cache_policy="
-                    + config.humanoid.scene_cache_policy.value
-                )
-                if config.humanoid.policy_camera_profile is None:
-                    argv.append(
-                        "defines.humanoid_scene_cache="
-                        + config.humanoid.scene_cache_path
-                    )
     extra_overrides = shlex.split(wizard_args.extra_overrides)
     if reference_mode:
         _reject_motion_reference_reserved_overrides(extra_overrides)
@@ -313,16 +312,28 @@ def start_wizard(
         is HumanoidReferenceControllerProfile.sonic_visual
     ):
         assert config.humanoid.scene_cache_path is not None
+        assert config.humanoid.runtime_cache_path is not None
         scene_cache_path = Path(config.humanoid.scene_cache_path)
-        if (
-            config.humanoid.scene_cache_policy
-            is HumanoidSceneCachePolicy.build_if_missing
-        ):
-            scene_cache_path.mkdir(parents=True, exist_ok=True)
-        elif not scene_cache_path.is_dir():
+        runtime_cache_path = Path(config.humanoid.runtime_cache_path)
+        if not scene_cache_path.is_dir():
             raise FileNotFoundError(
                 "required humanoid scene cache directory does not exist: "
                 f"{scene_cache_path}"
+            )
+        if not os.access(scene_cache_path, os.R_OK | os.X_OK):
+            raise PermissionError(
+                "required humanoid scene cache is not readable/traversable: "
+                f"{scene_cache_path}"
+            )
+        runtime_cache_path.mkdir(parents=True, exist_ok=True)
+        if not runtime_cache_path.is_dir():
+            raise NotADirectoryError(
+                f"humanoid runtime cache is not a directory: {runtime_cache_path}"
+            )
+        if not os.access(runtime_cache_path, os.W_OK | os.X_OK):
+            raise PermissionError(
+                "humanoid runtime cache is not writable/traversable: "
+                f"{runtime_cache_path}"
             )
     argv = _build_wizard_command(
         config=config,

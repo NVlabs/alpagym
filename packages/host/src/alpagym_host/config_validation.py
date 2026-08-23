@@ -29,6 +29,7 @@ from alpagym_host.config import (
     SlurmConfig,
     SlurmLayout,
     TransportKind,
+    alpagym_project_root,
 )
 from alpagym_host.run_artifacts import is_supported_hf_bundle_dir
 from alpagym_host.run_topology import build_slurm_topology
@@ -349,6 +350,25 @@ def _validate_humanoid_config(config: RunConfig, *, training: bool = True) -> No
     humanoid = config.alpasim.humanoid
     if humanoid is None:
         raise ValueError("humanoid simulation requires alpasim.humanoid")
+    if humanoid.runtime_cache_path is not None:
+        runtime_cache = Path(humanoid.runtime_cache_path).expanduser().resolve()
+        protected_paths = {
+            "policy.model.path": Path(config.policy.model.path).expanduser().resolve(),
+            "AlpaGym source": alpagym_project_root().resolve(),
+        }
+        if config.alpasim.repo_path is not None:
+            protected_paths["AlpaSim source"] = (
+                Path(config.alpasim.repo_path).expanduser().resolve()
+            )
+        for label, protected in protected_paths.items():
+            if (
+                runtime_cache == protected
+                or runtime_cache.is_relative_to(protected)
+                or protected.is_relative_to(runtime_cache)
+            ):
+                raise ValueError(
+                    f"alpasim.humanoid.runtime_cache_path must be disjoint from {label}"
+                )
     if config.dataset.scene_ids is None:
         raise ValueError("humanoid simulation requires explicit dataset.scene_ids")
     expected_scenes = set(config.dataset.scene_ids)
@@ -1131,6 +1151,11 @@ def _validate_vla_slurm_worker_mounts(config: RunConfig) -> None:
         raise ValueError("VLA policy camera requires scene_cache_path")
     required_paths.append(
         ("alpasim.humanoid.scene_cache_path", Path(humanoid.scene_cache_path))
+    )
+    if humanoid.runtime_cache_path is None:
+        raise ValueError("VLA managed visual runtime requires runtime_cache_path")
+    required_paths.append(
+        ("alpasim.humanoid.runtime_cache_path", Path(humanoid.runtime_cache_path))
     )
     if (
         getattr(

@@ -331,6 +331,16 @@ def execute_run(config: RunConfig) -> None:
                 workload_kind="cosmos_training",
                 workload_command=cosmos_command,
                 scene_store_root=Path(humanoid.scene_store_path),
+                scene_cache_root=(
+                    Path(humanoid.scene_cache_path)
+                    if humanoid.scene_cache_path is not None
+                    else None
+                ),
+                runtime_cache_root=(
+                    Path(humanoid.runtime_cache_path)
+                    if humanoid.runtime_cache_path is not None
+                    else None
+                ),
                 import_probe=import_probe,
             )
         logging.info(
