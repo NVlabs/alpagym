@@ -6,6 +6,7 @@
 import importlib
 import json
 import logging
+import math
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from typing import Any
@@ -1203,11 +1204,11 @@ def test_step_training_does_not_advance_scheduler_without_optimizer_step(
     assert scheduler.steps == 0
 
 
-def test_ppo_pre_update_behavior_kl_guard_rejects_before_training(
+def test_ppo_pre_update_behavior_kl_guard_rejects_nonfinite_before_training(
     cosmos_stubs: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An already-diverged replay batch must not apply another PPO update."""
+    """An invalid replay diagnostic must not apply another PPO update."""
     del cosmos_stubs
     trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
     trainer = _ppo_step_guard_trainer(trainer_module)
@@ -1216,7 +1217,7 @@ def test_ppo_pre_update_behavior_kl_guard_rejects_before_training(
         trainer_module, "filter_trainable_rollouts", lambda rollouts, **kwargs: rollouts
     )
     trainer._pre_update_diagnostics = lambda samples: {
-        "train/pre_update_approx_kl": 0.25,
+        "train/pre_update_approx_kl": float("nan"),
         "train/pre_update_valid_rows": len(samples),
     }
     trainer._post_update_diagnostics = lambda samples: {
@@ -1231,7 +1232,7 @@ def test_ppo_pre_update_behavior_kl_guard_rejects_before_training(
 
     trainer._run_training_loop = _unexpected_training
 
-    with pytest.raises(FloatingPointError, match="pre-update.*behavior KL"):
+    with pytest.raises(FloatingPointError, match="pre-update.*non-finite"):
         trainer.step_training(
             rollouts=[object()],
             current_step=1,
@@ -1468,14 +1469,16 @@ def test_flow_ppo_optional_kl_guard_allows_critic_only_batch(
     )
 
 
-def test_ppo_post_update_behavior_kl_guard_precedes_scheduler_and_checkpoint(
+def test_ppo_post_update_behavior_kl_target_allows_finite_overshoot(
     cosmos_stubs: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A bad candidate update cannot advance LR state or become a checkpoint."""
+    """A finite KL target miss is diagnostic and does not kill the update."""
     del cosmos_stubs
     trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
     trainer = _ppo_step_guard_trainer(trainer_module)
+    trainer._behavior_kl_target_mode = "soft"
+    trainer._behavior_kl_hard_limit = 0.2
     events: list[str] = []
     monkeypatch.setattr(
         trainer_module, "filter_trainable_rollouts", lambda rollouts, **kwargs: rollouts
@@ -1485,7 +1488,7 @@ def test_ppo_post_update_behavior_kl_guard_precedes_scheduler_and_checkpoint(
         "train/pre_update_valid_rows": len(samples),
     }
     trainer._post_update_diagnostics = lambda samples: {
-        "train/post_update_approx_kl": 0.25,
+        "train/post_update_approx_kl": 0.15,
         "train/post_update_valid_rows": len(samples),
     }
 
@@ -1499,19 +1502,19 @@ def test_ppo_post_update_behavior_kl_guard_precedes_scheduler_and_checkpoint(
 
     trainer._run_training_loop = _record_training
 
-    with pytest.raises(FloatingPointError, match="post-update.*behavior KL"):
-        trainer.step_training(
-            rollouts=[object()],
-            current_step=1,
-            total_steps=1,
-            remain_samples_num=0,
-            inter_policy_nccl=object(),
-            is_master_replica=True,
-        )
+    metrics = trainer.step_training(
+        rollouts=[object()],
+        current_step=1,
+        total_steps=1,
+        remain_samples_num=0,
+        inter_policy_nccl=object(),
+        is_master_replica=True,
+    )
 
     assert events == ["train"]
-    assert trainer.lr_schedulers.steps == 0
-    assert trainer.saved_checkpoints == []
+    assert metrics["train/post_update_approx_kl"] == pytest.approx(0.15)
+    assert trainer.lr_schedulers.steps == 1
+    assert trainer.saved_checkpoints == [(1, 1, 0)]
 
 
 def test_ppo_behavior_kl_backtracking_scales_actor_only_before_accept(
@@ -1551,6 +1554,8 @@ def test_ppo_behavior_kl_backtracking_scales_actor_only_before_accept(
     trainer._behavior_kl_backtrack_margin = 0.9
     trainer._behavior_kl_backtrack_max_attempts = 4
     trainer._target_behavior_kl = 0.003
+    trainer._behavior_kl_target_mode = "soft"
+    trainer._behavior_kl_hard_limit = 0.01
     trainer._pre_update_diagnostics = lambda samples: {
         "train/pre_update_valid_rows": len(samples),
         "train/pre_update_approx_kl": 0.0,
@@ -1597,6 +1602,10 @@ def test_ppo_behavior_kl_backtracking_scales_actor_only_before_accept(
     assert metrics["train/actor_effective_learning_rate"] == pytest.approx(0.075)
     assert metrics["train/actor_backtrack_attempts"] == 1
     assert metrics["train/actor_backtrack_failed"] == 0
+    assert metrics["train/actor_backtrack_target_met"] == 1
+    assert metrics["train/actor_backtrack_target_missed"] == 0
+    assert metrics["train/actor_backtrack_exhausted"] == 0
+    assert metrics["train/behavior_kl_target_overshoot"] == pytest.approx(0.0)
     assert trainer._optimizer_steps_applied_in_training_step == 1
     assert trainer.lr_schedulers.steps == 1
     assert trainer.saved_checkpoints == [(1, 2, 1)]
@@ -1613,14 +1622,32 @@ def test_ppo_behavior_kl_backtracking_scales_actor_only_before_accept(
     )
 
 
-def test_ppo_behavior_kl_backtracking_restores_actor_and_rejects_bad_diagnostic(
+def test_ppo_behavior_kl_backtracking_accepts_r5_finite_target_miss(
     cosmos_stubs: None,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A non-responsive KL diagnostic restores the actor and publishes nothing."""
+    """Bounded correction reports a finite target miss and keeps training."""
     del cosmos_stubs
     trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    _stub_consumed_optimizer_batch(monkeypatch, trainer_module)
     trainer = _ppo_step_guard_trainer(trainer_module)
+    trainer._write_ppo_update_diagnostic_receipts = True
+    trainer.ckpt_manager = SimpleNamespace(global_rank=0)
+    receipt_path = tmp_path / "step_1_rank_0.json"
+    monkeypatch.setattr(
+        trainer_module,
+        "_load_run_config",
+        lambda config: SimpleNamespace(
+            artifact_paths=SimpleNamespace(run_dir=tmp_path)
+        ),
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "_ppo_update_receipt_context",
+        lambda **kwargs: (receipt_path, {}),
+    )
     monkeypatch.setattr(
         trainer_module,
         "filter_trainable_rollouts",
@@ -1631,16 +1658,33 @@ def test_ppo_behavior_kl_backtracking_restores_actor_and_rejects_bad_diagnostic(
     trainer.optimizers = _actor_critic_optimizer_container(trainer.model)
     trainer._behavior_kl_backtrack = True
     trainer._behavior_kl_backtrack_margin = 0.9
-    trainer._behavior_kl_backtrack_max_attempts = 2
+    trainer._behavior_kl_backtrack_max_attempts = 4
     trainer._target_behavior_kl = 0.003
+    trainer._behavior_kl_target_mode = "soft"
+    trainer._behavior_kl_hard_limit = 0.01
     trainer._pre_update_diagnostics = lambda samples: {
         "train/pre_update_valid_rows": len(samples),
         "train/pre_update_approx_kl": 0.0,
     }
-    trainer._post_update_diagnostics = lambda samples: {
-        "train/post_update_valid_rows": len(samples),
-        "train/post_update_approx_kl": 0.01,
-    }
+    # This is the measured R5 step-2 sequence that previously killed the
+    # process solely because its final finite KL was slightly above target.
+    kl_sequence = iter(
+        [
+            0.005120630139601045,
+            0.0065741927512597085,
+            0.0063090229528787855,
+            0.006469296463368272,
+            0.0038210509864432126,
+        ]
+    )
+
+    def r5_post_update(samples: list[object]) -> dict[str, float | int]:
+        return {
+            "train/post_update_valid_rows": len(samples),
+            "train/post_update_approx_kl": next(kl_sequence),
+        }
+
+    trainer._post_update_diagnostics = r5_post_update
 
     def oversized_update(
         *args: Any,
@@ -1655,7 +1699,159 @@ def test_ppo_behavior_kl_backtracking_restores_actor_and_rejects_bad_diagnostic(
 
     trainer._run_training_loop = oversized_update
 
-    with pytest.raises(FloatingPointError, match="backtracking exhausted"):
+    metrics = trainer.step_training(
+        rollouts=[SimpleNamespace(weight_version=0)],
+        current_step=1,
+        total_steps=2,
+        remain_samples_num=1,
+        inter_policy_nccl=object(),
+        is_master_replica=True,
+        do_save_checkpoint=True,
+    )
+
+    expected_scale = 1.0
+    for observed_kl in (
+        0.005120630139601045,
+        0.0065741927512597085,
+        0.0063090229528787855,
+        0.006469296463368272,
+    ):
+        expected_scale *= min(0.75, 0.9 * math.sqrt(0.003 / observed_kl))
+    expected_actor = 0.25 + expected_scale * (1.0 - 0.25)
+    assert trainer.model.actor.weight.item() == pytest.approx(expected_actor)
+    assert trainer.model.critic.weight.item() == pytest.approx(2.0)
+    assert trainer._optimizer_steps_applied_in_training_step == 1
+    assert metrics["train/post_update_approx_kl"] == pytest.approx(
+        0.0038210509864432126
+    )
+    assert metrics["train/actor_backtrack_failed"] == 0
+    assert metrics["train/actor_backtrack_target_met"] == 0
+    assert metrics["train/actor_backtrack_target_missed"] == 1
+    assert metrics["train/actor_backtrack_exhausted"] == 1
+    assert metrics["train/behavior_kl_target_overshoot"] == pytest.approx(
+        0.0008210509864432125
+    )
+    assert trainer.lr_schedulers.steps == 1
+    assert trainer.saved_checkpoints == [(1, 2, 1)]
+    assert any(
+        "remains above soft target" in record.getMessage()
+        and "continuing with the finite audited candidate" in record.getMessage()
+        for record in caplog.records
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["state"] == "accepted"
+    receipt_metrics = receipt["optimizer_metrics"]
+    assert receipt_metrics["train/behavior_kl_target_mode"] == "soft"
+    assert receipt_metrics["train/behavior_kl_hard_limit"] == pytest.approx(0.01)
+    assert receipt_metrics["train/behavior_kl_hard_gate_passed"] == 1
+    assert receipt_metrics["train/actor_backtrack_target_met"] == 0
+    assert receipt_metrics["train/actor_backtrack_target_missed"] == 1
+    assert receipt_metrics["train/actor_backtrack_attempts"] == 4
+    history = receipt_metrics["train/actor_backtrack_history"]
+    assert [entry["attempt"] for entry in history] == [0, 1, 2, 3, 4]
+    assert [entry["actor_step_scale"] for entry in history] == pytest.approx(
+        [
+            1.0,
+            0.6888766000141694,
+            0.4188160851614707,
+            0.2599234339725781,
+            0.15930156632853334,
+        ],
+        rel=1.0e-12,
+        abs=1.0e-12,
+    )
+    assert all(entry["actor_step_scale"] > 0.0 for entry in history)
+    assert [entry["behavior_kl"] for entry in history] == pytest.approx(
+        [
+            0.005120630139601045,
+            0.0065741927512597085,
+            0.0063090229528787855,
+            0.006469296463368272,
+            0.0038210509864432126,
+        ],
+        rel=1.0e-12,
+        abs=1.0e-12,
+    )
+    assert receipt["post_update_metrics"][
+        "train/post_update_approx_kl"
+    ] == pytest.approx(history[-1]["behavior_kl"], rel=0.0, abs=0.0)
+    assert "train/actor_restore_attempted" not in receipt_metrics
+    assert "train/behavior_kl_after_restore" not in receipt_metrics
+
+
+def test_ppo_soft_behavior_kl_hard_limit_boundary_is_inclusive(
+    cosmos_stubs: None,
+) -> None:
+    """The independent catastrophe limit accepts its exact finite boundary."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = object.__new__(trainer_module.AlpagymFlowPPOTrainer)
+    trainer._on_policy = True
+    trainer._flow_chunk_density = False
+    trainer._target_behavior_kl = 0.003
+    trainer._behavior_kl_target_mode = "soft"
+    trainer._behavior_kl_hard_limit = 0.01
+
+    trainer._validate_update_diagnostics(
+        {
+            "train/post_update_valid_rows": 74,
+            "train/post_update_approx_kl": 0.01,
+        },
+        phase="post_update",
+    )
+
+
+def test_ppo_behavior_kl_backtracking_rejects_catastrophic_soft_candidate(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Soft target mode still restores an update above its independent hard limit."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = _ppo_step_guard_trainer(trainer_module)
+    monkeypatch.setattr(
+        trainer_module,
+        "filter_trainable_rollouts",
+        lambda rollouts, **kwargs: rollouts,
+    )
+
+    trainer.model = _BacktrackActorCritic(actor_weight=0.25, critic_weight=0.0)
+    actor_before = trainer.model.actor.weight.detach().clone()
+    trainer.optimizers = _actor_critic_optimizer_container(trainer.model)
+    trainer._behavior_kl_backtrack = True
+    trainer._behavior_kl_backtrack_margin = 0.9
+    trainer._behavior_kl_backtrack_max_attempts = 4
+    trainer._target_behavior_kl = 0.003
+    trainer._behavior_kl_target_mode = "soft"
+    trainer._behavior_kl_hard_limit = 0.01
+    trainer._pre_update_diagnostics = lambda samples: {
+        "train/pre_update_valid_rows": len(samples),
+        "train/pre_update_approx_kl": 0.0,
+    }
+
+    def catastrophic_post_update(samples: list[object]) -> dict[str, float | int]:
+        restored = torch.equal(trainer.model.actor.weight.detach(), actor_before)
+        return {
+            "train/post_update_valid_rows": len(samples),
+            "train/post_update_approx_kl": 0.0 if restored else 0.02,
+        }
+
+    trainer._post_update_diagnostics = catastrophic_post_update
+
+    def catastrophic_update(
+        *args: Any,
+    ) -> tuple[float, float, int, float, float, float, float]:
+        del args
+        with torch.no_grad():
+            trainer.model.actor.weight.fill_(1.0)
+            trainer.model.critic.weight.fill_(2.0)
+        trainer._optimizer_steps_applied_in_training_step = 1
+        trainer._last_micro_batches = 1
+        return (1.0, 0.0, 1, 1.0, 1.0, 0.0, 1.0)
+
+    trainer._run_training_loop = catastrophic_update
+
+    with pytest.raises(FloatingPointError, match="catastrophic candidate"):
         trainer.step_training(
             rollouts=[SimpleNamespace(weight_version=0)],
             current_step=1,
@@ -1666,9 +1862,8 @@ def test_ppo_behavior_kl_backtracking_restores_actor_and_rejects_bad_diagnostic(
             do_save_checkpoint=True,
         )
 
-    assert trainer.model.actor.weight.item() == pytest.approx(0.25)
+    assert torch.equal(trainer.model.actor.weight.detach(), actor_before)
     assert trainer.model.critic.weight.item() == pytest.approx(2.0)
-    assert trainer._optimizer_steps_applied_in_training_step == 1
     assert trainer.lr_schedulers.steps == 0
     assert trainer.saved_checkpoints == []
 

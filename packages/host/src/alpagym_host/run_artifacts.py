@@ -125,6 +125,10 @@ def _build_cosmos_config(config: RunConfig) -> dict[str, Any]:
         "min_action_std": train_policy.pop("ppo_min_action_std", 0.02),
         "max_action_std": train_policy.pop("ppo_max_action_std", 2.0),
         "target_behavior_kl": train_policy.pop("ppo_target_behavior_kl", None),
+        "behavior_kl_target_mode": train_policy.pop(
+            "ppo_behavior_kl_target_mode", "hard"
+        ),
+        "behavior_kl_hard_limit": train_policy.pop("ppo_behavior_kl_hard_limit", None),
         "behavior_kl_backtrack": train_policy.pop("ppo_behavior_kl_backtrack", False),
         "behavior_kl_backtrack_margin": train_policy.pop(
             "ppo_behavior_kl_backtrack_margin", 0.9

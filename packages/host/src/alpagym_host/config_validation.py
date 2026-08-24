@@ -920,6 +920,36 @@ def _validate_training_policy_config(config: RunConfig) -> None:
         raise ValueError(
             "PPO ppo_target_behavior_kl must be finite and positive when set"
         )
+    if train_policy.ppo_behavior_kl_target_mode not in {"hard", "soft"}:
+        raise ValueError(
+            "PPO ppo_behavior_kl_target_mode must be either 'hard' or 'soft'"
+        )
+    hard_limit = train_policy.ppo_behavior_kl_hard_limit
+    if hard_limit is not None and (
+        isinstance(hard_limit, bool)
+        or not isinstance(hard_limit, (int, float))
+        or not math.isfinite(hard_limit)
+        or hard_limit <= 0.0
+    ):
+        raise ValueError(
+            "PPO ppo_behavior_kl_hard_limit must be finite and positive when set"
+        )
+    if train_policy.ppo_behavior_kl_target_mode == "soft":
+        target = train_policy.ppo_target_behavior_kl
+        if target is None or hard_limit is None:
+            raise ValueError(
+                "PPO soft behavior-KL target mode requires both "
+                "ppo_target_behavior_kl and ppo_behavior_kl_hard_limit"
+            )
+        if hard_limit <= target:
+            raise ValueError(
+                "PPO ppo_behavior_kl_hard_limit must exceed the soft "
+                "ppo_target_behavior_kl"
+            )
+    elif hard_limit is not None:
+        raise ValueError(
+            "PPO ppo_behavior_kl_hard_limit is only valid in soft target mode"
+        )
     if not isinstance(train_policy.ppo_behavior_kl_backtrack, bool):
         raise ValueError("PPO ppo_behavior_kl_backtrack must be a boolean")
     if (
@@ -1162,7 +1192,9 @@ def _validate_vla_slurm_worker_mounts(config: RunConfig) -> None:
         is HumanoidReferenceControllerProfile.grail_heightmap
     ):
         if humanoid.grail_root_path is None:
-            raise ValueError("GRAIL heightmap motion_reference requires grail_root_path")
+            raise ValueError(
+                "GRAIL heightmap motion_reference requires grail_root_path"
+            )
         required_paths.append(
             ("alpasim.humanoid.grail_root_path", Path(humanoid.grail_root_path))
         )

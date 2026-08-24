@@ -194,12 +194,15 @@ cosmos:
       # Clamp learned Gaussian exploration after every optimizer step.
       ppo_min_action_std: 0.02
       ppo_max_action_std: 2.0
-      # Optional pre/post-update KL guard against the replay behavior policy.
-      # This does not anchor training to the initial checkpoint.
+      # Optional pre/post-update KL target against the replay behavior policy.
+      # This does not anchor training to the initial checkpoint. Hard mode
+      # preserves the legacy acceptance gate; soft mode requires a distinct
+      # catastrophic limit above the target.
       ppo_target_behavior_kl: null
+      ppo_behavior_kl_target_mode: hard
+      ppo_behavior_kl_hard_limit: null
       # Optional Flow-PPO actor-step backtracking. Each retry reduces the
-      # candidate actor step using margin as a conservative scale factor;
-      # acceptance remains the hard behavior-KL target above.
+      # candidate actor step using margin as a conservative scale factor.
       ppo_behavior_kl_backtrack: false
       ppo_behavior_kl_backtrack_margin: 0.9
       ppo_behavior_kl_backtrack_max_attempts: 4

@@ -118,9 +118,12 @@ cosmos:
       ppo_value_clip_range: 0.2
       ppo_value_huber_delta: 10.0
       ppo_normalize_advantages: true
-      # Keep every accepted actor update within the measured behavior-policy
-      # trust region; retry an oversized step instead of publishing it.
+      # Use 0.003 as a step-size target, not a run-killing threshold. Bounded
+      # correction may publish a finite residual miss, while the independent
+      # 0.01 catastrophe limit still prevents a runaway policy publication.
       ppo_target_behavior_kl: 0.003
+      ppo_behavior_kl_target_mode: soft
+      ppo_behavior_kl_hard_limit: 0.01
       ppo_behavior_kl_backtrack: true
       ppo_behavior_kl_backtrack_margin: 0.9
       ppo_behavior_kl_backtrack_max_attempts: 4

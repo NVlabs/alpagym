@@ -242,6 +242,7 @@ def test_host_writes_alpagym_ppo_trainer_config(
         "gae_lambda": 0.9,
         "min_action_std": 0.02,
         "max_action_std": 2.0,
+        "behavior_kl_target_mode": "hard",
         "behavior_kl_backtrack": False,
         "behavior_kl_backtrack_margin": 0.9,
         "behavior_kl_backtrack_max_attempts": 4,
@@ -277,6 +278,8 @@ def test_host_writes_vla_flow_ppo_config(tmp_path: Path) -> None:
                 "cosmos.train.train_policy.ppo_gamma=0.99",
                 "cosmos.train.train_policy.ppo_gae_lambda=0.95",
                 "cosmos.train.train_policy.ppo_target_behavior_kl=0.05",
+                "cosmos.train.train_policy.ppo_behavior_kl_target_mode=soft",
+                "cosmos.train.train_policy.ppo_behavior_kl_hard_limit=0.1",
                 "cosmos.train.train_policy.ppo_behavior_kl_backtrack=true",
                 "cosmos.train.train_policy.ppo_behavior_kl_backtrack_margin=0.8",
                 "cosmos.train.train_policy.ppo_behavior_kl_backtrack_max_attempts=3",
@@ -311,6 +314,8 @@ def test_host_writes_vla_flow_ppo_config(tmp_path: Path) -> None:
         "min_action_std": 0.02,
         "max_action_std": 2.0,
         "target_behavior_kl": 0.05,
+        "behavior_kl_target_mode": "soft",
+        "behavior_kl_hard_limit": 0.1,
         "behavior_kl_backtrack": True,
         "behavior_kl_backtrack_margin": 0.8,
         "behavior_kl_backtrack_max_attempts": 3,
@@ -334,6 +339,56 @@ def test_training_policy_config_rejects_invalid_target_behavior_kl(
     run_config.cosmos.train.train_policy.ppo_target_behavior_kl = target_behavior_kl
 
     with pytest.raises(ValueError, match="ppo_target_behavior_kl"):
+        validate_run_config(run_config, "run")
+
+
+def test_training_policy_soft_kl_target_requires_independent_hard_limit(
+    tmp_path: Path,
+) -> None:
+    """Soft target mode cannot silently accept every finite policy update."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        f"policy.model.path={model_path.as_posix()}",
+    )
+    train_policy = run_config.cosmos.train.train_policy
+    train_policy.ppo_target_behavior_kl = 0.003
+    train_policy.ppo_behavior_kl_target_mode = "soft"
+
+    with pytest.raises(ValueError, match="requires both.*hard_limit"):
+        validate_run_config(run_config, "run")
+
+
+@pytest.mark.parametrize("hard_limit", (0.003, 0.0, float("nan"), float("inf")))
+def test_training_policy_soft_kl_hard_limit_must_exceed_target(
+    tmp_path: Path,
+    hard_limit: float,
+) -> None:
+    """The catastrophe limit is finite, positive, and distinct from the target."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        f"policy.model.path={model_path.as_posix()}",
+    )
+    train_policy = run_config.cosmos.train.train_policy
+    train_policy.ppo_target_behavior_kl = 0.003
+    train_policy.ppo_behavior_kl_target_mode = "soft"
+    train_policy.ppo_behavior_kl_hard_limit = hard_limit
+
+    with pytest.raises(ValueError, match="ppo_behavior_kl_hard_limit"):
+        validate_run_config(run_config, "run")
+
+
+def test_training_policy_rejects_unknown_kl_target_mode(tmp_path: Path) -> None:
+    """KL acceptance semantics must be explicit and schema-validated."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        f"policy.model.path={model_path.as_posix()}",
+    )
+    run_config.cosmos.train.train_policy.ppo_behavior_kl_target_mode = "warning"
+
+    with pytest.raises(ValueError, match="ppo_behavior_kl_target_mode"):
         validate_run_config(run_config, "run")
 
 

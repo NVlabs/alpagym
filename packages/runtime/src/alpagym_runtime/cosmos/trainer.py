@@ -1438,14 +1438,16 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
                     key: value
                     for key, value in backtrack_metrics.items()
                     if key != "train/actor_backtrack_history"
+                    and isinstance(value, (int, float))
+                    and not isinstance(value, bool)
                 }
                 if optimizer_metrics is not None:
                     optimizer_metrics.update(backtrack_metrics)
                 if int(backtrack_metrics["train/actor_backtrack_failed"]):
                     raise FloatingPointError(
-                        "PPO actor behavior-KL backtracking exhausted its calibrated "
-                        "attempts; restored the pre-step actor and refusing scheduler, "
-                        "checkpoint, or weight sync"
+                        "PPO actor behavior-KL backtracking produced a non-finite or "
+                        "catastrophic candidate; restored the pre-step actor and "
+                        "refusing scheduler, checkpoint, or weight sync"
                     )
             self._validate_update_diagnostics(
                 post_update_metrics,
@@ -2655,6 +2657,34 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                 "PPO target_behavior_kl must be finite and positive when set, "
                 f"got {target_behavior_kl!r}"
             )
+        behavior_kl_target_mode = ppo_config.get("behavior_kl_target_mode", "hard")
+        if behavior_kl_target_mode not in {"hard", "soft"}:
+            raise ValueError(
+                "PPO behavior_kl_target_mode must be either 'hard' or 'soft'"
+            )
+        self._behavior_kl_target_mode = behavior_kl_target_mode
+        behavior_kl_hard_limit = ppo_config.get("behavior_kl_hard_limit")
+        self._behavior_kl_hard_limit = (
+            None if behavior_kl_hard_limit is None else float(behavior_kl_hard_limit)
+        )
+        if self._behavior_kl_target_mode == "soft":
+            if self._target_behavior_kl is None or self._behavior_kl_hard_limit is None:
+                raise ValueError(
+                    "PPO soft behavior-KL target mode requires both "
+                    "target_behavior_kl and behavior_kl_hard_limit"
+                )
+            if (
+                not math.isfinite(self._behavior_kl_hard_limit)
+                or self._behavior_kl_hard_limit <= self._target_behavior_kl
+            ):
+                raise ValueError(
+                    "PPO behavior_kl_hard_limit must be finite and greater than "
+                    "the soft target_behavior_kl"
+                )
+        elif self._behavior_kl_hard_limit is not None:
+            raise ValueError(
+                "PPO behavior_kl_hard_limit is only valid in soft target mode"
+            )
         behavior_kl_backtrack = ppo_config.get("behavior_kl_backtrack", False)
         if type(behavior_kl_backtrack) is not bool:
             raise TypeError("PPO behavior-KL backtracking flag must be a boolean")
@@ -2862,7 +2892,7 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         *,
         actor_learning_rate: float,
     ) -> tuple[dict[str, float | int], dict[str, Any]]:
-        """Shrink one actor update until its measured behavior KL is safe.
+        """Shrink one actor update toward its measured behavior-KL target.
 
         Adam and the critic are updated exactly once.  Only the actor parameter
         delta is interpolated toward the pre-step actor, which is equivalent to
@@ -2885,8 +2915,8 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             if math.isfinite(initial_kl) and initial_kl > target:
                 for attempt in range(1, self._behavior_kl_backtrack_max_attempts + 1):
                     # ``margin`` is a conservative scale factor, not a second
-                    # acceptance threshold.  The hard contract remains
-                    # measured behavior KL <= target.
+                    # threshold.  The target guides bounded correction; a
+                    # finite residual overshoot is reported, not made fatal.
                     proposed_scale = current_scale * min(
                         0.75,
                         self._behavior_kl_backtrack_margin
@@ -2933,11 +2963,27 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             raise
 
         candidate_kl = float(metrics["train/post_update_approx_kl"])
-        backtrack_failed = not math.isfinite(candidate_kl) or candidate_kl > target
+        target_met = math.isfinite(candidate_kl) and candidate_kl <= target
+        target_mode = getattr(self, "_behavior_kl_target_mode", "hard")
+        hard_limit = getattr(self, "_behavior_kl_hard_limit", None)
+        if target_mode == "soft":
+            if hard_limit is None:
+                raise RuntimeError(
+                    "PPO soft behavior-KL target mode has no catastrophic hard limit"
+                )
+            candidate_accepted = math.isfinite(candidate_kl) and candidate_kl <= float(
+                hard_limit
+            )
+        else:
+            candidate_accepted = target_met
+        # In soft mode, a finite target miss below the independent catastrophe
+        # limit stays live and is explicit in the receipt. Hard mode preserves
+        # the legacy target-as-acceptance behavior for other profiles.
+        backtrack_failed = not candidate_accepted
         restored_kl: float | None = None
         if backtrack_failed:
-            # Exhaustion/non-finite diagnostics restore the exact old actor for
-            # the rejection receipt.  The critic and optimizer moments remain
+            # Non-finite or above-limit diagnostics restore the exact old
+            # actor for the rejection receipt. The critic and optimizer moments remain
             # process-local and can never cross scheduler/checkpoint/sync.
             try:
                 self._scale_actor_step_toward_snapshot_(
@@ -2978,8 +3024,24 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                 actor_learning_rate * current_scale
             ),
             "train/actor_backtrack_failed": int(backtrack_failed),
+            "train/behavior_kl_target_mode": target_mode,
+            "train/behavior_kl_hard_limit": hard_limit,
+            "train/behavior_kl_hard_gate_passed": int(candidate_accepted),
+            "train/actor_backtrack_target_met": int(target_met),
+            "train/actor_backtrack_target_missed": int(
+                math.isfinite(candidate_kl) and not target_met
+            ),
+            "train/actor_backtrack_exhausted": int(
+                math.isfinite(candidate_kl)
+                and not target_met
+                and attempts >= self._behavior_kl_backtrack_max_attempts
+            ),
             "train/actor_backtrack_history": history,
         }
+        if math.isfinite(candidate_kl):
+            backtrack_metrics["train/behavior_kl_target_overshoot"] = max(
+                candidate_kl - target, 0.0
+            )
         if backtrack_failed:
             backtrack_metrics.update(
                 {
@@ -2996,11 +3058,12 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                 backtrack_metrics["train/behavior_kl_after_restore"] = restored_kl
         logger.info(
             "AlpaGym PPO behavior-KL actor backtracking initial_kl=%.6f "
-            "candidate_kl=%.6f target=%.6f attempts=%d actor_step_scale=%.6f "
-            "effective_actor_lr=%.8g",
+            "candidate_kl=%.6f target=%.6f target_met=%s attempts=%d "
+            "actor_step_scale=%.6f effective_actor_lr=%.8g",
             initial_kl,
             candidate_kl,
             target,
+            target_met,
             attempts,
             current_scale,
             actor_learning_rate * current_scale,
@@ -3494,7 +3557,12 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         *,
         phase: str,
     ) -> None:
-        """Fail closed when calibrated behavior-policy KL exceeds its guard."""
+        """Validate replay identity and finite behavior-policy diagnostics.
+
+        ``target_behavior_kl`` is an optimizer calibration target.  Bounded
+        actor backtracking records whether it was reached, but a finite target
+        miss is not an infrastructure failure and must not terminate training.
+        """
         if phase == "pre_update" and self._on_policy:
             valid_rows = int(metrics["train/pre_update_valid_rows"])
             max_abs_ratio_error = float(metrics["train/pre_update_max_abs_ratio_error"])
@@ -3545,11 +3613,25 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             raise FloatingPointError(
                 f"PPO {phase_label} behavior KL is non-finite: {approx_kl}"
             )
-        if approx_kl > target:
+        target_mode = getattr(self, "_behavior_kl_target_mode", "hard")
+        hard_limit = getattr(self, "_behavior_kl_hard_limit", None)
+        acceptance_limit = target if target_mode == "hard" else hard_limit
+        if acceptance_limit is None:
+            raise RuntimeError(
+                "PPO soft behavior-KL target mode has no catastrophic hard limit"
+            )
+        if approx_kl > float(acceptance_limit):
             raise FloatingPointError(
-                f"PPO {phase_label} behavior KL {approx_kl:.6g} exceeds calibrated "
-                f"target {target:.6g}; refusing to advance scheduler, checkpoint, "
-                "or weight sync"
+                f"PPO {phase_label} behavior KL {approx_kl:.6g} exceeds "
+                f"{target_mode} acceptance limit {float(acceptance_limit):.6g}; "
+                "refusing to advance scheduler, checkpoint, or weight sync"
+            )
+        if phase == "post_update" and approx_kl > target:
+            logger.warning(
+                "PPO post-update behavior KL %.6g remains above soft target %.6g; "
+                "continuing with the finite audited candidate",
+                approx_kl,
+                target,
             )
 
     def _compute_gae(self, step_samples: list[Any]) -> tuple[list[float], list[float]]:
