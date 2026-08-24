@@ -25,6 +25,9 @@ from alpagym_host.formal_run_provenance import (
     build_import_probe_receipt,
 )
 
+_TEST_IMAGE_ID = "sha256:" + "a" * 64
+_TEST_MANIFEST_DIGEST = "sha256:" + "b" * 64
+
 
 def test_formal_provenance_copies_effective_dirty_sources_and_invalidates_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -213,7 +216,7 @@ def test_runtime_ready_attests_the_exact_qualification_host_invocation(
     )
 
     receipt = json.loads(receipt_path.read_text())
-    assert receipt["schema_id"] == "alpagym.formal_run_runtime_ready.v4"
+    assert receipt["schema_id"] == "alpagym.formal_run_runtime_ready.v5"
     assert receipt["workload_kind"] == "qualification_rollout"
     assert receipt["workload_command"] == expected_command
     assert receipt["scene_cache_identity"]["file_count"] == 0
@@ -281,7 +284,8 @@ def test_runtime_ready_receipt_records_actual_image_compose_and_mounts(
     assert runtime["compose_sha256"]
     assert runtime["images"] == [
         {
-            "id": "sha256:image-id",
+            "id": _TEST_IMAGE_ID,
+            "labels": {"org.example.runtime-contract": "v1"},
             "repo_digests": ["runtime@example-sha256"],
             "repo_tags": ["runtime:local"],
         }
@@ -292,8 +296,8 @@ def test_runtime_ready_receipt_records_actual_image_compose_and_mounts(
     ]
     assert all(service["compose_config_hash"] for service in runtime["services"])
     assert all(
-        service["image_config_id"] == "sha256:image-id"
-        and service["oci_platform_manifest_digest"] == "sha256:platform-manifest"
+        service["image_config_id"] == _TEST_IMAGE_ID
+        and service["oci_platform_manifest_digest"] == _TEST_MANIFEST_DIGEST
         for service in runtime["services"]
     )
     for service in runtime["services"]:
@@ -556,6 +560,100 @@ def test_runtime_receipt_rejects_recomputed_wrong_prelaunch_binding(
     runtime_ready_path.write_text(json.dumps(receipt), encoding="utf-8")
 
     with pytest.raises(ValueError, match="source binding differs"):
+        _read_runtime_ready_receipt(
+            runtime_ready_path,
+            expected_source_set_sha256=owner.prelaunch_manifest[
+                "portable_source_set_sha256"
+            ],
+            expected_config_identity_sha256=owner.prelaunch_manifest[
+                "config_artifacts"
+            ]["identity_sha256"],
+            expected_critical_environment_sha256=owner.prelaunch_manifest[
+                "critical_environment_sha256"
+            ],
+            expected_receipt_sha256=receipt["receipt_sha256"],
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["malformed_labels", "service_image_mismatch", "service_manifest_mismatch"],
+)
+def test_runtime_receipt_v5_rejects_invalid_exact_image_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    owner, _alpagym, alpasim, humanoid = _prepare_formal_owner(tmp_path, monkeypatch)
+    runtime_ready_path = _capture_valid_runtime(
+        owner=owner,
+        tmp_path=tmp_path,
+        alpasim=alpasim,
+        humanoid=humanoid,
+        monkeypatch=monkeypatch,
+    )
+    runtime_ready_path.chmod(0o644)
+    receipt = json.loads(runtime_ready_path.read_text())
+    runtime = receipt["runtimes"][0]
+    if mutation == "malformed_labels":
+        runtime["images"][0]["labels"] = ["not", "a", "mapping"]
+        error = "image identity is invalid"
+    elif mutation == "service_image_mismatch":
+        runtime["services"][0]["image_config_id"] = "sha256:" + "c" * 64
+        error = "service.*image identity is invalid"
+    else:
+        changed_digest = "sha256:" + "c" * 64
+        runtime["services"][0]["oci_platform_manifest_digest"] = changed_digest
+        runtime["services"][0]["image_manifest_descriptor"]["digest"] = changed_digest
+        error = "services disagree on image manifest"
+    runtime["runtime_identity_sha256"] = _canonical_sha256(
+        {
+            "compose_sha256": runtime["compose_sha256"],
+            "compose_project": runtime["compose_project"],
+            "services": runtime["services"],
+            "images": runtime["images"],
+        }
+    )
+    receipt.pop("receipt_sha256")
+    receipt["receipt_sha256"] = _canonical_sha256(receipt)
+    runtime_ready_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=error):
+        _read_runtime_ready_receipt(
+            runtime_ready_path,
+            expected_source_set_sha256=owner.prelaunch_manifest[
+                "portable_source_set_sha256"
+            ],
+            expected_config_identity_sha256=owner.prelaunch_manifest[
+                "config_artifacts"
+            ]["identity_sha256"],
+            expected_critical_environment_sha256=owner.prelaunch_manifest[
+                "critical_environment_sha256"
+            ],
+            expected_receipt_sha256=receipt["receipt_sha256"],
+        )
+
+
+def test_runtime_receipt_v4_cannot_masquerade_as_label_bound_v5(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner, _alpagym, alpasim, humanoid = _prepare_formal_owner(tmp_path, monkeypatch)
+    runtime_ready_path = _capture_valid_runtime(
+        owner=owner,
+        tmp_path=tmp_path,
+        alpasim=alpasim,
+        humanoid=humanoid,
+        monkeypatch=monkeypatch,
+    )
+    runtime_ready_path.chmod(0o644)
+    receipt = json.loads(runtime_ready_path.read_text())
+    receipt["schema_id"] = "alpagym.formal_run_runtime_ready.v4"
+    receipt.pop("receipt_sha256")
+    receipt["receipt_sha256"] = _canonical_sha256(receipt)
+    runtime_ready_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="schema_id is not supported"):
         _read_runtime_ready_receipt(
             runtime_ready_path,
             expected_source_set_sha256=owner.prelaunch_manifest[
@@ -3084,7 +3182,8 @@ def _mock_docker_command(
             return json.dumps(
                 [
                     {
-                        "Id": "sha256:image-id",
+                        "Id": _TEST_IMAGE_ID,
+                        "Config": {"Labels": {"org.example.runtime-contract": "v1"}},
                         "RepoDigests": ["runtime@example-sha256"],
                         "RepoTags": ["runtime:local"],
                     }
@@ -3132,10 +3231,10 @@ def _container_inspection(
     return {
         "Id": container_id,
         "Name": f"/{service}",
-        "Image": "sha256:image-id",
+        "Image": _TEST_IMAGE_ID,
         "ImageManifestDescriptor": {
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "digest": "sha256:platform-manifest",
+            "digest": _TEST_MANIFEST_DIGEST,
             "platform": {"architecture": "amd64", "os": "linux"},
         },
         "State": {"Running": True},

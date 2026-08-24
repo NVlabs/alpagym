@@ -758,7 +758,7 @@ class FormalRunProvenance:
                 "formal source watch observed a mutation during runtime inspection"
             )
         receipt = {
-            "schema_id": "alpagym.formal_run_runtime_ready.v4",
+            "schema_id": "alpagym.formal_run_runtime_ready.v5",
             "captured_at_utc": datetime.now(UTC).isoformat(),
             "workload_kind": workload_kind,
             "workload_command": list(workload_command),
@@ -2574,7 +2574,7 @@ def _read_runtime_ready_receipt(
     }
     if set(receipt) != expected_keys:
         raise ValueError("formal runtime receipt has an unexpected schema")
-    if receipt["schema_id"] != "alpagym.formal_run_runtime_ready.v4":
+    if receipt["schema_id"] != "alpagym.formal_run_runtime_ready.v5":
         raise ValueError("formal runtime receipt schema_id is not supported")
     stored_sha256 = receipt["receipt_sha256"]
     if not isinstance(stored_sha256, str) or len(stored_sha256) != 64:
@@ -2647,17 +2647,86 @@ def _validate_runtime_entry(runtime: Any) -> None:
     }
     if set(runtime) != expected_keys:
         raise ValueError("formal Compose runtime entry has an unexpected schema")
+    if (
+        not isinstance(runtime["wizard_log_dir_annotation"], str)
+        or not runtime["wizard_log_dir_annotation"]
+        or not isinstance(runtime["compose_path_annotation"], str)
+        or not runtime["compose_path_annotation"]
+        or not isinstance(runtime["compose_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", runtime["compose_sha256"]) is None
+        or isinstance(runtime["compose_size_bytes"], bool)
+        or not isinstance(runtime["compose_size_bytes"], int)
+        or runtime["compose_size_bytes"] <= 0
+        or not isinstance(runtime["compose_project"], str)
+        or not runtime["compose_project"]
+    ):
+        raise ValueError("formal Compose runtime metadata is invalid")
     services = runtime["services"]
     images = runtime["images"]
     if not isinstance(services, list) or not services:
         raise ValueError("formal Compose runtime entry has no services")
     if not isinstance(images, list) or not images:
         raise ValueError("formal Compose runtime entry has no images")
-    service_names = []
+    images_by_id: dict[str, dict[str, Any]] = {}
+    for image in images:
+        if not isinstance(image, dict) or set(image) != {
+            "id",
+            "labels",
+            "repo_digests",
+            "repo_tags",
+        }:
+            raise ValueError("formal Compose image entry has an unexpected schema")
+        image_id = image["id"]
+        labels = image["labels"]
+        repo_digests = image["repo_digests"]
+        repo_tags = image["repo_tags"]
+        if (
+            not isinstance(image_id, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+            or image_id in images_by_id
+            or not isinstance(labels, dict)
+            or not all(
+                isinstance(name, str) and isinstance(value, str)
+                for name, value in labels.items()
+            )
+            or not isinstance(repo_digests, list)
+            or not all(isinstance(value, str) and value for value in repo_digests)
+            or not isinstance(repo_tags, list)
+            or not all(isinstance(value, str) and value for value in repo_tags)
+        ):
+            raise ValueError("formal Compose image identity is invalid")
+        images_by_id[image_id] = image
+
+    service_names: list[str] = []
+    manifest_by_image: dict[str, str] = {}
     for service in services:
         if not isinstance(service, dict) or not isinstance(service.get("service"), str):
             raise TypeError("formal Compose service entry is invalid")
-        service_names.append(service["service"])
+        service_name = service["service"]
+        if not service_name or service_name in service_names:
+            raise ValueError("formal Compose service names are invalid")
+        service_names.append(service_name)
+        image_id = service.get("image_config_id")
+        configured_image = service.get("configured_image")
+        manifest_digest = service.get("oci_platform_manifest_digest")
+        descriptor = service.get("image_manifest_descriptor")
+        image = images_by_id.get(image_id) if isinstance(image_id, str) else None
+        if (
+            image is None
+            or not isinstance(configured_image, str)
+            or configured_image not in image["repo_tags"]
+            or not isinstance(manifest_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", manifest_digest) is None
+            or not isinstance(descriptor, dict)
+            or descriptor.get("digest") != manifest_digest
+            or service.get("running") is not True
+        ):
+            raise ValueError(
+                f"formal Compose service {service_name!r} image identity is invalid"
+            )
+        previous_manifest = manifest_by_image.setdefault(image_id, manifest_digest)
+        if previous_manifest != manifest_digest:
+            raise ValueError("formal Compose services disagree on image manifest")
     if not any(name.startswith("runtime-") for name in service_names):
         raise ValueError("formal Compose receipt has no runtime service")
     if not any(name.startswith("humanoid_dynamics-") for name in service_names):
@@ -2952,16 +3021,37 @@ def _capture_compose_runtime(
     )
     if not isinstance(image_inspections, list):
         raise TypeError("docker image inspect output must be a list")
-    images_by_id = {
-        str(image["Id"]): {
-            "id": str(image["Id"]),
-            "repo_digests": sorted(
-                str(value) for value in image.get("RepoDigests") or []
-            ),
-            "repo_tags": sorted(str(value) for value in image.get("RepoTags") or []),
+    images_by_id: dict[str, dict[str, Any]] = {}
+    for image in image_inspections:
+        if not isinstance(image, dict):
+            raise TypeError("docker image inspect entry must be an object")
+        image_id = image.get("Id")
+        config = image.get("Config")
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        if (
+            not isinstance(image_id, str)
+            or not image_id
+            or image_id in images_by_id
+            or labels is not None
+            and (
+                not isinstance(labels, dict)
+                or not all(
+                    isinstance(name, str) and isinstance(value, str)
+                    for name, value in labels.items()
+                )
+            )
+        ):
+            raise ValueError("docker image inspect identity is malformed")
+        repo_digests = image.get("RepoDigests") or []
+        repo_tags = image.get("RepoTags") or []
+        if not isinstance(repo_digests, list) or not isinstance(repo_tags, list):
+            raise TypeError("docker image inspect repositories must be arrays")
+        images_by_id[image_id] = {
+            "id": image_id,
+            "repo_digests": sorted(str(value) for value in repo_digests),
+            "repo_tags": sorted(str(value) for value in repo_tags),
+            "labels": dict(sorted((labels or {}).items())),
         }
-        for image in image_inspections
-    }
     if set(images_by_id) != set(image_ids):
         raise RuntimeError(
             "docker image inspect did not resolve every running image ID"
