@@ -1,0 +1,19 @@
+# @package _global_
+
+defaults:
+  - g1_vla_hq_stairs_local_1gpu
+  - _self_
+
+# Two rollout episodes form each colocated policy update. Fifty epochs author
+# one 100-episode / 50-update logical horizon. Run the first process stage to
+# cumulative step 5; later stages set max_num_steps to 10, 15, ..., 50 and
+# resume from the exact native checkpoint at the preceding boundary.
+cosmos:
+  train:
+    train_batch_per_replica: 2
+    max_num_steps: 5
+    num_epochs: 50
+    ckpt:
+      save_freq: 5
+  rollout:
+    n_generation: 2
