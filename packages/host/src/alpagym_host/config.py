@@ -187,7 +187,6 @@ class HumanoidReferenceControllerProfile(StrEnum):
 HUMANOID_ROBOT_PHYSICS_PROFILES = frozenset(
     {
         "sonic.isaac_training.g1_cylinder_model_12.mujoco_port.v1",
-        "sonic_visual.mujoco_release.g1_29dof_rev_1_0.capsule_raft.v1",
     }
 )
 

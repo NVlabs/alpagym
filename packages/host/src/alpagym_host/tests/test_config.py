@@ -1099,6 +1099,7 @@ def test_heightmap_sonic_still_requires_grail_checkout() -> None:
     [
         "g1_cylinder_model_12",
         "sonic_visual.mujoco_release.unknown.v1",
+        "sonic_visual.mujoco_release.g1_29dof_rev_1_0.capsule_raft.v1",
     ],
 )
 def test_visual_sonic_rejects_unqualified_robot_physics_profile(
