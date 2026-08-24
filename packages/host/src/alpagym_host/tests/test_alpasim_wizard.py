@@ -72,7 +72,9 @@ def test_wizard_command_appends_host_derived_overrides_last(tmp_path: Path) -> N
     )
 
     assert "myparam=myvalue" in command
-    assert command[-2:] == [
+    assert command[-4:] == [
+        f"hydra.run.dir={alpasim_run_dir / 'hydra' / 'wizard'}",
+        f"wizard.prometheus.file_sd_dir={alpasim_run_dir / 'prometheus' / 'file-sd'}",
         f"wizard.log_dir={alpasim_run_dir}",
         'scenes.scene_ids=["scene_a", "scene_b"]',
     ]
@@ -90,7 +92,10 @@ def test_wizard_command_can_select_test_suite(tmp_path: Path) -> None:
         checkout_root=tmp_path,
     )
 
-    assert command[-2:] == [
+    alpasim_run_dir = tmp_path / "alpasim"
+    assert command[-4:] == [
+        f"hydra.run.dir={alpasim_run_dir / 'hydra' / 'wizard'}",
+        f"wizard.prometheus.file_sd_dir={alpasim_run_dir / 'prometheus' / 'file-sd'}",
         f"wizard.log_dir={tmp_path / 'alpasim'}",
         "scenes.test_suite_id=alpagym_smoke",
     ]
@@ -176,6 +181,9 @@ def test_wizard_command_selects_strict_motion_reference_profile(
     assert (
         "services.humanoid_dynamics.volumes.1="
         f"{checkout_root / 'plugins'}:/repo/plugins:ro" in command
+    )
+    assert (
+        f"scenes.scene_cache={tmp_path / 'alpasim' / 'scene-cache'}" in command
     )
 
 

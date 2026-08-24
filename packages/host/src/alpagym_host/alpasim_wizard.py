@@ -290,7 +290,21 @@ def _build_wizard_command(
             "runtime.humanoid.controller.options.max_control_ticks="
             + json.dumps(str(max_control_ticks))
         )
-    argv.append(f"wizard.log_dir={alpasim_run_dir}")
+    # Wizard-owned mutable state belongs to this run.  The pinned checkout is
+    # execution source only, even though the local subprocess uses it as cwd.
+    argv.extend(
+        (
+            f"hydra.run.dir={alpasim_run_dir / 'hydra' / 'wizard'}",
+            "wizard.prometheus.file_sd_dir="
+            f"{alpasim_run_dir / 'prometheus' / 'file-sd'}",
+            f"wizard.log_dir={alpasim_run_dir}",
+        )
+    )
+    if config.humanoid is not None:
+        # Configured humanoid scenes come from SceneStore.  Keep the generic
+        # /mnt/nre-data mount run-local so no service receives a writable bind
+        # into the AlpaSim source checkout.
+        argv.append(f"scenes.scene_cache={alpasim_run_dir / 'scene-cache'}")
     if dataset.scene_ids is not None:
         argv.append(f"scenes.scene_ids={json.dumps(list(dataset.scene_ids))}")
     else:
