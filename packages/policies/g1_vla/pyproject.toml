@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
   "alpagym-runtime",
   "diffusers",
+  "h5py",
   "qwen-vl-utils",
   "safetensors",
   "transformers",
