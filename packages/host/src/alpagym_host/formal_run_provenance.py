@@ -636,6 +636,7 @@ class FormalRunProvenance:
         scene_cache_root: Path | None,
         runtime_cache_root: Path | None,
         import_probe: dict[str, Any],
+        controller_release_root: Path | None = None,
     ) -> Path:
         """Freeze running Compose containers, images, mounts, and workload identity.
 
@@ -699,6 +700,15 @@ class FormalRunProvenance:
             if scene_cache_root is not None
             else None
         )
+        controller_release_identity = (
+            _directory_tree_identity(
+                controller_release_root,
+                schema_id="alpagym.controller_release_tree.v1",
+                label="controller release",
+            )
+            if controller_release_root is not None
+            else None
+        )
         runtime_receipts = [
             _capture_compose_runtime(
                 wizard_log_dir=wizard_log_dir,
@@ -707,6 +717,7 @@ class FormalRunProvenance:
                 scene_store_root=scene_store_root,
                 scene_cache_root=scene_cache_root,
                 runtime_cache_root=runtime_cache_root,
+                controller_release_root=controller_release_root,
             )
             for wizard_log_dir in wizard_log_dirs
         ]
@@ -720,6 +731,20 @@ class FormalRunProvenance:
                 raise RuntimeError(
                     "formal scene cache changed during runtime-ready inspection"
                 )
+        if controller_release_root is not None:
+            assert controller_release_identity is not None
+            observed_controller_release_identity = _directory_tree_identity(
+                controller_release_root,
+                schema_id="alpagym.controller_release_tree.v1",
+                label="controller release",
+            )
+            if (
+                observed_controller_release_identity["tree_sha256"]
+                != controller_release_identity["tree_sha256"]
+            ):
+                raise RuntimeError(
+                    "formal controller release changed during runtime-ready inspection"
+                )
         admission_watch_state = self._record_source_watch_checkpoint(
             filename="source_watch_runtime_ready.json",
             stage="runtime_ready_admission",
@@ -729,7 +754,7 @@ class FormalRunProvenance:
                 "formal source watch observed a mutation during runtime inspection"
             )
         receipt = {
-            "schema_id": "alpagym.formal_run_runtime_ready.v3",
+            "schema_id": "alpagym.formal_run_runtime_ready.v4",
             "captured_at_utc": datetime.now(UTC).isoformat(),
             "workload_kind": workload_kind,
             "workload_command": list(workload_command),
@@ -746,6 +771,7 @@ class FormalRunProvenance:
             "import_probe": validated_import_probe,
             "source_watch_receipt_sha256": admission_watch_state["receipt_sha256"],
             "scene_cache_identity": scene_cache_identity,
+            "controller_release_identity": controller_release_identity,
             "runtimes": runtime_receipts,
         }
         receipt["receipt_sha256"] = _canonical_sha256(receipt)
@@ -835,6 +861,22 @@ class FormalRunProvenance:
                     ):
                         raise RuntimeError(
                             "formal scene cache changed after runtime admission"
+                        )
+                expected_controller_release = runtime_ready[
+                    "controller_release_identity"
+                ]
+                if expected_controller_release is not None:
+                    observed_controller_release = _directory_tree_identity(
+                        Path(expected_controller_release["path_annotation"]),
+                        schema_id="alpagym.controller_release_tree.v1",
+                        label="controller release",
+                    )
+                    if (
+                        observed_controller_release["tree_sha256"]
+                        != expected_controller_release["tree_sha256"]
+                    ):
+                        raise RuntimeError(
+                            "formal controller release changed after runtime admission"
                         )
                 watch_state = self._record_source_watch_checkpoint(
                     filename="source_watch_postrun.json",
@@ -1812,14 +1854,19 @@ def _validate_source_watch_receipt(receipt: Any, *, expected_stage: str) -> None
         raise ValueError("formal source-watch receipt SHA256 is invalid")
 
 
-def _directory_tree_identity(root: Path) -> dict[str, Any]:
+def _directory_tree_identity(
+    root: Path,
+    *,
+    schema_id: str = "alpagym.scene_cache_tree.v1",
+    label: str = "scene cache",
+) -> dict[str, Any]:
     """Hash an immutable directory tree without following links."""
 
     root = _normalized_absolute_path(root)
     resolved_root = root.resolve(strict=True)
     if root != resolved_root or not root.is_dir():
         raise ValueError(
-            f"formal scene cache must be a canonical non-symlink directory: {root}"
+            f"formal {label} must be a canonical non-symlink directory: {root}"
         )
     files: list[dict[str, Any]] = []
     directories: list[str] = []
@@ -1829,9 +1876,7 @@ def _directory_tree_identity(root: Path) -> dict[str, Any]:
 
         before = os.lstat(directory)
         if not stat.S_ISDIR(before.st_mode):
-            raise ValueError(
-                f"formal scene cache entry is not a directory: {directory}"
-            )
+            raise ValueError(f"formal {label} entry is not a directory: {directory}")
         with os.scandir(directory) as iterator:
             entries = sorted(iterator, key=lambda entry: entry.name)
         for entry in entries:
@@ -1840,7 +1885,7 @@ def _directory_tree_identity(root: Path) -> dict[str, Any]:
             metadata = entry.stat(follow_symlinks=False)
             if stat.S_ISLNK(metadata.st_mode):
                 raise ValueError(
-                    f"formal scene cache must not contain symlinks: {entry_path}"
+                    f"formal {label} must not contain symlinks: {entry_path}"
                 )
             if stat.S_ISDIR(metadata.st_mode):
                 directories.append(relative_path.as_posix())
@@ -1848,7 +1893,7 @@ def _directory_tree_identity(root: Path) -> dict[str, Any]:
                 continue
             if not stat.S_ISREG(metadata.st_mode):
                 raise ValueError(
-                    f"formal scene cache contains a special file: {entry_path}"
+                    f"formal {label} contains a special file: {entry_path}"
                 )
             identity = _file_identity(entry_path)
             files.append(
@@ -1861,12 +1906,12 @@ def _directory_tree_identity(root: Path) -> dict[str, Any]:
         after = os.lstat(directory)
         if _stable_file_metadata(before) != _stable_file_metadata(after):
             raise RuntimeError(
-                f"formal scene cache directory changed while hashing: {directory}"
+                f"formal {label} directory changed while hashing: {directory}"
             )
 
     scan(root, PurePosixPath())
     payload = {
-        "schema_id": "alpagym.scene_cache_tree.v1",
+        "schema_id": schema_id,
         "directories": directories,
         "files": files,
     }
@@ -1880,8 +1925,13 @@ def _directory_tree_identity(root: Path) -> dict[str, Any]:
     }
 
 
-def _validate_directory_tree_identity(value: Any) -> None:
-    """Validate one optional scene-cache tree identity from a runtime receipt."""
+def _validate_directory_tree_identity(
+    value: Any,
+    *,
+    schema_id: str = "alpagym.scene_cache_tree.v1",
+    label: str = "scene cache",
+) -> None:
+    """Validate one optional immutable-tree identity from a runtime receipt."""
 
     if value is None:
         return
@@ -1893,23 +1943,23 @@ def _validate_directory_tree_identity(value: Any) -> None:
         "directories",
         "files",
     }:
-        raise ValueError("formal scene cache identity has an unexpected schema")
+        raise ValueError(f"formal {label} identity has an unexpected schema")
     if not Path(value["path_annotation"]).is_absolute():
-        raise ValueError("formal scene cache identity path must be absolute")
+        raise ValueError(f"formal {label} identity path must be absolute")
     if (
         not isinstance(value["tree_sha256"], str)
         or re.fullmatch(r"[0-9a-f]{64}", value["tree_sha256"]) is None
     ):
-        raise ValueError("formal scene cache identity SHA256 is invalid")
+        raise ValueError(f"formal {label} identity SHA256 is invalid")
     if not isinstance(value["directories"], list) or not all(
         isinstance(path, str) and path for path in value["directories"]
     ):
         if value["directories"] != []:
-            raise TypeError("formal scene cache directories must be strings")
+            raise TypeError(f"formal {label} directories must be strings")
     if not isinstance(value["files"], list):
-        raise TypeError("formal scene cache files must be a list")
+        raise TypeError(f"formal {label} files must be a list")
     if value["file_count"] != len(value["files"]):
-        raise ValueError("formal scene cache file count is invalid")
+        raise ValueError(f"formal {label} file count is invalid")
     total_size_bytes = 0
     for entry in value["files"]:
         if not isinstance(entry, dict) or set(entry) != {
@@ -1917,27 +1967,27 @@ def _validate_directory_tree_identity(value: Any) -> None:
             "sha256",
             "size_bytes",
         }:
-            raise ValueError("formal scene cache file identity is invalid")
+            raise ValueError(f"formal {label} file identity is invalid")
         relative_path = PurePosixPath(entry["relative_path"])
         if relative_path.is_absolute() or ".." in relative_path.parts:
-            raise ValueError("formal scene cache file path is unsafe")
+            raise ValueError(f"formal {label} file path is unsafe")
         if (
             not isinstance(entry["sha256"], str)
             or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
         ):
-            raise ValueError("formal scene cache file SHA256 is invalid")
+            raise ValueError(f"formal {label} file SHA256 is invalid")
         if not isinstance(entry["size_bytes"], int) or entry["size_bytes"] < 0:
-            raise ValueError("formal scene cache file size is invalid")
+            raise ValueError(f"formal {label} file size is invalid")
         total_size_bytes += entry["size_bytes"]
     if value["total_size_bytes"] != total_size_bytes:
-        raise ValueError("formal scene cache total size is invalid")
+        raise ValueError(f"formal {label} total size is invalid")
     payload = {
-        "schema_id": "alpagym.scene_cache_tree.v1",
+        "schema_id": schema_id,
         "directories": value["directories"],
         "files": value["files"],
     }
     if value["tree_sha256"] != _canonical_sha256(payload):
-        raise ValueError("formal scene cache tree SHA256 is invalid")
+        raise ValueError(f"formal {label} tree SHA256 is invalid")
 
 
 def _read_runtime_ready_receipt(
@@ -1966,12 +2016,13 @@ def _read_runtime_ready_receipt(
         "import_probe",
         "source_watch_receipt_sha256",
         "scene_cache_identity",
+        "controller_release_identity",
         "runtimes",
         "receipt_sha256",
     }
     if set(receipt) != expected_keys:
         raise ValueError("formal runtime receipt has an unexpected schema")
-    if receipt["schema_id"] != "alpagym.formal_run_runtime_ready.v3":
+    if receipt["schema_id"] != "alpagym.formal_run_runtime_ready.v4":
         raise ValueError("formal runtime receipt schema_id is not supported")
     stored_sha256 = receipt["receipt_sha256"]
     if not isinstance(stored_sha256, str) or len(stored_sha256) != 64:
@@ -1997,6 +2048,11 @@ def _read_runtime_ready_receipt(
         )
     _validate_import_probe_identity(receipt["import_probe"])
     _validate_directory_tree_identity(receipt["scene_cache_identity"])
+    _validate_directory_tree_identity(
+        receipt["controller_release_identity"],
+        schema_id="alpagym.controller_release_tree.v1",
+        label="controller release",
+    )
     source_watch = _read_json_regular(path.parent / "source_watch_runtime_ready.json")
     _validate_source_watch_receipt(
         source_watch, expected_stage="runtime_ready_admission"
@@ -2097,6 +2153,7 @@ def _capture_compose_runtime(
     scene_store_root: Path,
     scene_cache_root: Path | None,
     runtime_cache_root: Path | None,
+    controller_release_root: Path | None,
 ) -> dict[str, Any]:
     """Capture and validate one Wizard-owned local Compose runtime."""
     wizard_log_dir = wizard_log_dir.resolve(strict=True)
@@ -2200,6 +2257,11 @@ def _capture_compose_runtime(
     alpasim_plugins = (alpasim_root / "plugins").resolve(strict=True)
     humanoid_source = humanoid_root.resolve(strict=True)
     scene_store = scene_store_root.expanduser().resolve(strict=True)
+    controller_release = (
+        controller_release_root.expanduser().resolve(strict=True)
+        if controller_release_root is not None
+        else None
+    )
     if (scene_cache_root is None) != (runtime_cache_root is None):
         raise ValueError(
             "formal scene and runtime cache roots must either both be set or both be absent"
@@ -2210,6 +2272,22 @@ def _capture_compose_runtime(
         str(humanoid_source): ("/repo/humanoid-rl-joint-sim", False),
         str(scene_store): ("/mnt/humanoid-scene-store", False),
     }
+    controller_mounts: dict[str, tuple[str, bool]] = {}
+    if controller_release is not None:
+        _require_isolated_root(
+            label="controller release",
+            root=controller_release,
+            protected_sources={
+                "AlpaSim source": alpasim_src,
+                "AlpaSim plugins": alpasim_plugins,
+                "Humanoid source": humanoid_source,
+                "SceneStore": scene_store,
+            },
+        )
+        controller_mounts[str(controller_release)] = (
+            "/mnt/sonic-visual-release",
+            False,
+        )
     cache_mounts: dict[str, tuple[str, bool]] = {}
     if scene_cache_root is not None and runtime_cache_root is not None:
         scene_cache = scene_cache_root.expanduser().resolve(strict=True)
@@ -2222,6 +2300,11 @@ def _capture_compose_runtime(
                 "AlpaSim plugins": alpasim_plugins,
                 "Humanoid source": humanoid_source,
                 "SceneStore": scene_store,
+                **(
+                    {"controller release": controller_release}
+                    if controller_release is not None
+                    else {}
+                ),
             },
         )
         cache_mounts[str(scene_cache)] = (
@@ -2229,7 +2312,7 @@ def _capture_compose_runtime(
             False,
         )
         cache_mounts[str(runtime_cache)] = ("/root/.cache", True)
-    canonical_mounts = {**common_mounts, **cache_mounts}
+    canonical_mounts = {**common_mounts, **cache_mounts, **controller_mounts}
     cache_service_count = 0
     for service in executable_services:
         inspection = service_inspections[service]
@@ -2271,6 +2354,21 @@ def _capture_compose_runtime(
                     f"Compose service {service!r} violates canonical {access} "
                     f"mount mapping {source} -> {destination}"
                 )
+        if service in dynamics_services and controller_mounts:
+            for source, (destination, expected_rw) in controller_mounts.items():
+                observed = [
+                    mount for mount in actual_bind_mounts if mount["source"] == source
+                ]
+                expected = {
+                    "source": source,
+                    "destination": destination,
+                    "rw": expected_rw,
+                }
+                if observed != [expected]:
+                    raise RuntimeError(
+                        f"Compose service {service!r} violates canonical read-only "
+                        f"controller release mapping {source} -> {destination}"
+                    )
         if cache_mounts:
             observed_cache_mounts = {
                 source: [
@@ -2478,6 +2576,26 @@ def _require_cache_source_isolation(
             raise RuntimeError(
                 f"formal {first_label} must be disjoint from {second_label}: "
                 f"{first} versus {second}"
+            )
+
+
+def _require_isolated_root(
+    *,
+    label: str,
+    root: Path,
+    protected_sources: dict[str, Path],
+) -> None:
+    """Reject an immutable input that aliases another provenance-owned root."""
+
+    for protected_label, protected in protected_sources.items():
+        if (
+            root == protected
+            or root.is_relative_to(protected)
+            or protected.is_relative_to(root)
+        ):
+            raise RuntimeError(
+                f"formal {label} must be disjoint from {protected_label}: "
+                f"{root} versus {protected}"
             )
 
 

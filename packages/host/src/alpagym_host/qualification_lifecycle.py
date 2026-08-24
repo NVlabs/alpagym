@@ -278,6 +278,11 @@ def execute_qualification_rollout(config: RunConfig) -> QualificationArtifacts:
                     if humanoid.runtime_cache_path is not None
                     else None
                 ),
+                controller_release_root=(
+                    Path(humanoid.visual_controller_release_path)
+                    if humanoid.visual_controller_release_path is not None
+                    else None
+                ),
                 import_probe=import_probe,
             )
 

@@ -9,7 +9,15 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
-from alpagym_host.config import ExecutionBackend, RunConfig, register_config_schema
+from alpagym_host.config import (
+    ExecutionBackend,
+    HumanoidAlpaSimConfig,
+    HumanoidExecutionProfile,
+    HumanoidReferenceControllerProfile,
+    ProvenanceMode,
+    RunConfig,
+    register_config_schema,
+)
 from alpagym_host.run_artifacts import build_artifact_paths, build_run_config
 from alpagym_host.run_lifecycle import (
     _cleanup_wizard_processes,
@@ -46,10 +54,12 @@ def test_local_process_preflight_requires_redis_cli(monkeypatch) -> None:
         validate_local_process_config(ExecutionBackend.local_process)
 
 
+@pytest.mark.parametrize("formal_provenance", (False, True))
 def test_execute_run_runs_local_process_lifecycle(
     tmp_path: Path,
     caplog,
     monkeypatch,
+    formal_provenance: bool,
 ) -> None:
     """Local execution starts one Wizard and one Cosmos controller."""
     from alpagym_host import run_lifecycle
@@ -80,11 +90,30 @@ def test_execute_run_runs_local_process_lifecycle(
     # The host must not replace the locked alpasim-grpc ABI with Wizard checkout
     # sources, even when the selected runtime domain is humanoid.
     config.alpasim.simulation_domain = "humanoid"
+    controller_release = tmp_path / "controller_release"
+    if formal_provenance:
+        config.alpasim.humanoid = HumanoidAlpaSimConfig(
+            repo_path=str(tmp_path / "humanoid"),
+            scene_store_path=str(tmp_path / "scene_store"),
+            scenario_ids_by_scene={"scene_a": "ascend", "scene_b": "ascend"},
+            execution_profile=HumanoidExecutionProfile.motion_reference,
+            reference_controller_profile=HumanoidReferenceControllerProfile.sonic_visual,
+            visual_controller_release_path=str(controller_release),
+            robot_physics_profile=(
+                "sonic.isaac_training.g1_cylinder_model_12.mujoco_port.v1"
+            ),
+            scene_cache_path=str(tmp_path / "scene_cache"),
+            runtime_cache_path=str(tmp_path / "runtime_cache"),
+            service_image="alpasim-humanoid-nurec:local",
+            reward_profile_id="stable_support_route.v2",
+        )
+        config.execution.provenance_mode = ProvenanceMode.required
     monkeypatch.delenv("ALPASIM_GRPC_ROOT", raising=False)
     monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
     config.cosmos.train.deterministic = True
     commands: list[list[str]] = []
     captured_paths: dict[str, Path] = {}
+    provenance_calls: list[tuple[str, dict[str, object]]] = []
 
     monkeypatch.setattr(
         run_lifecycle, "validate_local_process_config", lambda backend: None
@@ -94,6 +123,47 @@ def test_execute_run_runs_local_process_lifecycle(
         "resolve_alpasim_checkout",
         lambda config: tmp_path / "alpasim",
     )
+    if formal_provenance:
+        monkeypatch.setattr(
+            run_lifecycle,
+            "_configure_formal_subprocess_environment",
+            lambda **kwargs: {"formal": "environment"},
+        )
+
+        class Provenance:
+            """Capture formal lifecycle arguments without touching the filesystem."""
+
+            def capture_runtime_ready(self, **kwargs: object) -> None:
+                """Record runtime admission arguments."""
+                provenance_calls.append(("runtime_ready", kwargs))
+
+            def cleanup_compose_identity(self, compose_path: Path) -> tuple[str, str]:
+                """Return the project identity expected by exact cleanup."""
+                return "unused-sha256", run_lifecycle.wizard_compose_project(
+                    compose_path.parent
+                )
+
+            def finalize(self, **kwargs: object) -> None:
+                """Record postrun finalization arguments."""
+                provenance_calls.append(("finalize", kwargs))
+
+        provenance = Provenance()
+
+        class ProvenanceFactory:
+            """Return the test provenance owner at prelaunch."""
+
+            @staticmethod
+            def capture_prelaunch(**kwargs: object) -> Provenance:
+                """Record prelaunch arguments and return the lifecycle owner."""
+                provenance_calls.append(("prelaunch", kwargs))
+                return provenance
+
+        monkeypatch.setattr(run_lifecycle, "FormalRunProvenance", ProvenanceFactory)
+        monkeypatch.setattr(
+            run_lifecycle,
+            "_run_formal_import_probe",
+            lambda **kwargs: {"probe": "receipt"},
+        )
 
     def fake_wait_for_runtime_ready(**kwargs: object) -> tuple[str, int]:
         captured_paths["runtime_server_path"] = kwargs["runtime_server_path"]
@@ -220,6 +290,16 @@ def test_execute_run_runs_local_process_lifecycle(
         ],
     ]
     assert f"Starting Cosmos launcher command: {cosmos_command}" in caplog.messages
+    if formal_provenance:
+        runtime_ready = next(
+            kwargs for name, kwargs in provenance_calls if name == "runtime_ready"
+        )
+        assert runtime_ready["workload_kind"] == "cosmos_training"
+        assert runtime_ready["controller_release_root"] == controller_release
+        assert runtime_ready["scene_cache_root"] == tmp_path / "scene_cache"
+        assert runtime_ready["runtime_cache_root"] == tmp_path / "runtime_cache"
+    else:
+        assert not provenance_calls
 
     # organize_role_logs wraps the Cosmos launch: its exit-path final pass must have
     # linked the flat per-role logs into the role-grouped layout by the time execute_run

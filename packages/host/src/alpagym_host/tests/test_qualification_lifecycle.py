@@ -73,6 +73,7 @@ def _qualification_config(tmp_path: Path) -> SimpleNamespace:
                 scene_store_path=str(tmp_path / "scene_store"),
                 scene_cache_path=str(tmp_path / "scene_cache"),
                 runtime_cache_path=str(tmp_path / "runtime_cache"),
+                visual_controller_release_path=None,
                 scenario_ids_by_scene={"hq_stairs": "ascend"},
                 rollout_seed_base=292285,
             ),
@@ -228,6 +229,8 @@ def test_execute_qualification_rollout_bypasses_trainer_and_persists_raw_episode
     from alpagym_host.qualification_lifecycle import execute_qualification_rollout
 
     config = _qualification_config(tmp_path)
+    controller_release = tmp_path / "controller_release"
+    config.alpasim.humanoid.visual_controller_release_path = str(controller_release)
     if lifecycle_mode != "disabled":
         config.execution.provenance_mode = ProvenanceMode.required
     output = _policy_output()
@@ -455,6 +458,7 @@ def test_execute_qualification_rollout_bypasses_trainer_and_persists_raw_episode
         assert runtime_ready[1]["import_probe"] == {"probe": "receipt"}
         assert runtime_ready[1]["scene_cache_root"] == tmp_path / "scene_cache"
         assert runtime_ready[1]["runtime_cache_root"] == tmp_path / "runtime_cache"
+        assert runtime_ready[1]["controller_release_root"] == controller_release
         assert any(call[0] == "formal_cleanup" for call in calls)
         finalize = next(call for call in calls if call[0] == "finalize")
         assert finalize[1]["run_completed"] is True

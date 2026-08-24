@@ -209,7 +209,7 @@ def test_runtime_ready_attests_the_exact_qualification_host_invocation(
     )
 
     receipt = json.loads(receipt_path.read_text())
-    assert receipt["schema_id"] == "alpagym.formal_run_runtime_ready.v3"
+    assert receipt["schema_id"] == "alpagym.formal_run_runtime_ready.v4"
     assert receipt["workload_kind"] == "qualification_rollout"
     assert receipt["workload_command"] == expected_command
     assert receipt["scene_cache_identity"]["file_count"] == 0
@@ -823,6 +823,213 @@ def test_finalize_rejects_scene_cache_drift(
         (owner.provenance_dir / "postrun.json").read_text(encoding="utf-8")
     )
     assert failure["run_completed"] is True
+
+
+def test_runtime_ready_binds_visual_controller_release_and_rejects_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact Visual SONIC release used by dynamics remains auditable."""
+    owner, alpagym, alpasim, humanoid = _prepare_formal_owner(tmp_path, monkeypatch)
+    controller_release = tmp_path / "controller_release"
+    controller_release.mkdir()
+    onnx_path = controller_release / "controller.onnx"
+    onnx_path.write_bytes(b"locked-controller")
+    controller_mount = ((controller_release, "/mnt/sonic-visual-release", False),)
+    service_bind_mounts: dict[str, tuple[tuple[Path, str, bool], ...]] = {
+        "humanoid_dynamics-0": controller_mount
+    }
+    wizard_log_dir = _write_compose_runtime(
+        tmp_path,
+        alpasim,
+        humanoid,
+        service_bind_mounts=service_bind_mounts,
+    )
+    monkeypatch.setattr(
+        "alpagym_host.formal_run_provenance._run_command",
+        _mock_docker_command(
+            alpasim=alpasim,
+            humanoid=humanoid,
+            compose_path=wizard_log_dir / "docker-compose.yaml",
+            service_bind_mounts=service_bind_mounts,
+        ),
+    )
+
+    receipt_path = owner.capture_runtime_ready(
+        wizard_log_dirs=(wizard_log_dir,),
+        workload_command=["cosmos"],
+        scene_store_root=tmp_path / "scene_store",
+        scene_cache_root=tmp_path / "scene_cache",
+        runtime_cache_root=tmp_path / "runtime_cache",
+        controller_release_root=controller_release,
+        import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
+    )
+
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    identity = receipt["controller_release_identity"]
+    assert identity["file_count"] == 1
+    assert identity["files"][0]["relative_path"] == "controller.onnx"
+    assert (
+        identity["files"][0]["sha256"]
+        == hashlib.sha256(b"locked-controller").hexdigest()
+    )
+    services = {
+        service["service"]: service for service in receipt["runtimes"][0]["services"]
+    }
+    assert not any(
+        mount["destination"] == "/mnt/sonic-visual-release"
+        for mount in services["runtime-0"]["mounts"]
+    )
+    assert [
+        mount
+        for mount in services["humanoid_dynamics-0"]["mounts"]
+        if mount["destination"] == "/mnt/sonic-visual-release"
+    ] == [
+        {
+            "type": "bind",
+            "source": str(controller_release),
+            "destination": "/mnt/sonic-visual-release",
+            "mode": "ro",
+            "rw": False,
+            "propagation": "rprivate",
+        }
+    ]
+
+    onnx_path.write_bytes(b"different-controller")
+    with pytest.raises(RuntimeError, match="controller release changed"):
+        owner.finalize(run_completed=True)
+    failure = json.loads(
+        (owner.provenance_dir / "postrun.json").read_text(encoding="utf-8")
+    )
+    assert failure["formal_run_valid"] is False
+
+
+def test_runtime_ready_rejects_unmounted_visual_controller_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host directory hash cannot attest a release dynamics did not mount."""
+    owner, alpagym, alpasim, humanoid = _prepare_formal_owner(tmp_path, monkeypatch)
+    controller_release = tmp_path / "controller_release"
+    controller_release.mkdir()
+    (controller_release / "controller.onnx").write_bytes(b"locked-controller")
+    wizard_log_dir = _write_compose_runtime(tmp_path, alpasim, humanoid)
+    monkeypatch.setattr(
+        "alpagym_host.formal_run_provenance._run_command",
+        _mock_docker_command(
+            alpasim=alpasim,
+            humanoid=humanoid,
+            compose_path=wizard_log_dir / "docker-compose.yaml",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="controller release mapping"):
+        owner.capture_runtime_ready(
+            wizard_log_dirs=(wizard_log_dir,),
+            workload_command=["cosmos"],
+            scene_store_root=tmp_path / "scene_store",
+            scene_cache_root=tmp_path / "scene_cache",
+            runtime_cache_root=tmp_path / "runtime_cache",
+            controller_release_root=controller_release,
+            import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
+        )
+
+    assert not (owner.provenance_dir / "runtime_ready.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("destination", "read_write", "error"),
+    (
+        ("/mnt/not-sonic-visual-release", False, "remounts canonical source"),
+        ("/mnt/sonic-visual-release", True, "shadowing canonical destination"),
+    ),
+)
+def test_runtime_ready_rejects_noncanonical_visual_controller_mount(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    destination: str,
+    read_write: bool,
+    error: str,
+) -> None:
+    """Dynamics must consume the attested controller at its canonical RO mount."""
+    owner, alpagym, alpasim, humanoid = _prepare_formal_owner(tmp_path, monkeypatch)
+    controller_release = tmp_path / "controller_release"
+    controller_release.mkdir()
+    (controller_release / "controller.onnx").write_bytes(b"locked-controller")
+    service_bind_mounts: dict[str, tuple[tuple[Path, str, bool], ...]] = {
+        "humanoid_dynamics-0": ((controller_release, destination, read_write),)
+    }
+    wizard_log_dir = _write_compose_runtime(
+        tmp_path,
+        alpasim,
+        humanoid,
+        service_bind_mounts=service_bind_mounts,
+    )
+    monkeypatch.setattr(
+        "alpagym_host.formal_run_provenance._run_command",
+        _mock_docker_command(
+            alpasim=alpasim,
+            humanoid=humanoid,
+            compose_path=wizard_log_dir / "docker-compose.yaml",
+            service_bind_mounts=service_bind_mounts,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=error):
+        owner.capture_runtime_ready(
+            wizard_log_dirs=(wizard_log_dir,),
+            workload_command=["cosmos"],
+            scene_store_root=tmp_path / "scene_store",
+            scene_cache_root=tmp_path / "scene_cache",
+            runtime_cache_root=tmp_path / "runtime_cache",
+            controller_release_root=controller_release,
+            import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
+        )
+
+    assert not (owner.provenance_dir / "runtime_ready.json").exists()
+
+
+def test_runtime_ready_rejects_controller_release_overlapping_scene_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An immutable controller cannot be nested inside another mounted input."""
+    owner, alpagym, alpasim, humanoid = _prepare_formal_owner(tmp_path, monkeypatch)
+    controller_release = tmp_path / "scene_store" / "controller_release"
+    controller_release.mkdir(parents=True)
+    (controller_release / "controller.onnx").write_bytes(b"locked-controller")
+    service_bind_mounts: dict[str, tuple[tuple[Path, str, bool], ...]] = {
+        "humanoid_dynamics-0": (
+            (controller_release, "/mnt/sonic-visual-release", False),
+        )
+    }
+    wizard_log_dir = _write_compose_runtime(
+        tmp_path,
+        alpasim,
+        humanoid,
+        service_bind_mounts=service_bind_mounts,
+    )
+    monkeypatch.setattr(
+        "alpagym_host.formal_run_provenance._run_command",
+        _mock_docker_command(
+            alpasim=alpasim,
+            humanoid=humanoid,
+            compose_path=wizard_log_dir / "docker-compose.yaml",
+            service_bind_mounts=service_bind_mounts,
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError, match="controller release must be disjoint from SceneStore"
+    ):
+        owner.capture_runtime_ready(
+            wizard_log_dirs=(wizard_log_dir,),
+            workload_command=["cosmos"],
+            scene_store_root=tmp_path / "scene_store",
+            scene_cache_root=tmp_path / "scene_cache",
+            runtime_cache_root=tmp_path / "runtime_cache",
+            controller_release_root=controller_release,
+            import_probe=_test_import_probe(alpagym=alpagym, alpasim=alpasim),
+        )
+
+    assert not (owner.provenance_dir / "runtime_ready.json").exists()
 
 
 def test_runtime_ready_rejects_missing_humanoid_dynamics_service(
@@ -1879,6 +2086,7 @@ def _write_compose_runtime(
     cache_services: tuple[str, ...] | None = None,
     runtime_cache_read_only: bool = False,
     extra_bind_mounts: tuple[tuple[Path, str, bool], ...] = (),
+    service_bind_mounts: dict[str, tuple[tuple[Path, str, bool], ...]] | None = None,
 ) -> Path:
     """Write the generated Compose shape consumed by the receipt."""
     wizard_log_dir = tmp_path / "wizard_0"
@@ -1907,6 +2115,7 @@ def _write_compose_runtime(
     resolved_cache_services = set(
         services if cache_services is None else cache_services
     )
+    resolved_service_bind_mounts = service_bind_mounts or {}
     (wizard_log_dir / "docker-compose.yaml").write_text(
         yaml.safe_dump(
             {
@@ -1915,6 +2124,12 @@ def _write_compose_runtime(
                         "image": "runtime:local",
                         "volumes": [
                             *shared_volumes,
+                            *[
+                                f"{source}:{destination}:{'rw' if read_write else 'ro'}"
+                                for source, destination, read_write in (
+                                    resolved_service_bind_mounts.get(service, ())
+                                )
+                            ],
                             *(
                                 visual_cache_volumes
                                 if include_visual_caches
@@ -1946,6 +2161,7 @@ def _mock_docker_command(
     cache_services: tuple[str, ...] | None = None,
     runtime_cache_read_only: bool = False,
     extra_bind_mounts: tuple[tuple[Path, str, bool], ...] = (),
+    service_bind_mounts: dict[str, tuple[tuple[Path, str, bool], ...]] | None = None,
     compose_project: str | None = None,
 ):
     """Return a deterministic Docker command fake for a two-service runtime."""
@@ -1953,6 +2169,7 @@ def _mock_docker_command(
     resolved_cache_services = set(
         services if cache_services is None else cache_services
     )
+    resolved_service_bind_mounts = service_bind_mounts or {}
 
     def run(command: list[str]) -> bytes:
         """Return Docker CLI JSON for the requested inspection."""
@@ -1976,7 +2193,10 @@ def _mock_docker_command(
                             include_visual_caches and service in resolved_cache_services
                         ),
                         runtime_cache_read_only=runtime_cache_read_only,
-                        extra_bind_mounts=extra_bind_mounts,
+                        extra_bind_mounts=(
+                            *extra_bind_mounts,
+                            *resolved_service_bind_mounts.get(service, ()),
+                        ),
                         compose_project=compose_project,
                     )
                     for service in services
