@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,11 @@ import pytest
 import torch
 from alpagym_runtime.inference.types import NUM_ROUTE_WAYPOINTS, ModelInput
 from alpagym_runtime.replay import ActionSelection, PolicyReplayData
-from alpagym_runtime.transport.disk import read_episode_json, write_episode_json
+from alpagym_runtime.transport.disk import (
+    read_episode_json,
+    read_episode_json_with_identity,
+    write_episode_json,
+)
 from alpagym_runtime.types import (
     EgoPose,
     EpisodeMetrics,
@@ -203,6 +208,22 @@ def test_rollout_artifact_round_trips_full_episode_output(tmp_path: Path) -> Non
         loaded.policy_outputs, episode.policy_outputs
     ):
         _assert_policy_output_equal(actual_output, expected_output)
+
+    loaded_with_identity, identity = read_episode_json_with_identity(target_path)
+    assert loaded_with_identity.session_uuid == episode.session_uuid
+    assert identity is not None
+    assert identity.completion_path == str(target_path.resolve())
+    assert (
+        identity.episode_file_sha256
+        == hashlib.sha256(target_path.read_bytes()).hexdigest()
+    )
+    assert identity.episode_file_size_bytes == target_path.stat().st_size
+    assert identity.episode_manifest_sha256 == artifact["manifest_sha256"]
+    assert identity.tensor_sidecar_filename == artifact["tensor_sidecar"]["filename"]
+    assert identity.tensor_sidecar_sha256 == artifact["tensor_sidecar"]["sha256"]
+    assert (
+        identity.tensor_sidecar_size_bytes == artifact["tensor_sidecar"]["size_bytes"]
+    )
 
 
 def test_write_episode_json_extracts_tensor_replay_payload(tmp_path: Path) -> None:

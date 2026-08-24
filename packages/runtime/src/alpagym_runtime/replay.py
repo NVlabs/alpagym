@@ -220,6 +220,23 @@ class TrainingSignal:
 
 
 @dataclass(frozen=True)
+class RolloutArtifactIdentity:
+    """Immutable identity of the exact disk bytes loaded into replay samples."""
+
+    completion_path: str
+    episode_file_sha256: str
+    episode_file_size_bytes: int
+    episode_manifest_sha256: str
+    tensor_sidecar_filename: str
+    tensor_sidecar_sha256: str
+    tensor_sidecar_size_bytes: int
+    session_uuid: str
+    rollout_seed: int | None
+    scene_id: str
+    num_steps: int
+
+
+@dataclass(frozen=True)
 class TrainerReplayData:
     """One replay step extracted from a rollout artifact before collation.
 
@@ -237,6 +254,7 @@ class TrainerReplayData:
     training_signal: TrainingSignal
     rollout_id: str
     weight_version: torch.Tensor
+    artifact_identity: RolloutArtifactIdentity | None = None
 
 
 @dataclass(frozen=True)

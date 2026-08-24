@@ -55,7 +55,7 @@ from alpagym_runtime.policies.registry import (
     PolicyCheckpointExportContext,
     get_policy_bundle,
 )
-from alpagym_runtime.replay import TrainingSignal
+from alpagym_runtime.replay import RolloutArtifactIdentity, TrainingSignal
 from alpagym_runtime.tensor_utils import to_device_recursive
 
 logger = logging.getLogger(__name__)
@@ -780,6 +780,195 @@ def _write_bytes_atomic_immutable(path: Path, payload: bytes) -> None:
                 )
 
 
+def _consumed_rollout_artifact_records(
+    rollouts: list[Any],
+    samples: list[Any],
+    *,
+    flow_chunk_density: bool,
+    formal_run_root: Path,
+) -> tuple[list[dict[str, Any]], str, int]:
+    """Bind the exact ordered disk artifacts that produced an optimizer batch."""
+
+    samples_by_rollout: dict[str, list[Any]] = {}
+    for sample in samples:
+        rollout_id = getattr(sample, "rollout_id", None)
+        if not isinstance(rollout_id, str) or not rollout_id:
+            raise ValueError("PPO receipt sample has no rollout_id")
+        samples_by_rollout.setdefault(rollout_id, []).append(sample)
+
+    raw_formal_root = Path(formal_run_root).expanduser()
+    canonical_formal_root = raw_formal_root.resolve(strict=True)
+    if (
+        not raw_formal_root.is_absolute()
+        or raw_formal_root != canonical_formal_root
+        or _FORMAL_RUN_ID.fullmatch(canonical_formal_root.name) is None
+        or not canonical_formal_root.is_dir()
+    ):
+        raise ValueError("PPO receipt formal run root is invalid")
+
+    records: list[dict[str, Any]] = []
+    seen_rollout_ids: set[str] = set()
+    seen_rollout_seeds: set[int] = set()
+    for rollout_index, rollout in enumerate(rollouts):
+        completion = getattr(rollout, "completion", None)
+        if not isinstance(completion, (str, os.PathLike)):
+            raise TypeError(
+                "formal PPO receipt requires disk-episode rollout completions"
+            )
+        completion_source = Path(completion).expanduser()
+        if not completion_source.is_absolute() or ".." in completion_source.parts:
+            raise ValueError(
+                "PPO receipt completion path must be absolute and normalized"
+            )
+        if (
+            completion_source.parent != canonical_formal_root / "artifacts"
+            or completion_source.is_symlink()
+            or not completion_source.is_file()
+        ):
+            raise ValueError("PPO receipt completion is outside formal artifacts")
+        completion_path = completion_source.resolve(strict=True)
+
+        matching_samples = [
+            sample
+            for rollout_samples in samples_by_rollout.values()
+            for sample in rollout_samples
+            if getattr(
+                getattr(sample, "artifact_identity", None),
+                "completion_path",
+                None,
+            )
+            == str(completion_path)
+        ]
+        identities = {
+            getattr(sample, "artifact_identity", None) for sample in matching_samples
+        }
+        if len(identities) != 1:
+            raise ValueError(
+                "PPO receipt samples do not share one loaded artifact identity"
+            )
+        identity = next(iter(identities))
+        if not isinstance(identity, RolloutArtifactIdentity):
+            raise TypeError("PPO receipt sample has no loaded disk-artifact identity")
+        session_uuid = identity.session_uuid
+        rollout_seed = identity.rollout_seed
+        scene_id = identity.scene_id
+        num_steps = identity.num_steps
+        if (
+            not isinstance(session_uuid, str)
+            or not session_uuid
+            or session_uuid in seen_rollout_ids
+            or isinstance(rollout_seed, bool)
+            or not isinstance(rollout_seed, int)
+            or not 0 <= rollout_seed < 2**64
+            or rollout_seed in seen_rollout_seeds
+            or not isinstance(scene_id, str)
+            or not scene_id
+            or isinstance(num_steps, bool)
+            or not isinstance(num_steps, int)
+            or num_steps <= 0
+        ):
+            raise ValueError("PPO receipt disk episode ownership is invalid")
+        filename = identity.tensor_sidecar_filename
+        sidecar_sha256 = identity.tensor_sidecar_sha256
+        sidecar_size = identity.tensor_sidecar_size_bytes
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or Path(filename).name != filename
+            or not isinstance(sidecar_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", sidecar_sha256) is None
+            or isinstance(sidecar_size, bool)
+            or not isinstance(sidecar_size, int)
+            or sidecar_size <= 0
+        ):
+            raise ValueError("PPO receipt tensor-sidecar identity is invalid")
+        if (
+            not isinstance(identity.episode_file_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", identity.episode_file_sha256) is None
+            or isinstance(identity.episode_file_size_bytes, bool)
+            or not isinstance(identity.episode_file_size_bytes, int)
+            or identity.episode_file_size_bytes <= 0
+            or not isinstance(identity.episode_manifest_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", identity.episode_manifest_sha256) is None
+        ):
+            raise ValueError("PPO receipt loaded episode identity is invalid")
+
+        rollout_samples = samples_by_rollout.pop(session_uuid, None)
+        if not rollout_samples:
+            raise ValueError("PPO receipt rollout has no optimizer samples")
+        if matching_samples != rollout_samples:
+            raise ValueError(
+                "PPO receipt optimizer rows differ from the loaded disk episode"
+            )
+        actor_rows = 0
+        valid_sample_rows = 0
+        for sample in rollout_samples:
+            if getattr(sample, "artifact_identity", None) != identity:
+                raise ValueError("PPO receipt rollout mixes artifact identities")
+            signal = getattr(sample, "training_signal", None)
+            if not isinstance(signal, TrainingSignal):
+                raise TypeError("PPO receipt sample training signal is invalid")
+            is_padding = getattr(signal, "is_padding", None)
+            if (
+                not isinstance(is_padding, torch.Tensor)
+                or is_padding.numel() != 1
+                or is_padding.dtype != torch.bool
+            ):
+                raise ValueError("PPO receipt sample validity signal is invalid")
+            padding_row = bool(is_padding.item())
+            actor_mask = _ppo_actor_valid_mask(
+                signal,
+                required=flow_chunk_density,
+            )
+            if actor_mask.numel() != 1 or actor_mask.dtype != torch.bool:
+                raise ValueError("PPO receipt actor-valid mask is not scalar")
+            actor_valid = bool(actor_mask.item())
+            if padding_row and actor_valid:
+                raise ValueError("PPO receipt padding row is actor-valid")
+            if not padding_row:
+                valid_sample_rows += 1
+                actor_rows += int(actor_valid)
+        if valid_sample_rows != num_steps:
+            raise ValueError(
+                "PPO receipt valid optimizer rows differ from the disk episode"
+            )
+        weight_version = getattr(rollout, "weight_version", None)
+        if isinstance(weight_version, bool) or not isinstance(weight_version, int):
+            raise TypeError("PPO receipt rollout weight version is invalid")
+        seen_rollout_ids.add(session_uuid)
+        seen_rollout_seeds.add(rollout_seed)
+        records.append(
+            {
+                "rollout_index": rollout_index,
+                "transport_kind": "disk_episode_v2",
+                "completion_relative_path": completion_path.relative_to(
+                    canonical_formal_root
+                ).as_posix(),
+                "episode_file_sha256": identity.episode_file_sha256,
+                "episode_file_size_bytes": identity.episode_file_size_bytes,
+                "episode_manifest_sha256": identity.episode_manifest_sha256,
+                "tensor_sidecar": {
+                    "filename": filename,
+                    "sha256": sidecar_sha256,
+                    "size_bytes": sidecar_size,
+                },
+                "session_uuid": session_uuid,
+                "rollout_seed": rollout_seed,
+                "scene_id": scene_id,
+                "num_steps": num_steps,
+                "behavior_weight_version": weight_version,
+                "optimizer_sample_rows": len(rollout_samples),
+                "optimizer_actor_valid_rows": actor_rows,
+            }
+        )
+    if samples_by_rollout:
+        raise ValueError("PPO receipt has optimizer samples from an undeclared rollout")
+    actor_sample_rows = sum(
+        int(record["optimizer_actor_valid_rows"]) for record in records
+    )
+    return records, canonical_json_sha256(records), actor_sample_rows
+
+
 def _write_ppo_update_diagnostic_receipt(
     *,
     config: Any,
@@ -791,7 +980,10 @@ def _write_ppo_update_diagnostic_receipt(
     received_rollouts: int,
     trainable_rollouts: int,
     sample_rows: int,
+    actor_sample_rows: int,
     behavior_weight_versions: list[int],
+    consumed_rollout_artifacts: list[dict[str, Any]],
+    consumed_rollout_batch_sha256: str,
     is_master_replica: bool,
     do_save_checkpoint: bool,
     pre_update_metrics: dict[str, float | int],
@@ -829,7 +1021,7 @@ def _write_ppo_update_diagnostic_receipt(
         current_step=current_step,
     )
     receipt = {
-        "schema_id": "alpagym.ppo_update_diagnostic.v1",
+        "schema_id": "alpagym.ppo_update_diagnostic.v2",
         "captured_at_utc": datetime.now(UTC).isoformat(),
         **binding,
         "rank": rank,
@@ -839,7 +1031,10 @@ def _write_ppo_update_diagnostic_receipt(
         "received_rollouts": received_rollouts,
         "trainable_rollouts": trainable_rollouts,
         "sample_rows": sample_rows,
+        "actor_sample_rows": actor_sample_rows,
         "behavior_weight_versions": sorted(behavior_weight_versions),
+        "consumed_rollout_artifacts": consumed_rollout_artifacts,
+        "consumed_rollout_batch_sha256": consumed_rollout_batch_sha256,
         "is_master_replica": is_master_replica,
         "checkpoint_requested": do_save_checkpoint,
         "boundary": {
@@ -1080,6 +1275,9 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         receipt_run_config: RunConfig | None = None
         receipt_rank: int | None = None
         behavior_weight_versions: list[int] = []
+        consumed_rollout_artifacts: list[dict[str, Any]] = []
+        consumed_rollout_batch_sha256 = ""
+        actor_sample_rows = 0
         optimizer_learning_rates_before_scheduler: list[float] | None = None
         behavior_kl_backtrack = bool(getattr(self, "_behavior_kl_backtrack", False))
         if write_ppo_receipt:
@@ -1087,6 +1285,16 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
                 int(rollout.weight_version) for rollout in rollouts
             ]
             receipt_run_config = _load_run_config(self.config)
+            (
+                consumed_rollout_artifacts,
+                consumed_rollout_batch_sha256,
+                actor_sample_rows,
+            ) = _consumed_rollout_artifact_records(
+                rollouts,
+                samples,
+                flow_chunk_density=bool(getattr(self, "_flow_chunk_density", False)),
+                formal_run_root=receipt_run_config.artifact_paths.run_dir,
+            )
             candidate_rank = getattr(self.ckpt_manager, "global_rank", None)
             if (
                 isinstance(candidate_rank, bool)
@@ -1142,7 +1350,10 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
                         received_rollouts=received_rollout_count,
                         trainable_rollouts=len(rollouts),
                         sample_rows=len(samples),
+                        actor_sample_rows=actor_sample_rows,
                         behavior_weight_versions=behavior_weight_versions,
+                        consumed_rollout_artifacts=consumed_rollout_artifacts,
+                        consumed_rollout_batch_sha256=(consumed_rollout_batch_sha256),
                         is_master_replica=is_master_replica,
                         do_save_checkpoint=do_save_checkpoint,
                         pre_update_metrics=pre_update_metrics,
@@ -1329,7 +1540,10 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
                         received_rollouts=received_rollout_count,
                         trainable_rollouts=len(rollouts),
                         sample_rows=len(samples),
+                        actor_sample_rows=actor_sample_rows,
                         behavior_weight_versions=behavior_weight_versions,
+                        consumed_rollout_artifacts=consumed_rollout_artifacts,
+                        consumed_rollout_batch_sha256=(consumed_rollout_batch_sha256),
                         is_master_replica=is_master_replica,
                         do_save_checkpoint=do_save_checkpoint,
                         pre_update_metrics=pre_update_metrics,
@@ -1373,7 +1587,10 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
                 received_rollouts=received_rollout_count,
                 trainable_rollouts=len(rollouts),
                 sample_rows=len(samples),
+                actor_sample_rows=actor_sample_rows,
                 behavior_weight_versions=behavior_weight_versions,
+                consumed_rollout_artifacts=consumed_rollout_artifacts,
+                consumed_rollout_batch_sha256=consumed_rollout_batch_sha256,
                 is_master_replica=is_master_replica,
                 do_save_checkpoint=do_save_checkpoint,
                 pre_update_metrics=pre_update_metrics,
@@ -3280,12 +3497,9 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         """Fail closed when calibrated behavior-policy KL exceeds its guard."""
         if phase == "pre_update" and self._on_policy:
             valid_rows = int(metrics["train/pre_update_valid_rows"])
-            max_abs_ratio_error = float(
-                metrics["train/pre_update_max_abs_ratio_error"]
-            )
+            max_abs_ratio_error = float(metrics["train/pre_update_max_abs_ratio_error"])
             if valid_rows > 0 and (
-                not math.isfinite(max_abs_ratio_error)
-                or max_abs_ratio_error > 1.0e-5
+                not math.isfinite(max_abs_ratio_error) or max_abs_ratio_error > 1.0e-5
             ):
                 raise FloatingPointError(
                     "On-policy PPO pre-update replay differs from its behavior "

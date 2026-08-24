@@ -44,7 +44,10 @@ from alpagym_runtime.replay import (
     clone_model_inputs,
 )
 from alpagym_runtime.transport import EpisodeWriter
-from alpagym_runtime.transport.disk import DiskEpisodeWriter, read_episode_json
+from alpagym_runtime.transport.disk import (
+    DiskEpisodeWriter,
+    read_episode_json_with_identity,
+)
 from alpagym_runtime.types import EpisodeOutput
 
 if TYPE_CHECKING:
@@ -207,9 +210,12 @@ class AlpagymDataPacker(DataPacker):
         # NcclDataPackerMixin); disk handles are JSON artifact paths read here.
         if isinstance(rollout_output, EpisodeOutput):
             episode = rollout_output
+            artifact_identity = None
         else:
             with timed_scope("trainer/artifact_load/disk_read", category="io"):
-                episode = read_episode_json(rollout_output)
+                episode, artifact_identity = read_episode_json_with_identity(
+                    rollout_output
+                )
 
         replay_rows: list[PolicyReplayData] = []
         for output in episode.policy_outputs:
@@ -243,6 +249,7 @@ class AlpagymDataPacker(DataPacker):
                     ),
                     rollout_id=episode.session_uuid,
                     weight_version=torch.tensor(weight_version, dtype=torch.int64),
+                    artifact_identity=artifact_identity,
                 )
             )
 
@@ -277,6 +284,7 @@ class AlpagymDataPacker(DataPacker):
                     ),
                     rollout_id=episode.session_uuid,
                     weight_version=step_samples[0].weight_version.clone(),
+                    artifact_identity=artifact_identity,
                 )
             )
 

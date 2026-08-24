@@ -15,9 +15,9 @@ import struct
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -117,6 +117,10 @@ _COSMOS_CHECKPOINT_STEP = re.compile(r"^step_([1-9][0-9]*)$")
 _FORMAL_RUN_ID = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}$")
 _PPO_UPDATE_DIAGNOSTIC = re.compile(r"^step_([0-9]+)_rank_([0-9]+)\.json$")
 _PPO_UPDATE_DIAGNOSTIC_STATES = frozenset({"pre_rejected", "post_rejected", "accepted"})
+_PPO_CAPTURED_AT_UTC = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?\+00:00$"
+)
 
 
 def build_import_probe_receipt(
@@ -1132,6 +1136,86 @@ def _capture_ppo_update_diagnostic_seals(
     expected_config_relative_path = canonical_config.relative_to(
         canonical_run_dir
     ).as_posix()
+    config_bytes, config_metadata = read_stable_regular_file(canonical_config)
+    if (
+        config_metadata.st_size != expected_resolved_config_size_bytes
+        or hashlib.sha256(config_bytes).hexdigest() != expected_resolved_config_sha256
+    ):
+        raise ValueError("PPO diagnostic seal resolved-config identity differs")
+    try:
+        resolved_config = yaml.safe_load(config_bytes)
+    except yaml.YAMLError as exc:
+        raise ValueError("PPO diagnostic seal resolved config is invalid YAML") from exc
+    if not isinstance(resolved_config, dict):
+        raise TypeError("PPO diagnostic seal resolved config must be an object")
+    cosmos = resolved_config.get("cosmos")
+    train = cosmos.get("train") if isinstance(cosmos, dict) else None
+    train_policy = train.get("train_policy") if isinstance(train, dict) else None
+    on_policy = (
+        train_policy.get("on_policy") if isinstance(train_policy, dict) else None
+    )
+    if on_policy is not None and not isinstance(on_policy, bool):
+        raise TypeError("PPO diagnostic seal on_policy config must be boolean")
+    expected_scene_ids: frozenset[str] | None = None
+    expected_packed_rows: int | None = None
+    expected_compact_optimizer_padding: bool | None = None
+    rollout_seed_base: int | None = None
+    train_batch_per_replica: int | None = None
+    policy_replicas: int | None = None
+    if on_policy is True:
+        dataset = resolved_config.get("dataset")
+        raw_scene_ids = dataset.get("scene_ids") if isinstance(dataset, dict) else None
+        if (
+            not isinstance(raw_scene_ids, list)
+            or not raw_scene_ids
+            or any(
+                not isinstance(scene_id, str) or not scene_id
+                for scene_id in raw_scene_ids
+            )
+            or len(set(raw_scene_ids)) != len(raw_scene_ids)
+        ):
+            raise ValueError("on-policy PPO seal dataset scene_ids are invalid")
+        expected_scene_ids = frozenset(cast(list[str], raw_scene_ids))
+
+        raw_expected_rows = resolved_config.get("expected_valid_steps")
+        if (
+            isinstance(raw_expected_rows, bool)
+            or not isinstance(raw_expected_rows, int)
+            or raw_expected_rows <= 0
+        ):
+            raise ValueError("on-policy PPO seal expected_valid_steps is invalid")
+        expected_packed_rows = raw_expected_rows
+
+        raw_train_batch = (
+            train.get("train_batch_per_replica") if isinstance(train, dict) else None
+        )
+        launch = cosmos.get("launch") if isinstance(cosmos, dict) else None
+        raw_policy_replicas = (
+            launch.get("policy_replicas") if isinstance(launch, dict) else None
+        )
+        alpasim = resolved_config.get("alpasim")
+        humanoid = alpasim.get("humanoid") if isinstance(alpasim, dict) else None
+        raw_seed_base = (
+            humanoid.get("rollout_seed_base") if isinstance(humanoid, dict) else None
+        )
+        for name, value in (
+            ("train_batch_per_replica", raw_train_batch),
+            ("policy_replicas", raw_policy_replicas),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"on-policy PPO seal {name} is invalid")
+        if (
+            isinstance(raw_seed_base, bool)
+            or not isinstance(raw_seed_base, int)
+            or not 0 <= raw_seed_base < 2**64
+        ):
+            raise ValueError("on-policy PPO seal rollout_seed_base is invalid")
+        train_batch_per_replica = raw_train_batch
+        policy_replicas = raw_policy_replicas
+        rollout_seed_base = raw_seed_base
+        expected_compact_optimizer_padding = (
+            cosmos.get("mode") == "colocated" and policy_replicas == 1
+        )
 
     if (
         receipt_dir.is_symlink()
@@ -1142,8 +1226,15 @@ def _capture_ppo_update_diagnostic_seals(
 
     seals: list[dict[str, Any]] = []
     seen_coordinates: set[tuple[int, int]] = set()
+    seen_on_policy_completion_paths: set[str] = set()
+    seen_on_policy_sessions: set[str] = set()
+    seen_on_policy_seeds: set[int] = set()
     with os.scandir(receipt_dir) as iterator:
         entries = sorted(iterator, key=lambda entry: entry.name)
+    if entries and on_policy is not True:
+        raise ValueError(
+            "PPO v2 diagnostic sealing requires explicit on-policy training"
+        )
     for entry in entries:
         match = _PPO_UPDATE_DIAGNOSTIC.fullmatch(entry.name)
         path = receipt_dir / entry.name
@@ -1161,6 +1252,26 @@ def _capture_ppo_update_diagnostic_seals(
             raise ValueError(f"PPO update diagnostic is invalid JSON: {path}") from exc
         _validate_ppo_update_diagnostic_receipt(
             receipt,
+            expected_formal_run_root=canonical_run_dir,
+            expected_behavior_weight_version=(
+                int(match.group(1)) - 1 if on_policy is True else None
+            ),
+            expected_scene_ids=expected_scene_ids,
+            expected_packed_rows_per_rollout=expected_packed_rows,
+            expected_compact_optimizer_padding=expected_compact_optimizer_padding,
+            expected_rollout_seeds=(
+                frozenset(
+                    rollout_seed_base
+                    + (int(match.group(1)) - 1) * train_batch_per_replica
+                    + offset
+                    for offset in range(train_batch_per_replica)
+                )
+                if on_policy is True
+                and policy_replicas == 1
+                and rollout_seed_base is not None
+                and train_batch_per_replica is not None
+                else None
+            ),
             expected_formal_run_id=canonical_run_dir.name,
             expected_resolved_config_sha256=expected_resolved_config_sha256,
             expected_resolved_config_relative_path=expected_config_relative_path,
@@ -1179,6 +1290,22 @@ def _capture_ppo_update_diagnostic_seals(
         if coordinate in seen_coordinates:
             raise ValueError("duplicate PPO update diagnostic step/rank coordinate")
         seen_coordinates.add(coordinate)
+        if on_policy is True:
+            for record in receipt["consumed_rollout_artifacts"]:
+                completion = record["completion_relative_path"]
+                session_uuid = record["session_uuid"]
+                rollout_seed = record["rollout_seed"]
+                if (
+                    completion in seen_on_policy_completion_paths
+                    or session_uuid in seen_on_policy_sessions
+                    or rollout_seed in seen_on_policy_seeds
+                ):
+                    raise ValueError(
+                        "on-policy PPO update reused rollout ownership across steps"
+                    )
+                seen_on_policy_completion_paths.add(completion)
+                seen_on_policy_sessions.add(session_uuid)
+                seen_on_policy_seeds.add(rollout_seed)
         seals.append(
             {
                 "receipt_relative_path": path.relative_to(canonical_run_dir).as_posix(),
@@ -1196,6 +1323,12 @@ def _capture_ppo_update_diagnostic_seals(
 def _validate_ppo_update_diagnostic_receipt(
     receipt: Any,
     *,
+    expected_formal_run_root: Path | None = None,
+    expected_behavior_weight_version: int | None = None,
+    expected_scene_ids: frozenset[str] | None = None,
+    expected_packed_rows_per_rollout: int | None = None,
+    expected_compact_optimizer_padding: bool | None = None,
+    expected_rollout_seeds: frozenset[int] | None = None,
     expected_formal_run_id: str,
     expected_resolved_config_sha256: str,
     expected_resolved_config_relative_path: str,
@@ -1222,7 +1355,10 @@ def _validate_ppo_update_diagnostic_receipt(
         "received_rollouts",
         "trainable_rollouts",
         "sample_rows",
+        "actor_sample_rows",
         "behavior_weight_versions",
+        "consumed_rollout_artifacts",
+        "consumed_rollout_batch_sha256",
         "is_master_replica",
         "checkpoint_requested",
         "boundary",
@@ -1234,10 +1370,14 @@ def _validate_ppo_update_diagnostic_receipt(
     }
     if set(receipt) != expected_keys:
         raise ValueError("PPO update diagnostic receipt has an unexpected schema")
-    if receipt["schema_id"] != "alpagym.ppo_update_diagnostic.v1":
+    if receipt["schema_id"] != "alpagym.ppo_update_diagnostic.v2":
         raise ValueError("PPO update diagnostic schema_id is unsupported")
     if receipt["formal_run_id"] != expected_formal_run_id:
         raise ValueError("PPO update diagnostic formal-run binding differs")
+    _validate_ppo_captured_at_utc(
+        receipt["captured_at_utc"],
+        formal_run_id=expected_formal_run_id,
+    )
     if (
         receipt["resolved_config_sha256"] != expected_resolved_config_sha256
         or receipt["resolved_config_relative_path"]
@@ -1269,20 +1409,45 @@ def _validate_ppo_update_diagnostic_receipt(
         or total_steps < expected_step
     ):
         raise ValueError("PPO update diagnostic total_steps is invalid")
-    for name in ("received_rollouts", "trainable_rollouts", "sample_rows"):
+    for name in (
+        "received_rollouts",
+        "trainable_rollouts",
+        "sample_rows",
+        "actor_sample_rows",
+    ):
         value = receipt[name]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"PPO update diagnostic {name} is invalid")
     if receipt["trainable_rollouts"] > receipt["received_rollouts"]:
         raise ValueError("PPO update diagnostic rollout counts are inconsistent")
+    if receipt["trainable_rollouts"] == 0 or receipt["sample_rows"] == 0:
+        raise ValueError("PPO update diagnostic optimizer batch is empty")
+    if receipt["actor_sample_rows"] > receipt["sample_rows"]:
+        raise ValueError("PPO update diagnostic actor row count is inconsistent")
     versions = receipt["behavior_weight_versions"]
     if not isinstance(versions, list) or any(
-        isinstance(version, bool) or not isinstance(version, int)
+        isinstance(version, bool) or not isinstance(version, int) or version < 0
         for version in versions
     ):
         raise TypeError("PPO update diagnostic behavior versions are invalid")
     if versions != sorted(versions):
         raise ValueError("PPO update diagnostic behavior versions are not sorted")
+    _validate_consumed_rollout_artifacts(
+        receipt,
+        expected_formal_run_root=expected_formal_run_root,
+        expected_scene_ids=expected_scene_ids,
+        expected_packed_rows_per_rollout=expected_packed_rows_per_rollout,
+        expected_compact_optimizer_padding=expected_compact_optimizer_padding,
+        expected_rollout_seeds=expected_rollout_seeds,
+    )
+    if (
+        expected_behavior_weight_version is not None
+        and versions
+        != [expected_behavior_weight_version] * receipt["trainable_rollouts"]
+    ):
+        raise ValueError(
+            "PPO update diagnostic behavior version differs from on-policy step"
+        )
     if not isinstance(receipt["is_master_replica"], bool) or not isinstance(
         receipt["checkpoint_requested"], bool
     ):
@@ -1330,9 +1495,26 @@ def _validate_ppo_update_diagnostic_receipt(
             raise TypeError(
                 "accepted PPO diagnostic requires optimizer and post-update metrics"
             )
+        if (
+            optimizer_steps != 1
+            or optimizer_metrics.get("train/optimizer_steps_applied") != 1
+        ):
+            raise ValueError(
+                "accepted PPO diagnostic must record exactly one optimizer step"
+            )
     else:
         if not isinstance(optimizer_metrics, dict):
             raise TypeError("post-rejected PPO diagnostic requires optimizer metrics")
+        metric_optimizer_steps = optimizer_metrics.get("train/optimizer_steps_applied")
+        if (
+            isinstance(metric_optimizer_steps, bool)
+            or not isinstance(metric_optimizer_steps, int)
+            or metric_optimizer_steps not in {0, 1}
+            or optimizer_steps != metric_optimizer_steps
+        ):
+            raise ValueError(
+                "post-rejected PPO diagnostic optimizer boundary differs from metrics"
+            )
         # A post-update replay can itself fail after the optimizer mutates the
         # policy.  The runtime restores the actor and writes ``null`` rather
         # than attaching stale candidate metrics to the restored live state.
@@ -1360,6 +1542,376 @@ def _validate_ppo_update_diagnostic_receipt(
     del body["receipt_sha256"]
     if stored_sha256 != _canonical_sha256(body):
         raise ValueError("PPO update diagnostic self hash differs from its contents")
+
+
+def _validate_ppo_captured_at_utc(value: Any, *, formal_run_id: str) -> None:
+    """Require the exact UTC timestamp shape emitted by the trainer.
+
+    This is a consistency check, not an authentication primitive.  Receipt
+    authentication comes from the captured clean producer source plus
+    re-reading the current formal-run artifacts below; the receipt's self hash
+    alone is deliberately not treated as trusted evidence.
+    """
+
+    if not isinstance(value, str) or _PPO_CAPTURED_AT_UTC.fullmatch(value) is None:
+        raise ValueError("PPO update diagnostic captured_at_utc is invalid")
+    try:
+        captured_at = datetime.fromisoformat(value)
+        run_started_at = datetime.strptime(
+            formal_run_id[:16],
+            "%Y%m%dT%H%M%SZ",
+        ).replace(tzinfo=UTC)
+    except ValueError as exc:
+        raise ValueError("PPO update diagnostic captured_at_utc is invalid") from exc
+    if captured_at.utcoffset() != timedelta(0) or captured_at < run_started_at:
+        raise ValueError("PPO update diagnostic captured_at_utc is inconsistent")
+
+
+def _validate_consumed_rollout_artifacts(
+    receipt: dict[str, Any],
+    *,
+    expected_formal_run_root: Path | None,
+    expected_scene_ids: frozenset[str] | None,
+    expected_packed_rows_per_rollout: int | None,
+    expected_compact_optimizer_padding: bool | None,
+    expected_rollout_seeds: frozenset[int] | None,
+) -> None:
+    """Validate the exact ordered disk episodes consumed by one optimizer step."""
+
+    records = receipt["consumed_rollout_artifacts"]
+    trainable_rollouts = receipt["trainable_rollouts"]
+    if not isinstance(records, list):
+        raise TypeError("PPO consumed rollout artifacts must be a list")
+    if len(records) != trainable_rollouts:
+        raise ValueError(
+            "PPO consumed rollout artifact count differs from trainable rollouts"
+        )
+
+    expected_record_keys = {
+        "rollout_index",
+        "transport_kind",
+        "completion_relative_path",
+        "episode_file_sha256",
+        "episode_file_size_bytes",
+        "episode_manifest_sha256",
+        "tensor_sidecar",
+        "session_uuid",
+        "rollout_seed",
+        "scene_id",
+        "num_steps",
+        "behavior_weight_version",
+        "optimizer_sample_rows",
+        "optimizer_actor_valid_rows",
+    }
+    expected_sidecar_keys = {"filename", "sha256", "size_bytes"}
+    seen_sessions: set[str] = set()
+    seen_seeds: set[int] = set()
+    seen_completion_paths: set[PurePosixPath] = set()
+    sample_rows = 0
+    actor_rows = 0
+    record_versions: list[int] = []
+    for expected_index, raw_record in enumerate(records):
+        if not isinstance(raw_record, dict) or set(raw_record) != expected_record_keys:
+            raise ValueError("PPO consumed rollout artifact has an unexpected schema")
+        record = cast(dict[str, Any], raw_record)
+        if record["rollout_index"] != expected_index or isinstance(
+            record["rollout_index"], bool
+        ):
+            raise ValueError("PPO consumed rollout artifact order is invalid")
+        if record["transport_kind"] != "disk_episode_v2":
+            raise ValueError("PPO consumed rollout transport kind is invalid")
+
+        completion = record["completion_relative_path"]
+        if not isinstance(completion, str) or "\\" in completion:
+            raise TypeError("PPO consumed rollout completion path is invalid")
+        completion_path = PurePosixPath(completion)
+        if (
+            completion_path.is_absolute()
+            or completion_path.parts in ((), (".",))
+            or ".." in completion_path.parts
+            or len(completion_path.parts) != 2
+            or completion_path.parts[0] != "artifacts"
+            or completion_path.suffix != ".json"
+            or completion_path.as_posix() != completion
+        ):
+            raise ValueError("PPO consumed rollout completion path is unsafe")
+        if completion_path in seen_completion_paths:
+            raise ValueError("PPO consumed rollout completion path is duplicated")
+        seen_completion_paths.add(completion_path)
+
+        for name in ("episode_file_sha256", "episode_manifest_sha256"):
+            if (
+                not isinstance(record[name], str)
+                or re.fullmatch(r"[0-9a-f]{64}", record[name]) is None
+            ):
+                raise ValueError(f"PPO consumed rollout {name} is invalid")
+        episode_size = record["episode_file_size_bytes"]
+        if (
+            isinstance(episode_size, bool)
+            or not isinstance(episode_size, int)
+            or episode_size <= 0
+        ):
+            raise ValueError("PPO consumed rollout episode file size is invalid")
+
+        raw_sidecar = record["tensor_sidecar"]
+        if (
+            not isinstance(raw_sidecar, dict)
+            or set(raw_sidecar) != expected_sidecar_keys
+        ):
+            raise ValueError("PPO consumed rollout sidecar has an unexpected schema")
+        sidecar = cast(dict[str, Any], raw_sidecar)
+        sidecar_filename = sidecar["filename"]
+        completion_stem = completion_path.stem
+        if (
+            not isinstance(sidecar_filename, str)
+            or "\\" in sidecar_filename
+            or PurePosixPath(sidecar_filename).name != sidecar_filename
+            or re.fullmatch(
+                rf"{re.escape(completion_stem)}\.[0-9a-f]{{32}}\.tensors\.pt",
+                sidecar_filename,
+            )
+            is None
+        ):
+            raise ValueError("PPO consumed rollout sidecar filename is invalid")
+        if (
+            not isinstance(sidecar["sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", sidecar["sha256"]) is None
+        ):
+            raise ValueError("PPO consumed rollout sidecar SHA-256 is invalid")
+        sidecar_size = sidecar["size_bytes"]
+        if (
+            isinstance(sidecar_size, bool)
+            or not isinstance(sidecar_size, int)
+            or sidecar_size <= 0
+        ):
+            raise ValueError("PPO consumed rollout sidecar size is invalid")
+
+        session_uuid = record["session_uuid"]
+        if (
+            not isinstance(session_uuid, str)
+            or not session_uuid
+            or session_uuid in seen_sessions
+        ):
+            raise ValueError("PPO consumed rollout session ownership is invalid")
+        seen_sessions.add(session_uuid)
+        rollout_seed = record["rollout_seed"]
+        if (
+            isinstance(rollout_seed, bool)
+            or not isinstance(rollout_seed, int)
+            or not 0 <= rollout_seed < 2**64
+            or rollout_seed in seen_seeds
+        ):
+            raise ValueError("PPO consumed rollout seed ownership is invalid")
+        seen_seeds.add(rollout_seed)
+        if not isinstance(record["scene_id"], str) or not record["scene_id"]:
+            raise ValueError("PPO consumed rollout scene is invalid")
+
+        for name in (
+            "num_steps",
+            "optimizer_sample_rows",
+            "optimizer_actor_valid_rows",
+        ):
+            value = record[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"PPO consumed rollout {name} is invalid")
+        if record["num_steps"] == 0 or record["optimizer_sample_rows"] == 0:
+            raise ValueError("PPO consumed rollout has no optimizer samples")
+        if record["optimizer_actor_valid_rows"] > record["optimizer_sample_rows"]:
+            raise ValueError("PPO consumed rollout actor row count is inconsistent")
+        behavior_version = record["behavior_weight_version"]
+        if (
+            isinstance(behavior_version, bool)
+            or not isinstance(behavior_version, int)
+            or behavior_version < 0
+        ):
+            raise TypeError("PPO consumed rollout behavior version is invalid")
+
+        sample_rows += record["optimizer_sample_rows"]
+        actor_rows += record["optimizer_actor_valid_rows"]
+        record_versions.append(behavior_version)
+
+        if expected_formal_run_root is not None:
+            _validate_consumed_rollout_files(
+                formal_run_root=expected_formal_run_root,
+                completion_path=completion_path,
+                record=record,
+            )
+
+    if sample_rows != receipt["sample_rows"]:
+        raise ValueError("PPO consumed rollout sample rows do not conserve")
+    if actor_rows != receipt["actor_sample_rows"]:
+        raise ValueError("PPO consumed rollout actor rows do not conserve")
+    if sorted(record_versions) != receipt["behavior_weight_versions"]:
+        raise ValueError("PPO consumed rollout behavior versions differ")
+    if expected_scene_ids is not None and any(
+        record["scene_id"] not in expected_scene_ids for record in records
+    ):
+        raise ValueError("PPO consumed rollout scene differs from resolved config")
+    if expected_packed_rows_per_rollout is not None:
+        for record in records:
+            num_steps = record["num_steps"]
+            optimizer_rows = record["optimizer_sample_rows"]
+            if num_steps > expected_packed_rows_per_rollout:
+                raise ValueError(
+                    "PPO consumed rollout real row count exceeds resolved T_pack"
+                )
+            if expected_compact_optimizer_padding is True:
+                if optimizer_rows != num_steps:
+                    raise ValueError(
+                        "colocated single-policy PPO must compact padding before "
+                        "the optimizer"
+                    )
+            elif not (num_steps <= optimizer_rows <= expected_packed_rows_per_rollout):
+                raise ValueError(
+                    "PPO consumed rollout optimizer rows fall outside real-row/T_pack "
+                    "bounds"
+                )
+    if (
+        expected_rollout_seeds is not None
+        and {record["rollout_seed"] for record in records} != expected_rollout_seeds
+    ):
+        raise ValueError("PPO consumed rollout seeds differ from resolved schedule")
+
+    batch_sha256 = receipt["consumed_rollout_batch_sha256"]
+    if (
+        not isinstance(batch_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", batch_sha256) is None
+    ):
+        raise ValueError("PPO consumed rollout batch SHA-256 is invalid")
+    if batch_sha256 != _canonical_sha256(records):
+        raise ValueError("PPO consumed rollout batch SHA-256 differs")
+
+
+def _validate_consumed_rollout_files(
+    *,
+    formal_run_root: Path,
+    completion_path: PurePosixPath,
+    record: dict[str, Any],
+) -> None:
+    """Re-authenticate current bytes and independently check episode semantics.
+
+    The host intentionally has no Torch/runtime dependency.  It verifies the
+    current single-link sidecar's exact filename, size, and SHA-256, but the
+    captured clean ``alpagym_runtime`` disk reader remains the trust boundary
+    for ``weights_only`` loading and exact tensor key/shape/dtype ABI
+    validation.  Consequently this function is not, by itself, proof against a
+    privileged actor that replaces both artifacts and the receipt.
+    """
+
+    canonical_root = formal_run_root.resolve(strict=True)
+    if (
+        canonical_root != formal_run_root
+        or _FORMAL_RUN_ID.fullmatch(canonical_root.name) is None
+    ):
+        raise ValueError("PPO consumed rollout formal root is invalid")
+    episode_path = canonical_root.joinpath(*completion_path.parts)
+    episode_bytes, episode_metadata = read_stable_regular_file(episode_path)
+    if (
+        episode_metadata.st_size != record["episode_file_size_bytes"]
+        or hashlib.sha256(episode_bytes).hexdigest() != record["episode_file_sha256"]
+    ):
+        raise ValueError("PPO consumed rollout episode file identity differs")
+    try:
+        artifact = json.loads(episode_bytes.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("PPO consumed rollout episode is invalid JSON") from exc
+    if not isinstance(artifact, dict) or set(artifact) != {
+        "artifact_schema",
+        "episode_manifest",
+        "manifest_sha256",
+        "tensor_sidecar",
+    }:
+        raise ValueError("PPO consumed rollout disk artifact schema differs")
+    manifest = artifact["episode_manifest"]
+    sidecar = artifact["tensor_sidecar"]
+    if (
+        artifact["artifact_schema"] != "alpagym.disk_episode.v2"
+        or not isinstance(manifest, dict)
+        or artifact["manifest_sha256"] != _canonical_sha256(manifest)
+        or artifact["manifest_sha256"] != record["episode_manifest_sha256"]
+    ):
+        raise ValueError("PPO consumed rollout episode manifest identity differs")
+    expected_manifest_identity = {
+        "session_uuid": record["session_uuid"],
+        "rollout_seed": record["rollout_seed"],
+        "scene_id": record["scene_id"],
+        "num_steps": record["num_steps"],
+    }
+    if any(
+        type(manifest.get(name)) is not type(value) or manifest.get(name) != value
+        for name, value in expected_manifest_identity.items()
+    ):
+        raise ValueError("PPO consumed rollout episode ownership differs")
+    policy_outputs = manifest.get("policy_outputs")
+    if (
+        not isinstance(policy_outputs, list)
+        or len(policy_outputs) != record["num_steps"]
+    ):
+        raise ValueError("PPO consumed rollout episode row count differs")
+    behavior_versions: set[int] = set()
+    actor_valid_rows = 0
+    for output in policy_outputs:
+        if not isinstance(output, dict):
+            raise ValueError("PPO consumed rollout policy output is invalid")
+        replay_data = output.get("replay_data")
+        if not isinstance(replay_data, dict):
+            raise ValueError("PPO consumed rollout replay data is invalid")
+        payload = replay_data.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError("PPO consumed rollout replay payload is invalid")
+        transition = payload.get("transition")
+        if transition is None:
+            behavior_version = 0
+            actor_valid = True
+        else:
+            if not isinstance(transition, dict):
+                raise ValueError("PPO consumed rollout transition is invalid")
+            behavior_version = transition.get("behavior_policy_version")
+            actor_valid = transition.get("actor_valid", True)
+            if (
+                isinstance(behavior_version, bool)
+                or not isinstance(behavior_version, int)
+                or behavior_version < 0
+            ):
+                raise ValueError(
+                    "PPO consumed rollout transition behavior version is invalid"
+                )
+            if not isinstance(actor_valid, bool):
+                raise ValueError(
+                    "PPO consumed rollout transition actor validity is invalid"
+                )
+        behavior_versions.add(behavior_version)
+        actor_valid_rows += int(actor_valid)
+    if behavior_versions != {record["behavior_weight_version"]}:
+        raise ValueError("PPO consumed rollout behavior version differs from episode")
+    if record["optimizer_sample_rows"] < len(policy_outputs):
+        raise ValueError(
+            "PPO consumed rollout optimizer row count differs from episode"
+        )
+    if record["optimizer_actor_valid_rows"] != actor_valid_rows:
+        raise ValueError("PPO consumed rollout actor row count differs from episode")
+    if (
+        not isinstance(sidecar, dict)
+        or set(sidecar) != {"filename", "format", "sha256", "size_bytes"}
+        or sidecar["format"] != "torch.save.weights_only.v1"
+        or {
+            "filename": sidecar["filename"],
+            "sha256": sidecar["sha256"],
+            "size_bytes": sidecar["size_bytes"],
+        }
+        != record["tensor_sidecar"]
+    ):
+        raise ValueError("PPO consumed rollout sidecar descriptor differs")
+    sidecar_path = episode_path.parent / sidecar["filename"]
+    sidecar_identity = _hash_regular_file(
+        source=sidecar_path,
+        relative_path=PurePosixPath("artifacts") / sidecar["filename"],
+    )
+    if (
+        sidecar_identity["sha256"] != sidecar["sha256"]
+        or sidecar_identity["size_bytes"] != sidecar["size_bytes"]
+    ):
+        raise ValueError("PPO consumed rollout sidecar file identity differs")
 
 
 def _capture_repository(

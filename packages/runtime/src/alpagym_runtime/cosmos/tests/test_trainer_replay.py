@@ -1522,11 +1522,18 @@ def test_ppo_behavior_kl_backtracking_scales_actor_only_before_accept(
     """One oversized Adam step is shrunk without weakening the critic update."""
     del cosmos_stubs
     trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    _stub_consumed_optimizer_batch(monkeypatch, trainer_module)
     trainer = _ppo_step_guard_trainer(trainer_module)
     trainer._write_ppo_update_diagnostic_receipts = True
     trainer.ckpt_manager = SimpleNamespace(global_rank=0)
     receipt_path = tmp_path / "step_1_rank_0.json"
-    monkeypatch.setattr(trainer_module, "_load_run_config", lambda config: object())
+    monkeypatch.setattr(
+        trainer_module,
+        "_load_run_config",
+        lambda config: SimpleNamespace(
+            artifact_paths=SimpleNamespace(run_dir=tmp_path)
+        ),
+    )
     monkeypatch.setattr(
         trainer_module,
         "_ppo_update_receipt_context",
@@ -1674,11 +1681,18 @@ def test_ppo_behavior_kl_backtracking_restores_after_initial_post_diagnostic_fai
     """A diagnostic crash after Adam restores actor and emits a null-metric rejection."""
     del cosmos_stubs
     trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    _stub_consumed_optimizer_batch(monkeypatch, trainer_module)
     trainer = _ppo_step_guard_trainer(trainer_module)
     trainer._write_ppo_update_diagnostic_receipts = True
     trainer.ckpt_manager = SimpleNamespace(global_rank=0)
     receipt_path = tmp_path / "step_1_rank_0.json"
-    monkeypatch.setattr(trainer_module, "_load_run_config", lambda config: object())
+    monkeypatch.setattr(
+        trainer_module,
+        "_load_run_config",
+        lambda config: SimpleNamespace(
+            artifact_paths=SimpleNamespace(run_dir=tmp_path)
+        ),
+    )
     monkeypatch.setattr(
         trainer_module,
         "_ppo_update_receipt_context",
@@ -1763,11 +1777,18 @@ def test_ppo_behavior_kl_backtracking_exactly_restores_nan_actor(
     """Exact restore overwrites a non-finite Adam result instead of computing NaN*0."""
     del cosmos_stubs
     trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    _stub_consumed_optimizer_batch(monkeypatch, trainer_module)
     trainer = _ppo_step_guard_trainer(trainer_module)
     trainer._write_ppo_update_diagnostic_receipts = True
     trainer.ckpt_manager = SimpleNamespace(global_rank=0)
     receipt_path = tmp_path / "step_1_rank_0.json"
-    monkeypatch.setattr(trainer_module, "_load_run_config", lambda config: object())
+    monkeypatch.setattr(
+        trainer_module,
+        "_load_run_config",
+        lambda config: SimpleNamespace(
+            artifact_paths=SimpleNamespace(run_dir=tmp_path)
+        ),
+    )
     monkeypatch.setattr(
         trainer_module,
         "_ppo_update_receipt_context",
@@ -1880,11 +1901,18 @@ def test_ppo_behavior_kl_backtracking_restores_after_partial_scale_diagnostic_fa
     """A crash after partial interpolation cannot leave the scaled actor live."""
     del cosmos_stubs
     trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    _stub_consumed_optimizer_batch(monkeypatch, trainer_module)
     trainer = _ppo_step_guard_trainer(trainer_module)
     trainer._write_ppo_update_diagnostic_receipts = True
     trainer.ckpt_manager = SimpleNamespace(global_rank=0)
     receipt_path = tmp_path / "step_1_rank_0.json"
-    monkeypatch.setattr(trainer_module, "_load_run_config", lambda config: object())
+    monkeypatch.setattr(
+        trainer_module,
+        "_load_run_config",
+        lambda config: SimpleNamespace(
+            artifact_paths=SimpleNamespace(run_dir=tmp_path)
+        ),
+    )
     monkeypatch.setattr(
         trainer_module,
         "_ppo_update_receipt_context",
@@ -2996,6 +3024,7 @@ def test_receipt_optimizer_topology_fails_before_training_mutates(
     """An unauditable optimizer topology is rejected before the update loop."""
     del cosmos_stubs
     trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    _stub_consumed_optimizer_batch(monkeypatch, trainer_module)
     trainer = _ppo_step_guard_trainer(trainer_module)
     trainer._write_ppo_update_diagnostic_receipts = True
     trainer.ckpt_manager = SimpleNamespace(global_rank=0)
@@ -3008,7 +3037,13 @@ def test_receipt_optimizer_topology_fails_before_training_mutates(
         "filter_trainable_rollouts",
         lambda rollouts, **kwargs: rollouts,
     )
-    monkeypatch.setattr(trainer_module, "_load_run_config", lambda config: object())
+    monkeypatch.setattr(
+        trainer_module,
+        "_load_run_config",
+        lambda config: SimpleNamespace(
+            artifact_paths=SimpleNamespace(run_dir=tmp_path)
+        ),
+    )
     monkeypatch.setattr(
         trainer_module,
         "_ppo_update_receipt_context",
@@ -3070,6 +3105,30 @@ def _actor_critic_optimizer_container(
         param_groups=[{"lr": 0.2, "params": critic_parameters}]
     )
     return SimpleNamespace(optimizers=[[actor_optimizer], [critic_optimizer]])
+
+
+def _stub_consumed_optimizer_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    trainer_module: Any,
+) -> None:
+    """Keep optimizer-boundary unit tests independent of disk provenance I/O."""
+
+    records = [
+        {
+            "rollout_index": 0,
+            "optimizer_sample_rows": 1,
+            "optimizer_actor_valid_rows": 1,
+        }
+    ]
+    monkeypatch.setattr(
+        trainer_module,
+        "_consumed_rollout_artifact_records",
+        lambda *_args, **_kwargs: (
+            records,
+            trainer_module.canonical_json_sha256(records),
+            1,
+        ),
+    )
 
 
 def _ppo_step_guard_trainer(trainer_module: Any) -> Any:

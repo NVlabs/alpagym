@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import stat
 import uuid
 from pathlib import Path
 from typing import Any, Mapping
@@ -10,7 +11,7 @@ from typing import Any, Mapping
 import redis
 import torch
 
-from alpagym_runtime.replay import parse_policy_replay_data
+from alpagym_runtime.replay import RolloutArtifactIdentity, parse_policy_replay_data
 from alpagym_runtime.transport.nccl.payload import (
     TENSOR_KEY_MARKER,
     WirePayload,
@@ -41,6 +42,44 @@ _DISK_ARTIFACT_KEYS = {
 _SIDECAR_KEYS = {"filename", "format", "sha256", "size_bytes"}
 _TENSOR_REF_KEYS = {TENSOR_KEY_MARKER, "shape", "dtype"}
 _SHA256_HEX_CHARS = frozenset("0123456789abcdef")
+
+
+def _stable_metadata(metadata: os.stat_result) -> tuple[int, ...]:
+    """Return fields that must remain constant across one artifact read."""
+
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_stable_regular_file(path: Path) -> tuple[bytes, os.stat_result]:
+    """Read one single-link regular file without following its final symlink."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError(f"Disk episode artifact is not a single-link file: {path}")
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            data = stream.read()
+        after = os.fstat(descriptor)
+        if _stable_metadata(before) != _stable_metadata(after):
+            raise RuntimeError(f"Disk episode artifact changed while read: {path}")
+        path_after = os.lstat(path)
+        if _stable_metadata(after) != _stable_metadata(path_after):
+            raise RuntimeError(f"Disk episode artifact path changed while read: {path}")
+        if len(data) != before.st_size:
+            raise RuntimeError(f"Disk episode artifact was read short: {path}")
+        return data, after
+    finally:
+        os.close(descriptor)
 
 
 def _manifest_sha256(manifest: Mapping[str, Any]) -> str:
@@ -127,7 +166,7 @@ def _load_tensor_sidecar(
     path: Path,
     descriptor: Mapping[str, Any],
     manifest: Mapping[str, Any],
-) -> dict[str, torch.Tensor]:
+) -> tuple[dict[str, torch.Tensor], int, str]:
     """Load a sidecar only after validating its descriptor, digest, and tensor ABI."""
     if set(descriptor) != _SIDECAR_KEYS:
         raise ValueError("Disk tensor sidecar descriptor has invalid fields")
@@ -144,30 +183,40 @@ def _load_tensor_sidecar(
         raise ValueError("Disk tensor sidecar has an invalid byte size")
 
     sidecar_path = path.parent / filename
-    if sidecar_path.is_symlink():
-        raise ValueError("Disk tensor sidecar must not be a symbolic link")
-    if not sidecar_path.is_file():
-        raise FileNotFoundError(f"Disk tensor sidecar is missing: {sidecar_path}")
-
     digest = hashlib.sha256()
     actual_size = 0
-    with sidecar_path.open("rb") as sidecar_file:
-        while chunk := sidecar_file.read(1024 * 1024):
-            digest.update(chunk)
-            actual_size += len(chunk)
-        if actual_size != expected_size:
-            raise ValueError(
-                f"Disk tensor sidecar size mismatch: {actual_size} != {expected_size}"
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor_fd = os.open(sidecar_path, flags)
+    try:
+        before = os.fstat(descriptor_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError("Disk tensor sidecar must be a single-link regular file")
+        with os.fdopen(os.dup(descriptor_fd), "rb") as sidecar_file:
+            while chunk := sidecar_file.read(1024 * 1024):
+                digest.update(chunk)
+                actual_size += len(chunk)
+            if actual_size != expected_size:
+                raise ValueError(
+                    "Disk tensor sidecar size mismatch: "
+                    f"{actual_size} != {expected_size}"
+                )
+            actual_sha256 = digest.hexdigest()
+            if actual_sha256 != expected_sha256:
+                raise ValueError("Disk tensor sidecar SHA-256 mismatch")
+            sidecar_file.seek(0)
+            tensor_payload = torch.load(
+                sidecar_file,
+                map_location="cpu",
+                weights_only=True,
             )
-        actual_sha256 = digest.hexdigest()
-        if actual_sha256 != expected_sha256:
-            raise ValueError("Disk tensor sidecar SHA-256 mismatch")
-        sidecar_file.seek(0)
-        tensor_payload = torch.load(
-            sidecar_file,
-            map_location="cpu",
-            weights_only=True,
-        )
+        after = os.fstat(descriptor_fd)
+        if _stable_metadata(before) != _stable_metadata(after):
+            raise RuntimeError("Disk tensor sidecar changed while loaded")
+        path_after = os.lstat(sidecar_path)
+        if _stable_metadata(after) != _stable_metadata(path_after):
+            raise RuntimeError("Disk tensor sidecar path changed while loaded")
+    finally:
+        os.close(descriptor_fd)
 
     if type(tensor_payload) is not dict:
         raise ValueError("Disk tensor sidecar payload must be a tensor dictionary")
@@ -193,7 +242,7 @@ def _load_tensor_sidecar(
                 f"Disk tensor {key!r} dtype mismatch: "
                 f"{tensor.dtype} != {expected_dtype}"
             )
-    return tensor_payload
+    return tensor_payload, actual_size, actual_sha256
 
 
 def _ego_pose_from_dict(payload: Mapping[str, Any]) -> EgoPose:
@@ -398,14 +447,18 @@ def write_episode_json(path: Path, episode: EpisodeOutput) -> None:
         previous_sidecar.unlink(missing_ok=True)
 
 
-def read_episode_json(handle: str | Path) -> EpisodeOutput:
-    """Read a v2 sidecar artifact or a backward-compatible legacy JSON artifact."""
-    path = Path(handle)
-    artifact_data = json.loads(path.read_text(encoding="utf-8"))
+def read_episode_json_with_identity(
+    handle: str | Path,
+) -> tuple[EpisodeOutput, RolloutArtifactIdentity | None]:
+    """Read one episode and return the identity of the exact bytes loaded."""
+
+    path = Path(handle).expanduser()
+    artifact_bytes, artifact_metadata = _read_stable_regular_file(path)
+    artifact_data = json.loads(artifact_bytes.decode("utf-8", errors="strict"))
     if not isinstance(artifact_data, dict):
         raise ValueError("Disk episode artifact must be a JSON object")
     if "artifact_schema" not in artifact_data:
-        return _episode_from_artifact_dict(artifact_data)
+        return _episode_from_artifact_dict(artifact_data), None
     if artifact_data["artifact_schema"] != _DISK_ARTIFACT_SCHEMA:
         raise ValueError(
             f"Unsupported disk episode schema: {artifact_data['artifact_schema']!r}"
@@ -425,10 +478,34 @@ def read_episode_json(handle: str | Path) -> EpisodeOutput:
     descriptor = artifact_data["tensor_sidecar"]
     if not isinstance(descriptor, dict):
         raise ValueError("Disk tensor sidecar descriptor must be a JSON object")
-    tensors = _load_tensor_sidecar(path, descriptor, manifest)
+    tensors, sidecar_size, sidecar_sha256 = _load_tensor_sidecar(
+        path,
+        descriptor,
+        manifest,
+    )
     episode = unpack(WirePayload(tensors=tensors, manifest=manifest))
     if not isinstance(episode, EpisodeOutput):
         raise TypeError("Disk tensor manifest did not reconstruct EpisodeOutput")
+    identity = RolloutArtifactIdentity(
+        completion_path=str(path.resolve(strict=True)),
+        episode_file_sha256=hashlib.sha256(artifact_bytes).hexdigest(),
+        episode_file_size_bytes=artifact_metadata.st_size,
+        episode_manifest_sha256=expected_manifest_sha256,
+        tensor_sidecar_filename=descriptor["filename"],
+        tensor_sidecar_sha256=sidecar_sha256,
+        tensor_sidecar_size_bytes=sidecar_size,
+        session_uuid=episode.session_uuid,
+        rollout_seed=episode.rollout_seed,
+        scene_id=episode.scene_id,
+        num_steps=episode.num_steps,
+    )
+    return episode, identity
+
+
+def read_episode_json(handle: str | Path) -> EpisodeOutput:
+    """Read a v2 sidecar artifact or a backward-compatible legacy JSON artifact."""
+
+    episode, _identity = read_episode_json_with_identity(handle)
     return episode
 
 

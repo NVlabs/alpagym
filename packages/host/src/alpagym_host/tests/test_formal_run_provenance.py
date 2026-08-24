@@ -2,12 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
 import textwrap
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
+from typing import cast
 
 import pytest
 import yaml
@@ -16,6 +19,7 @@ from alpagym_host.formal_run_provenance import (
     FormalRunProvenance,
     RepositorySource,
     _canonical_sha256,
+    _capture_ppo_update_diagnostic_seals,
     _read_runtime_ready_receipt,
     _validate_ppo_update_diagnostic_receipt,
     build_import_probe_receipt,
@@ -1687,6 +1691,421 @@ def test_incomplete_native_checkpoint_writes_invalid_postrun(
     _assert_durable_failure_receipt(owner.provenance_dir / "postrun.json")
 
 
+def _test_consumed_rollout_records(
+    *, count: int = 4, sample_rows: int = 14, actor_rows: int = 12
+) -> list[dict[str, object]]:
+    """Build one production-shaped ordered optimizer-artifact identity list."""
+
+    return [
+        {
+            "rollout_index": index,
+            "transport_kind": "disk_episode_v2",
+            "completion_relative_path": f"artifacts/episode_{index}.json",
+            "episode_file_sha256": f"{index + 1:064x}",
+            "episode_file_size_bytes": 1024 + index,
+            "episode_manifest_sha256": f"{index + 11:064x}",
+            "tensor_sidecar": {
+                "filename": (f"episode_{index}.{index + 21:032x}.tensors.pt"),
+                "sha256": f"{index + 31:064x}",
+                "size_bytes": 4096 + index,
+            },
+            "session_uuid": f"session-{index}",
+            "rollout_seed": 1000 + index,
+            "scene_id": "hq_stairs",
+            "num_steps": sample_rows,
+            "behavior_weight_version": 0,
+            "optimizer_sample_rows": sample_rows,
+            "optimizer_actor_valid_rows": actor_rows,
+        }
+        for index in range(count)
+    ]
+
+
+def _write_test_consumed_rollout_artifacts(
+    *,
+    run_dir: Path,
+    records: list[dict[str, object]],
+) -> None:
+    """Materialize v2 episode/sidecar bytes and bind ``records`` to them."""
+
+    artifacts_dir = run_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    for raw_record in records:
+        raw_sidecar = raw_record["tensor_sidecar"]
+        assert isinstance(raw_sidecar, dict)
+        sidecar = cast(dict[str, object], raw_sidecar)
+        sidecar_path = artifacts_dir / str(sidecar["filename"])
+        sidecar_buffer = io.BytesIO()
+        with zipfile.ZipFile(
+            sidecar_buffer,
+            mode="w",
+            compression=zipfile.ZIP_STORED,
+        ) as archive:
+            root = "archive"
+            archive.writestr(f"{root}/data.pkl", b"\x80\x02}q\x00.")
+            archive.writestr(f"{root}/byteorder", b"little")
+            archive.writestr(f"{root}/data/0", b"test-storage")
+            archive.writestr(f"{root}/version", b"3\n")
+            archive.writestr(f"{root}/.data/serialization_id", b"test")
+        sidecar_bytes = sidecar_buffer.getvalue()
+        sidecar_path.write_bytes(sidecar_bytes)
+        sidecar["sha256"] = hashlib.sha256(sidecar_bytes).hexdigest()
+        sidecar["size_bytes"] = len(sidecar_bytes)
+
+        num_steps = raw_record["num_steps"]
+        actor_rows = raw_record["optimizer_actor_valid_rows"]
+        behavior_version = raw_record["behavior_weight_version"]
+        assert type(num_steps) is int
+        assert type(actor_rows) is int
+        assert type(behavior_version) is int
+        manifest = {
+            "scene_id": raw_record["scene_id"],
+            "session_uuid": raw_record["session_uuid"],
+            "num_steps": num_steps,
+            "rollout_seed": raw_record["rollout_seed"],
+            "policy_outputs": [
+                {
+                    "replay_data": {
+                        "payload": {
+                            "transition": {
+                                "behavior_policy_version": behavior_version,
+                                "actor_valid": index < actor_rows,
+                            }
+                        }
+                    }
+                }
+                for index in range(num_steps)
+            ],
+        }
+        manifest_sha256 = _canonical_sha256(manifest)
+        raw_record["episode_manifest_sha256"] = manifest_sha256
+        artifact = {
+            "artifact_schema": "alpagym.disk_episode.v2",
+            "episode_manifest": manifest,
+            "manifest_sha256": manifest_sha256,
+            "tensor_sidecar": {
+                "filename": sidecar["filename"],
+                "format": "torch.save.weights_only.v1",
+                "sha256": sidecar["sha256"],
+                "size_bytes": sidecar["size_bytes"],
+            },
+        }
+        episode_bytes = (json.dumps(artifact, indent=2, sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
+        completion = PurePosixPath(str(raw_record["completion_relative_path"]))
+        episode_path = run_dir.joinpath(*completion.parts)
+        episode_path.write_bytes(episode_bytes)
+        raw_record["episode_file_sha256"] = hashlib.sha256(episode_bytes).hexdigest()
+        raw_record["episode_file_size_bytes"] = len(episode_bytes)
+
+
+def _write_test_accepted_ppo_receipt(
+    *,
+    run_dir: Path,
+    resolved_config: Path,
+    records: list[dict[str, object]],
+    step: int = 1,
+) -> Path:
+    """Write one immutable production-collector-shaped accepted v2 receipt."""
+
+    cosmos_output = run_dir / "cosmos" / "20260823120001"
+    cosmos_output.mkdir(parents=True, exist_ok=True)
+    receipt_dir = run_dir / "artifacts" / "ppo_update_diagnostics"
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    sample_rows = sum(int(record["optimizer_sample_rows"]) for record in records)
+    actor_rows = sum(int(record["optimizer_actor_valid_rows"]) for record in records)
+    receipt: dict[str, object] = {
+        "schema_id": "alpagym.ppo_update_diagnostic.v2",
+        "captured_at_utc": "2026-08-23T12:00:02+00:00",
+        "formal_run_id": run_dir.name,
+        "resolved_config_relative_path": "resolved_config.yaml",
+        "resolved_config_sha256": hashlib.sha256(
+            resolved_config.read_bytes()
+        ).hexdigest(),
+        "resolved_config_size_bytes": resolved_config.stat().st_size,
+        "cosmos_output_relative_path": "cosmos/20260823120001",
+        "rank": 0,
+        "current_step": step,
+        "total_steps": step,
+        "state": "accepted",
+        "received_rollouts": len(records),
+        "trainable_rollouts": len(records),
+        "sample_rows": sample_rows,
+        "actor_sample_rows": actor_rows,
+        "behavior_weight_versions": sorted(
+            int(record["behavior_weight_version"]) for record in records
+        ),
+        "consumed_rollout_artifacts": records,
+        "consumed_rollout_batch_sha256": _canonical_sha256(records),
+        "is_master_replica": True,
+        "checkpoint_requested": True,
+        "boundary": {
+            "optimizer_steps_applied": 1,
+            "scheduler_advanced": False,
+            "checkpoint_started": False,
+            "weight_sync_started": False,
+        },
+        "pre_update_metrics": {"train/pre_update_approx_kl": 0.0},
+        "optimizer_metrics": {"train/optimizer_steps_applied": 1},
+        "post_update_metrics": {"train/post_update_approx_kl": 0.001},
+        "rejection": None,
+    }
+    receipt["receipt_sha256"] = _canonical_sha256(receipt)
+    path = receipt_dir / f"step_{step}_rank_0.json"
+    path.write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o444)
+    return path
+
+
+def _write_test_on_policy_config(
+    *,
+    path: Path,
+    batch_size: int,
+    expected_rows: int,
+) -> None:
+    """Write the independent config authority used by the formal collector."""
+
+    path.write_text(
+        "dataset:\n"
+        "  scene_ids: [hq_stairs]\n"
+        f"expected_valid_steps: {expected_rows}\n"
+        "cosmos:\n"
+        "  mode: colocated\n"
+        "  launch:\n"
+        "    policy_replicas: 1\n"
+        "  train:\n"
+        f"    train_batch_per_replica: {batch_size}\n"
+        "    train_policy:\n"
+        "      on_policy: true\n"
+        "alpasim:\n"
+        "  humanoid:\n"
+        "    rollout_seed_base: 1000\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(
+    ("attack", "match"),
+    (
+        ("wrong_scene", "scene differs from resolved config"),
+        ("wrong_seed", "seeds differ from resolved schedule"),
+        ("claimed_num_steps", "episode ownership differs"),
+        ("drop_artifact", "seeds differ from resolved schedule"),
+    ),
+)
+def test_ppo_seal_rejects_fully_resigned_artifact_attack(
+    tmp_path: Path,
+    attack: str,
+    match: str,
+) -> None:
+    """Reject resigned claims that contradict config or current artifact bytes."""
+
+    run_dir = tmp_path / "20260823T120000Z-0123456789abcdef0123456789abcdef"
+    run_dir.mkdir()
+    expected_rows = 999 if attack == "claimed_num_steps" else 3
+    records = _test_consumed_rollout_records(
+        count=2,
+        sample_rows=expected_rows,
+        actor_rows=1 if attack == "claimed_num_steps" else 2,
+    )
+    if attack == "claimed_num_steps":
+        for record in records:
+            record["num_steps"] = 1
+    if attack == "wrong_scene":
+        for record in records:
+            record["scene_id"] = "wrong_scene"
+    elif attack == "wrong_seed":
+        for index, record in enumerate(records):
+            record["rollout_seed"] = 999_999 + index
+    elif attack == "drop_artifact":
+        records.pop()
+    _write_test_consumed_rollout_artifacts(run_dir=run_dir, records=records)
+
+    if attack == "claimed_num_steps":
+        # The current episode really contains one transition.  A resigned
+        # receipt cannot relabel that as 999 real transitions; 999 packed rows
+        # remain legal only when num_steps stays one (tested separately).
+        for record in records:
+            record["num_steps"] = 999
+    resolved_config = run_dir / "resolved_config.yaml"
+    _write_test_on_policy_config(
+        path=resolved_config,
+        batch_size=2,
+        expected_rows=expected_rows,
+    )
+    _write_test_accepted_ppo_receipt(
+        run_dir=run_dir,
+        resolved_config=resolved_config,
+        records=records,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        _capture_ppo_update_diagnostic_seals(
+            run_dir,
+            expected_resolved_config_sha256=hashlib.sha256(
+                resolved_config.read_bytes()
+            ).hexdigest(),
+            expected_resolved_config_path=resolved_config,
+            expected_resolved_config_size_bytes=resolved_config.stat().st_size,
+        )
+
+
+def test_ppo_seal_does_not_claim_host_sidecar_tensor_abi(tmp_path: Path) -> None:
+    """Sidecar ABI belongs to the captured clean runtime, not this host seal."""
+
+    run_dir = tmp_path / "20260823T120000Z-0123456789abcdef0123456789abcdef"
+    run_dir.mkdir()
+    records = _test_consumed_rollout_records(count=1, sample_rows=3, actor_rows=2)
+    _write_test_consumed_rollout_artifacts(run_dir=run_dir, records=records)
+    record = records[0]
+    sidecar = cast(dict[str, object], record["tensor_sidecar"])
+    sidecar_bytes = b"host-only-seal-does-not-load-tensors"
+    sidecar_path = run_dir / "artifacts" / str(sidecar["filename"])
+    sidecar_path.write_bytes(sidecar_bytes)
+    sidecar["sha256"] = hashlib.sha256(sidecar_bytes).hexdigest()
+    sidecar["size_bytes"] = len(sidecar_bytes)
+    episode_path = run_dir.joinpath(
+        *PurePosixPath(str(record["completion_relative_path"])).parts
+    )
+    artifact = json.loads(episode_path.read_text(encoding="utf-8"))
+    artifact["tensor_sidecar"]["sha256"] = sidecar["sha256"]
+    artifact["tensor_sidecar"]["size_bytes"] = sidecar["size_bytes"]
+    episode_bytes = (json.dumps(artifact, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    episode_path.write_bytes(episode_bytes)
+    record["episode_file_sha256"] = hashlib.sha256(episode_bytes).hexdigest()
+    record["episode_file_size_bytes"] = len(episode_bytes)
+
+    resolved_config = run_dir / "resolved_config.yaml"
+    _write_test_on_policy_config(
+        path=resolved_config,
+        batch_size=1,
+        expected_rows=3,
+    )
+    _write_test_accepted_ppo_receipt(
+        run_dir=run_dir,
+        resolved_config=resolved_config,
+        records=records,
+    )
+
+    seals = _capture_ppo_update_diagnostic_seals(
+        run_dir,
+        expected_resolved_config_sha256=hashlib.sha256(
+            resolved_config.read_bytes()
+        ).hexdigest(),
+        expected_resolved_config_path=resolved_config,
+        expected_resolved_config_size_bytes=resolved_config.stat().st_size,
+    )
+
+    assert len(seals) == 1
+
+
+def test_ppo_seal_accepts_early_terminal_padding_without_inflating_real_rows(
+    tmp_path: Path,
+) -> None:
+    """One real early-fall row may be padded to T_pack without becoming 999 rows."""
+
+    run_dir = tmp_path / "20260823T120000Z-0123456789abcdef0123456789abcdef"
+    run_dir.mkdir()
+    records = _test_consumed_rollout_records(count=1, sample_rows=1, actor_rows=1)
+    records[0]["num_steps"] = 1
+    _write_test_consumed_rollout_artifacts(run_dir=run_dir, records=records)
+    resolved_config = run_dir / "resolved_config.yaml"
+    _write_test_on_policy_config(
+        path=resolved_config,
+        batch_size=1,
+        expected_rows=999,
+    )
+    _write_test_accepted_ppo_receipt(
+        run_dir=run_dir,
+        resolved_config=resolved_config,
+        records=records,
+    )
+
+    seals = _capture_ppo_update_diagnostic_seals(
+        run_dir,
+        expected_resolved_config_sha256=hashlib.sha256(
+            resolved_config.read_bytes()
+        ).hexdigest(),
+        expected_resolved_config_path=resolved_config,
+        expected_resolved_config_size_bytes=resolved_config.stat().st_size,
+    )
+
+    assert len(seals) == 1
+
+
+def test_ppo_seal_rejects_uncompacted_padding_in_colocated_single_policy(
+    tmp_path: Path,
+) -> None:
+    """The single-GPU optimizer receipt must name only its real input rows."""
+
+    run_dir = tmp_path / "20260823T120000Z-0123456789abcdef0123456789abcdef"
+    run_dir.mkdir()
+    records = _test_consumed_rollout_records(count=1, sample_rows=60, actor_rows=1)
+    records[0]["num_steps"] = 1
+    _write_test_consumed_rollout_artifacts(run_dir=run_dir, records=records)
+    resolved_config = run_dir / "resolved_config.yaml"
+    _write_test_on_policy_config(
+        path=resolved_config,
+        batch_size=1,
+        expected_rows=60,
+    )
+    _write_test_accepted_ppo_receipt(
+        run_dir=run_dir,
+        resolved_config=resolved_config,
+        records=records,
+    )
+
+    with pytest.raises(ValueError, match="compact padding"):
+        _capture_ppo_update_diagnostic_seals(
+            run_dir,
+            expected_resolved_config_sha256=hashlib.sha256(
+                resolved_config.read_bytes()
+            ).hexdigest(),
+            expected_resolved_config_path=resolved_config,
+            expected_resolved_config_size_bytes=resolved_config.stat().st_size,
+        )
+
+
+def test_ppo_seal_requires_explicit_on_policy_config(tmp_path: Path) -> None:
+    """A v2 receipt cannot opt itself into the stricter config-derived checks."""
+
+    run_dir = tmp_path / "20260823T120000Z-0123456789abcdef0123456789abcdef"
+    run_dir.mkdir()
+    records = _test_consumed_rollout_records(count=1, sample_rows=3, actor_rows=2)
+    _write_test_consumed_rollout_artifacts(run_dir=run_dir, records=records)
+    resolved_config = run_dir / "resolved_config.yaml"
+    resolved_config.write_text(
+        "dataset:\n"
+        "  scene_ids: [hq_stairs]\n"
+        "expected_valid_steps: 3\n"
+        "alpasim:\n"
+        "  humanoid:\n"
+        "    rollout_seed_base: 1000\n",
+        encoding="utf-8",
+    )
+    _write_test_accepted_ppo_receipt(
+        run_dir=run_dir,
+        resolved_config=resolved_config,
+        records=records,
+    )
+
+    with pytest.raises(ValueError, match="requires explicit on-policy"):
+        _capture_ppo_update_diagnostic_seals(
+            run_dir,
+            expected_resolved_config_sha256=hashlib.sha256(
+                resolved_config.read_bytes()
+            ).hexdigest(),
+            expected_resolved_config_path=resolved_config,
+            expected_resolved_config_size_bytes=resolved_config.stat().st_size,
+        )
+
+
 @pytest.mark.parametrize(
     "post_update_metrics",
     (
@@ -1707,7 +2126,22 @@ def test_failed_formal_run_seals_post_rejected_ppo_diagnostic(
     run_dir = tmp_path / "20260823T120000Z-0123456789abcdef0123456789abcdef"
     run_dir.mkdir()
     resolved_config = run_dir / "resolved_config.yaml"
-    resolved_config.write_text("execution: {}\n", encoding="utf-8")
+    resolved_config.write_text(
+        "dataset:\n"
+        "  scene_ids: [hq_stairs]\n"
+        "expected_valid_steps: 14\n"
+        "cosmos:\n"
+        "  launch:\n"
+        "    policy_replicas: 1\n"
+        "  train:\n"
+        "    train_batch_per_replica: 4\n"
+        "    train_policy:\n"
+        "      on_policy: true\n"
+        "alpasim:\n"
+        "  humanoid:\n"
+        "    rollout_seed_base: 1000\n",
+        encoding="utf-8",
+    )
     cosmos_config = run_dir / "cosmos_config.toml"
     cosmos_config.write_text("mode = 'colocated'\n", encoding="utf-8")
     owner = FormalRunProvenance.capture_prelaunch(
@@ -1740,8 +2174,13 @@ def test_failed_formal_run_seals_post_rejected_ppo_diagnostic(
     cosmos_output.mkdir(parents=True)
     receipt_dir = run_dir / "artifacts" / "ppo_update_diagnostics"
     receipt_dir.mkdir(parents=True)
+    consumed_rollouts = _test_consumed_rollout_records()
+    _write_test_consumed_rollout_artifacts(
+        run_dir=run_dir,
+        records=consumed_rollouts,
+    )
     receipt = {
-        "schema_id": "alpagym.ppo_update_diagnostic.v1",
+        "schema_id": "alpagym.ppo_update_diagnostic.v2",
         "captured_at_utc": "2026-08-23T12:00:02+00:00",
         "formal_run_id": run_dir.name,
         "resolved_config_relative_path": "resolved_config.yaml",
@@ -1757,7 +2196,10 @@ def test_failed_formal_run_seals_post_rejected_ppo_diagnostic(
         "received_rollouts": 4,
         "trainable_rollouts": 4,
         "sample_rows": 56,
+        "actor_sample_rows": 48,
         "behavior_weight_versions": [0, 0, 0, 0],
+        "consumed_rollout_artifacts": consumed_rollouts,
+        "consumed_rollout_batch_sha256": _canonical_sha256(consumed_rollouts),
         "is_master_replica": True,
         "checkpoint_requested": True,
         "boundary": {
@@ -1806,11 +2248,19 @@ def test_failed_formal_run_seals_post_rejected_ppo_diagnostic(
 
 
 @pytest.mark.parametrize(
-    ("state", "optimizer_metrics", "post_metrics", "rejection", "match"),
+    (
+        "state",
+        "optimizer_metrics",
+        "boundary_optimizer_steps",
+        "post_metrics",
+        "rejection",
+        "match",
+    ),
     (
         (
             "pre_rejected",
             {"train/optimizer_steps_applied": 0},
+            0,
             None,
             {"type": "RuntimeError", "message": "pre guard failed"},
             "pre-rejected PPO diagnostic contains optimizer state",
@@ -1818,6 +2268,7 @@ def test_failed_formal_run_seals_post_rejected_ppo_diagnostic(
         (
             "accepted",
             {"train/optimizer_steps_applied": 1},
+            1,
             None,
             None,
             "accepted PPO diagnostic requires optimizer and post-update metrics",
@@ -1825,13 +2276,23 @@ def test_failed_formal_run_seals_post_rejected_ppo_diagnostic(
         (
             "post_rejected",
             None,
+            0,
             None,
             {"type": "RuntimeError", "message": "post replay failed"},
             "post-rejected PPO diagnostic requires optimizer metrics",
         ),
         (
+            "post_rejected",
+            {"train/optimizer_steps_applied": 1},
+            0,
+            None,
+            {"type": "RuntimeError", "message": "post replay failed"},
+            "post-rejected PPO diagnostic optimizer boundary differs from metrics",
+        ),
+        (
             "accepted",
             {"train/optimizer_steps_applied": 1},
+            1,
             {"train/post_update_approx_kl": 0.001},
             {"type": "RuntimeError", "message": "impossible accepted rejection"},
             "accepted PPO diagnostic cannot contain a rejection",
@@ -1839,6 +2300,7 @@ def test_failed_formal_run_seals_post_rejected_ppo_diagnostic(
         (
             "post_rejected",
             {"train/optimizer_steps_applied": 1},
+            1,
             None,
             None,
             "rejected PPO diagnostic has no valid exception identity",
@@ -1848,6 +2310,7 @@ def test_failed_formal_run_seals_post_rejected_ppo_diagnostic(
 def test_ppo_update_diagnostic_rejects_inconsistent_terminal_state(
     state: str,
     optimizer_metrics: dict[str, int] | None,
+    boundary_optimizer_steps: int,
     post_metrics: dict[str, float] | None,
     rejection: dict[str, str] | None,
     match: str,
@@ -1855,13 +2318,9 @@ def test_ppo_update_diagnostic_rejects_inconsistent_terminal_state(
     """Host sealing rejects metric/rejection combinations the writer cannot emit."""
     formal_run_id = "20260823T120000Z-0123456789abcdef0123456789abcdef"
     resolved_config_sha256 = "1" * 64
-    optimizer_steps = (
-        0
-        if optimizer_metrics is None
-        else int(optimizer_metrics["train/optimizer_steps_applied"])
-    )
+    consumed_rollouts = _test_consumed_rollout_records()
     receipt = {
-        "schema_id": "alpagym.ppo_update_diagnostic.v1",
+        "schema_id": "alpagym.ppo_update_diagnostic.v2",
         "captured_at_utc": "2026-08-23T12:00:02+00:00",
         "formal_run_id": formal_run_id,
         "resolved_config_relative_path": "resolved_config.yaml",
@@ -1875,11 +2334,14 @@ def test_ppo_update_diagnostic_rejects_inconsistent_terminal_state(
         "received_rollouts": 4,
         "trainable_rollouts": 4,
         "sample_rows": 56,
+        "actor_sample_rows": 48,
         "behavior_weight_versions": [0, 0, 0, 0],
+        "consumed_rollout_artifacts": consumed_rollouts,
+        "consumed_rollout_batch_sha256": _canonical_sha256(consumed_rollouts),
         "is_master_replica": True,
         "checkpoint_requested": True,
         "boundary": {
-            "optimizer_steps_applied": optimizer_steps,
+            "optimizer_steps_applied": boundary_optimizer_steps,
             "scheduler_advanced": False,
             "checkpoint_started": False,
             "weight_sync_started": False,
@@ -1900,6 +2362,422 @@ def test_ppo_update_diagnostic_rejects_inconsistent_terminal_state(
             expected_resolved_config_size_bytes=14,
             expected_step=1,
             expected_rank=0,
+        )
+
+
+@pytest.mark.parametrize(
+    "captured_at_utc",
+    (
+        "not-a-timestamp",
+        "2026-08-23T12:00:02",
+        "2026-08-23T12:00:02-07:00",
+        "2026-08-23T11:59:59+00:00",
+    ),
+)
+def test_ppo_update_diagnostic_rejects_invalid_capture_time(
+    captured_at_utc: str,
+) -> None:
+    """The formal root anchors a canonical UTC receipt time floor."""
+
+    formal_run_id = "20260823T120000Z-0123456789abcdef0123456789abcdef"
+    records = _test_consumed_rollout_records(count=1)
+    receipt = {
+        "schema_id": "alpagym.ppo_update_diagnostic.v2",
+        "captured_at_utc": captured_at_utc,
+        "formal_run_id": formal_run_id,
+        "resolved_config_relative_path": "resolved_config.yaml",
+        "resolved_config_sha256": "1" * 64,
+        "resolved_config_size_bytes": 14,
+        "cosmos_output_relative_path": "cosmos/20260823120001",
+        "rank": 0,
+        "current_step": 1,
+        "total_steps": 1,
+        "state": "accepted",
+        "received_rollouts": 1,
+        "trainable_rollouts": 1,
+        "sample_rows": 14,
+        "actor_sample_rows": 12,
+        "behavior_weight_versions": [0],
+        "consumed_rollout_artifacts": records,
+        "consumed_rollout_batch_sha256": _canonical_sha256(records),
+        "is_master_replica": True,
+        "checkpoint_requested": True,
+        "boundary": {
+            "optimizer_steps_applied": 1,
+            "scheduler_advanced": False,
+            "checkpoint_started": False,
+            "weight_sync_started": False,
+        },
+        "pre_update_metrics": {"train/pre_update_approx_kl": 0.0},
+        "optimizer_metrics": {"train/optimizer_steps_applied": 1},
+        "post_update_metrics": {"train/post_update_approx_kl": 0.001},
+        "rejection": None,
+    }
+    receipt["receipt_sha256"] = _canonical_sha256(receipt)
+
+    with pytest.raises(ValueError, match="captured_at_utc"):
+        _validate_ppo_update_diagnostic_receipt(
+            receipt,
+            expected_formal_run_id=formal_run_id,
+            expected_resolved_config_sha256="1" * 64,
+            expected_resolved_config_relative_path="resolved_config.yaml",
+            expected_resolved_config_size_bytes=14,
+            expected_step=1,
+            expected_rank=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    (
+        ("reorder", "artifact order is invalid"),
+        ("tamper", "batch SHA-256 differs"),
+        ("duplicate_session", "session ownership is invalid"),
+        ("duplicate_seed", "seed ownership is invalid"),
+        ("unsafe_path", "completion path is unsafe"),
+        ("sample_count", "sample rows do not conserve"),
+        ("actor_count", "actor rows do not conserve"),
+        ("behavior_version", "behavior versions differ"),
+        ("episode_sha", "episode_file_sha256 is invalid"),
+        ("episode_size", "episode file size is invalid"),
+        ("manifest_sha", "episode_manifest_sha256 is invalid"),
+        ("sidecar_sha", "sidecar SHA-256 is invalid"),
+        ("sidecar_size", "sidecar size is invalid"),
+        ("record_count", "artifact count differs"),
+    ),
+)
+def test_ppo_update_diagnostic_rejects_forged_consumed_rollout_batch(
+    mutation: str,
+    match: str,
+) -> None:
+    """Reject internally inconsistent, un-reindexed order/hash/ownership edits."""
+
+    formal_run_id = "20260823T120000Z-0123456789abcdef0123456789abcdef"
+    resolved_config_sha256 = "1" * 64
+    consumed_rollouts = _test_consumed_rollout_records(count=2)
+    receipt = {
+        "schema_id": "alpagym.ppo_update_diagnostic.v2",
+        "captured_at_utc": "2026-08-23T12:00:02+00:00",
+        "formal_run_id": formal_run_id,
+        "resolved_config_relative_path": "resolved_config.yaml",
+        "resolved_config_sha256": resolved_config_sha256,
+        "resolved_config_size_bytes": 14,
+        "cosmos_output_relative_path": "cosmos/20260823120001",
+        "rank": 0,
+        "current_step": 1,
+        "total_steps": 4,
+        "state": "accepted",
+        "received_rollouts": 2,
+        "trainable_rollouts": 2,
+        "sample_rows": 28,
+        "actor_sample_rows": 24,
+        "behavior_weight_versions": [0, 0],
+        "consumed_rollout_artifacts": consumed_rollouts,
+        "consumed_rollout_batch_sha256": _canonical_sha256(consumed_rollouts),
+        "is_master_replica": True,
+        "checkpoint_requested": True,
+        "boundary": {
+            "optimizer_steps_applied": 1,
+            "scheduler_advanced": False,
+            "checkpoint_started": False,
+            "weight_sync_started": False,
+        },
+        "pre_update_metrics": {"train/pre_update_approx_kl": 0.0},
+        "optimizer_metrics": {"train/optimizer_steps_applied": 1},
+        "post_update_metrics": {"train/post_update_approx_kl": 0.001},
+        "rejection": None,
+    }
+    records = receipt["consumed_rollout_artifacts"]
+    assert isinstance(records, list)
+    if mutation == "reorder":
+        records[:] = [records[1], records[0]]
+        receipt["consumed_rollout_batch_sha256"] = _canonical_sha256(records)
+    elif mutation == "tamper":
+        records[0]["episode_file_sha256"] = "f" * 64
+    elif mutation == "duplicate_session":
+        records[1]["session_uuid"] = records[0]["session_uuid"]
+        receipt["consumed_rollout_batch_sha256"] = _canonical_sha256(records)
+    elif mutation == "duplicate_seed":
+        records[1]["rollout_seed"] = records[0]["rollout_seed"]
+        receipt["consumed_rollout_batch_sha256"] = _canonical_sha256(records)
+    elif mutation == "unsafe_path":
+        records[0]["completion_relative_path"] = "artifacts/../episode_0.json"
+        receipt["consumed_rollout_batch_sha256"] = _canonical_sha256(records)
+    elif mutation == "sample_count":
+        records[0]["optimizer_sample_rows"] = 13
+        receipt["consumed_rollout_batch_sha256"] = _canonical_sha256(records)
+    elif mutation == "actor_count":
+        records[0]["optimizer_actor_valid_rows"] = 11
+        receipt["consumed_rollout_batch_sha256"] = _canonical_sha256(records)
+    elif mutation == "behavior_version":
+        records[0]["behavior_weight_version"] = 1
+        receipt["consumed_rollout_batch_sha256"] = _canonical_sha256(records)
+    elif mutation == "episode_sha":
+        records[0]["episode_file_sha256"] = "F" * 64
+        receipt["consumed_rollout_batch_sha256"] = _canonical_sha256(records)
+    elif mutation == "episode_size":
+        records[0]["episode_file_size_bytes"] = True
+        receipt["consumed_rollout_batch_sha256"] = _canonical_sha256(records)
+    elif mutation == "manifest_sha":
+        records[0]["episode_manifest_sha256"] = "bad"
+        receipt["consumed_rollout_batch_sha256"] = _canonical_sha256(records)
+    elif mutation == "sidecar_sha":
+        sidecar = records[0]["tensor_sidecar"]
+        assert isinstance(sidecar, dict)
+        cast(dict[str, object], sidecar)["sha256"] = "0" * 63
+        receipt["consumed_rollout_batch_sha256"] = _canonical_sha256(records)
+    elif mutation == "sidecar_size":
+        sidecar = records[0]["tensor_sidecar"]
+        assert isinstance(sidecar, dict)
+        cast(dict[str, object], sidecar)["size_bytes"] = 0
+        receipt["consumed_rollout_batch_sha256"] = _canonical_sha256(records)
+    elif mutation == "record_count":
+        records.pop()
+        receipt["consumed_rollout_batch_sha256"] = _canonical_sha256(records)
+    else:  # pragma: no cover - parameter list is exhaustive
+        raise AssertionError(mutation)
+    receipt["receipt_sha256"] = _canonical_sha256(receipt)
+
+    with pytest.raises((TypeError, ValueError), match=match):
+        _validate_ppo_update_diagnostic_receipt(
+            receipt,
+            expected_formal_run_id=formal_run_id,
+            expected_resolved_config_sha256=resolved_config_sha256,
+            expected_resolved_config_relative_path="resolved_config.yaml",
+            expected_resolved_config_size_bytes=14,
+            expected_step=1,
+            expected_rank=0,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "session_uuid",
+        "rollout_seed",
+        "scene_id",
+        "num_steps",
+        "behavior_weight_version",
+        "optimizer_sample_rows",
+        "optimizer_actor_valid_rows",
+    ),
+)
+def test_ppo_update_diagnostic_reauthenticates_episode_semantics(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """A fully resigned receipt cannot contradict the sealed episode bytes."""
+
+    formal_run_id = "20260823T120000Z-0123456789abcdef0123456789abcdef"
+    run_dir = tmp_path / formal_run_id
+    run_dir.mkdir()
+    records = _test_consumed_rollout_records(
+        count=1,
+        sample_rows=3,
+        actor_rows=2,
+    )
+    _write_test_consumed_rollout_artifacts(run_dir=run_dir, records=records)
+    receipt = {
+        "schema_id": "alpagym.ppo_update_diagnostic.v2",
+        "captured_at_utc": "2026-08-23T12:00:02+00:00",
+        "formal_run_id": formal_run_id,
+        "resolved_config_relative_path": "resolved_config.yaml",
+        "resolved_config_sha256": "1" * 64,
+        "resolved_config_size_bytes": 14,
+        "cosmos_output_relative_path": "cosmos/20260823120001",
+        "rank": 0,
+        "current_step": 1,
+        "total_steps": 4,
+        "state": "accepted",
+        "received_rollouts": 1,
+        "trainable_rollouts": 1,
+        "sample_rows": 3,
+        "actor_sample_rows": 2,
+        "behavior_weight_versions": [0],
+        "consumed_rollout_artifacts": records,
+        "consumed_rollout_batch_sha256": _canonical_sha256(records),
+        "is_master_replica": True,
+        "checkpoint_requested": True,
+        "boundary": {
+            "optimizer_steps_applied": 1,
+            "scheduler_advanced": False,
+            "checkpoint_started": False,
+            "weight_sync_started": False,
+        },
+        "pre_update_metrics": {"train/pre_update_approx_kl": 0.0},
+        "optimizer_metrics": {"train/optimizer_steps_applied": 1},
+        "post_update_metrics": {"train/post_update_approx_kl": 0.001},
+        "rejection": None,
+    }
+    receipt["receipt_sha256"] = _canonical_sha256(receipt)
+    _validate_ppo_update_diagnostic_receipt(
+        receipt,
+        expected_formal_run_root=run_dir,
+        expected_formal_run_id=formal_run_id,
+        expected_resolved_config_sha256="1" * 64,
+        expected_resolved_config_relative_path="resolved_config.yaml",
+        expected_resolved_config_size_bytes=14,
+        expected_step=1,
+        expected_rank=0,
+    )
+
+    record = records[0]
+    if mutation == "session_uuid":
+        record[mutation] = "forged-session"
+    elif mutation == "rollout_seed":
+        record[mutation] = 999999
+    elif mutation == "scene_id":
+        record[mutation] = "forged-scene"
+    elif mutation == "num_steps":
+        record[mutation] = 4
+    elif mutation == "behavior_weight_version":
+        record[mutation] = 9
+        receipt["behavior_weight_versions"] = [9]
+    elif mutation == "optimizer_sample_rows":
+        record[mutation] = 2
+        receipt["sample_rows"] = 2
+    elif mutation == "optimizer_actor_valid_rows":
+        record[mutation] = 1
+        receipt["actor_sample_rows"] = 1
+    else:  # pragma: no cover - parameter list is exhaustive
+        raise AssertionError(mutation)
+    receipt["consumed_rollout_batch_sha256"] = _canonical_sha256(records)
+    receipt["receipt_sha256"] = _canonical_sha256(
+        {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    )
+
+    with pytest.raises(ValueError, match="differs"):
+        _validate_ppo_update_diagnostic_receipt(
+            receipt,
+            expected_formal_run_root=run_dir,
+            expected_formal_run_id=formal_run_id,
+            expected_resolved_config_sha256="1" * 64,
+            expected_resolved_config_relative_path="resolved_config.yaml",
+            expected_resolved_config_size_bytes=14,
+            expected_step=1,
+            expected_rank=0,
+        )
+
+
+def test_ppo_seal_rejects_on_policy_rollout_reuse_across_steps(
+    tmp_path: Path,
+) -> None:
+    """A later update cannot relabel a prior session/seed as fresh data."""
+
+    formal_run_id = "20260823T120000Z-0123456789abcdef0123456789abcdef"
+    run_dir = tmp_path / formal_run_id
+    run_dir.mkdir()
+    resolved_config = run_dir / "resolved_config.yaml"
+    resolved_config.write_text(
+        "dataset:\n"
+        "  scene_ids: [hq_stairs]\n"
+        "expected_valid_steps: 3\n"
+        "cosmos:\n"
+        "  launch:\n"
+        "    policy_replicas: 1\n"
+        "  train:\n"
+        "    train_batch_per_replica: 1\n"
+        "    train_policy:\n"
+        "      on_policy: true\n"
+        "alpasim:\n"
+        "  humanoid:\n"
+        "    rollout_seed_base: 1000\n",
+        encoding="utf-8",
+    )
+    (run_dir / "cosmos" / "20260823120001").mkdir(parents=True)
+    receipt_dir = run_dir / "artifacts" / "ppo_update_diagnostics"
+    receipt_dir.mkdir(parents=True)
+
+    step_one_records = _test_consumed_rollout_records(
+        count=1,
+        sample_rows=3,
+        actor_rows=2,
+    )
+    _write_test_consumed_rollout_artifacts(
+        run_dir=run_dir,
+        records=step_one_records,
+    )
+    step_two_records = _test_consumed_rollout_records(
+        count=1,
+        sample_rows=3,
+        actor_rows=2,
+    )
+    step_two_record = step_two_records[0]
+    step_two_record["completion_relative_path"] = "artifacts/episode_second.json"
+    step_two_sidecar = step_two_record["tensor_sidecar"]
+    assert isinstance(step_two_sidecar, dict)
+    cast(dict[str, object], step_two_sidecar)["filename"] = (
+        "episode_second.0123456789abcdef0123456789abcdef.tensors.pt"
+    )
+    step_two_record["rollout_seed"] = 1001
+    step_two_record["behavior_weight_version"] = 1
+    _write_test_consumed_rollout_artifacts(
+        run_dir=run_dir,
+        records=step_two_records,
+    )
+
+    def accepted_receipt(
+        step: int,
+        records: list[dict[str, object]],
+    ) -> dict[str, object]:
+        sample_rows = sum(int(record["optimizer_sample_rows"]) for record in records)
+        actor_rows = sum(
+            int(record["optimizer_actor_valid_rows"]) for record in records
+        )
+        receipt: dict[str, object] = {
+            "schema_id": "alpagym.ppo_update_diagnostic.v2",
+            "captured_at_utc": "2026-08-23T12:00:02+00:00",
+            "formal_run_id": formal_run_id,
+            "resolved_config_relative_path": "resolved_config.yaml",
+            "resolved_config_sha256": hashlib.sha256(
+                resolved_config.read_bytes()
+            ).hexdigest(),
+            "resolved_config_size_bytes": resolved_config.stat().st_size,
+            "cosmos_output_relative_path": "cosmos/20260823120001",
+            "rank": 0,
+            "current_step": step,
+            "total_steps": 2,
+            "state": "accepted",
+            "received_rollouts": len(records),
+            "trainable_rollouts": len(records),
+            "sample_rows": sample_rows,
+            "actor_sample_rows": actor_rows,
+            "behavior_weight_versions": [step - 1] * len(records),
+            "consumed_rollout_artifacts": records,
+            "consumed_rollout_batch_sha256": _canonical_sha256(records),
+            "is_master_replica": True,
+            "checkpoint_requested": True,
+            "boundary": {
+                "optimizer_steps_applied": 1,
+                "scheduler_advanced": False,
+                "checkpoint_started": False,
+                "weight_sync_started": False,
+            },
+            "pre_update_metrics": {"train/pre_update_approx_kl": 0.0},
+            "optimizer_metrics": {"train/optimizer_steps_applied": 1},
+            "post_update_metrics": {"train/post_update_approx_kl": 0.001},
+            "rejection": None,
+        }
+        receipt["receipt_sha256"] = _canonical_sha256(receipt)
+        return receipt
+
+    for step, records in ((1, step_one_records), (2, step_two_records)):
+        path = receipt_dir / f"step_{step}_rank_0.json"
+        path.write_text(
+            json.dumps(accepted_receipt(step, records), indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o444)
+
+    with pytest.raises(ValueError, match="reused rollout ownership"):
+        _capture_ppo_update_diagnostic_seals(
+            run_dir,
+            expected_resolved_config_sha256=hashlib.sha256(
+                resolved_config.read_bytes()
+            ).hexdigest(),
+            expected_resolved_config_path=resolved_config,
+            expected_resolved_config_size_bytes=resolved_config.stat().st_size,
         )
 
 

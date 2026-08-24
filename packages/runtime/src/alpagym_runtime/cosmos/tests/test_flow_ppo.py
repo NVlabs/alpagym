@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import inspect
 import json
 import math
@@ -17,7 +18,370 @@ from alpagym_runtime.cosmos.replay_objective import (
     compute_flow_ppo_surrogate,
     compute_value_loss,
 )
-from alpagym_runtime.replay import TrainingSignal
+from alpagym_runtime.replay import RolloutArtifactIdentity, TrainingSignal
+
+
+def _write_consumed_disk_episode(
+    artifacts_dir: Path,
+    *,
+    session_uuid: str,
+    seed: int,
+    num_steps: int,
+    behavior_version: int = 0,
+    actor_valid_rows: int | None = None,
+) -> tuple[Path, RolloutArtifactIdentity]:
+    """Write the smallest production-shaped artifact needed by the batch binder."""
+
+    token = hashlib.sha256(session_uuid.encode()).hexdigest()[:32]
+    sidecar_path = artifacts_dir / f"episode_{session_uuid}.{token}.tensors.pt"
+    sidecar_bytes = f"sidecar-{session_uuid}".encode()
+    sidecar_path.write_bytes(sidecar_bytes)
+    if actor_valid_rows is None:
+        actor_valid_rows = num_steps
+    episode_manifest = {
+        "session_uuid": session_uuid,
+        "rollout_seed": seed,
+        "scene_id": "hq_stairs",
+        "num_steps": num_steps,
+        "policy_outputs": [
+            {
+                "replay_data": {
+                    "payload": {
+                        "transition": {
+                            "behavior_policy_version": behavior_version,
+                            "actor_valid": index < actor_valid_rows,
+                        }
+                    }
+                }
+            }
+            for index in range(num_steps)
+        ],
+    }
+    artifact = {
+        "artifact_schema": "alpagym.disk_episode.v2",
+        "episode_manifest": episode_manifest,
+        "manifest_sha256": hashlib.sha256(
+            json.dumps(
+                episode_manifest,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest(),
+        "tensor_sidecar": {
+            "filename": sidecar_path.name,
+            "format": "torch.save.weights_only.v1",
+            "sha256": hashlib.sha256(sidecar_bytes).hexdigest(),
+            "size_bytes": len(sidecar_bytes),
+        },
+    }
+    completion_path = artifacts_dir / f"episode_{session_uuid}.json"
+    completion_path.write_text(json.dumps(artifact), encoding="utf-8")
+    return completion_path, RolloutArtifactIdentity(
+        completion_path=str(completion_path.resolve(strict=True)),
+        episode_file_sha256=hashlib.sha256(completion_path.read_bytes()).hexdigest(),
+        episode_file_size_bytes=completion_path.stat().st_size,
+        episode_manifest_sha256=artifact["manifest_sha256"],
+        tensor_sidecar_filename=sidecar_path.name,
+        tensor_sidecar_sha256=artifact["tensor_sidecar"]["sha256"],
+        tensor_sidecar_size_bytes=len(sidecar_bytes),
+        session_uuid=session_uuid,
+        rollout_seed=seed,
+        scene_id="hq_stairs",
+        num_steps=num_steps,
+    )
+
+
+def test_optimizer_batch_receipt_binds_exact_ordered_disk_episodes(
+    cosmos_stubs: None,
+    tmp_path: Path,
+) -> None:
+    """The receipt names exactly the artifacts and actor rows used by Adam."""
+
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    run_dir = tmp_path / "20260823T120000Z-0123456789abcdef0123456789abcdef"
+    artifacts_dir = run_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    first, first_identity = _write_consumed_disk_episode(
+        artifacts_dir,
+        session_uuid="session-a",
+        seed=41,
+        num_steps=2,
+    )
+    second, second_identity = _write_consumed_disk_episode(
+        artifacts_dir,
+        session_uuid="session-b",
+        seed=42,
+        num_steps=1,
+    )
+
+    def sample(
+        session_uuid: str,
+        actor_valid: bool,
+        identity: RolloutArtifactIdentity,
+        *,
+        is_padding: bool = False,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            rollout_id=session_uuid,
+            artifact_identity=identity,
+            training_signal=TrainingSignal(
+                old_logprobs=torch.zeros(1),
+                is_padding=torch.tensor([is_padding]),
+                actor_valid=torch.tensor([actor_valid]),
+            ),
+        )
+
+    records, batch_sha256, actor_rows = (
+        trainer_module._consumed_rollout_artifact_records(
+            [
+                SimpleNamespace(completion=str(first), weight_version=3),
+                SimpleNamespace(completion=str(second), weight_version=3),
+            ],
+            [
+                sample("session-a", True, first_identity),
+                sample("session-a", False, first_identity),
+                sample("session-b", True, second_identity),
+            ],
+            flow_chunk_density=True,
+            formal_run_root=run_dir,
+        )
+    )
+
+    assert [record["session_uuid"] for record in records] == [
+        "session-a",
+        "session-b",
+    ]
+    assert [record["optimizer_sample_rows"] for record in records] == [2, 1]
+    assert [record["optimizer_actor_valid_rows"] for record in records] == [1, 1]
+    assert actor_rows == 2
+    assert batch_sha256 == trainer_module.canonical_json_sha256(records)
+
+
+def test_optimizer_batch_receipt_is_accepted_by_host_from_exact_episode_bytes(
+    cosmos_stubs: None,
+    tmp_path: Path,
+) -> None:
+    """Producer and host agree on one real ordered two-episode receipt."""
+
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    from alpagym_host.formal_run_provenance import (
+        _validate_ppo_update_diagnostic_receipt,
+    )
+
+    run_dir = tmp_path / "20260823T120000Z-0123456789abcdef0123456789abcdef"
+    artifacts_dir = run_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    first, first_identity = _write_consumed_disk_episode(
+        artifacts_dir,
+        session_uuid="session-a",
+        seed=41,
+        num_steps=2,
+        behavior_version=7,
+        actor_valid_rows=1,
+    )
+    second, second_identity = _write_consumed_disk_episode(
+        artifacts_dir,
+        session_uuid="session-b",
+        seed=42,
+        num_steps=1,
+        behavior_version=7,
+        actor_valid_rows=1,
+    )
+
+    def sample(
+        session_uuid: str,
+        actor_valid: bool,
+        identity: RolloutArtifactIdentity,
+        *,
+        is_padding: bool = False,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            rollout_id=session_uuid,
+            artifact_identity=identity,
+            training_signal=TrainingSignal(
+                old_logprobs=torch.zeros(1),
+                is_padding=torch.tensor([is_padding]),
+                actor_valid=torch.tensor([actor_valid]),
+            ),
+        )
+
+    records, batch_sha256, actor_rows = (
+        trainer_module._consumed_rollout_artifact_records(
+            [
+                SimpleNamespace(completion=str(first), weight_version=7),
+                SimpleNamespace(completion=str(second), weight_version=7),
+            ],
+            [
+                sample("session-a", True, first_identity),
+                sample("session-a", False, first_identity),
+                sample("session-b", True, second_identity),
+            ],
+            flow_chunk_density=True,
+            formal_run_root=run_dir,
+        )
+    )
+    receipt = {
+        "schema_id": "alpagym.ppo_update_diagnostic.v2",
+        "captured_at_utc": "2026-08-23T12:00:02+00:00",
+        "formal_run_id": run_dir.name,
+        "resolved_config_relative_path": "resolved_config.yaml",
+        "resolved_config_sha256": "1" * 64,
+        "resolved_config_size_bytes": 14,
+        "cosmos_output_relative_path": "cosmos/20260823120001",
+        "rank": 0,
+        "current_step": 8,
+        "total_steps": 50,
+        "state": "accepted",
+        "received_rollouts": 2,
+        "trainable_rollouts": 2,
+        "sample_rows": 3,
+        "actor_sample_rows": actor_rows,
+        "behavior_weight_versions": [7, 7],
+        "consumed_rollout_artifacts": records,
+        "consumed_rollout_batch_sha256": batch_sha256,
+        "is_master_replica": True,
+        "checkpoint_requested": True,
+        "boundary": {
+            "optimizer_steps_applied": 1,
+            "scheduler_advanced": False,
+            "checkpoint_started": False,
+            "weight_sync_started": False,
+        },
+        "pre_update_metrics": {"train/pre_update_approx_kl": 0.0},
+        "optimizer_metrics": {"train/optimizer_steps_applied": 1},
+        "post_update_metrics": {"train/post_update_approx_kl": 0.001},
+        "rejection": None,
+    }
+    receipt["receipt_sha256"] = trainer_module.canonical_json_sha256(receipt)
+
+    _validate_ppo_update_diagnostic_receipt(
+        receipt,
+        expected_formal_run_root=run_dir,
+        expected_behavior_weight_version=7,
+        expected_scene_ids=frozenset({"hq_stairs"}),
+        expected_packed_rows_per_rollout=2,
+        expected_compact_optimizer_padding=True,
+        expected_rollout_seeds=frozenset({41, 42}),
+        expected_formal_run_id=run_dir.name,
+        expected_resolved_config_sha256="1" * 64,
+        expected_resolved_config_relative_path="resolved_config.yaml",
+        expected_resolved_config_size_bytes=14,
+        expected_step=8,
+        expected_rank=0,
+    )
+
+
+def test_optimizer_batch_receipt_rejects_undeclared_or_symlinked_artifacts(
+    cosmos_stubs: None,
+    tmp_path: Path,
+) -> None:
+    """An optimizer row or completion outside the declared pair fails closed."""
+
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    run_dir = tmp_path / "20260823T120000Z-fedcba9876543210fedcba9876543210"
+    artifacts_dir = run_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    completion, identity = _write_consumed_disk_episode(
+        artifacts_dir,
+        session_uuid="session-a",
+        seed=41,
+        num_steps=1,
+    )
+    signal = TrainingSignal(
+        old_logprobs=torch.zeros(1),
+        is_padding=torch.zeros(1, dtype=torch.bool),
+        actor_valid=torch.ones(1, dtype=torch.bool),
+    )
+    with pytest.raises(ValueError, match="optimizer rows differ|undeclared rollout"):
+        trainer_module._consumed_rollout_artifact_records(
+            [SimpleNamespace(completion=str(completion), weight_version=0)],
+            [
+                SimpleNamespace(
+                    rollout_id="session-a",
+                    training_signal=signal,
+                    artifact_identity=identity,
+                ),
+                SimpleNamespace(
+                    rollout_id="session-extra",
+                    training_signal=signal,
+                    artifact_identity=identity,
+                ),
+            ],
+            flow_chunk_density=True,
+            formal_run_root=run_dir,
+        )
+
+    linked = artifacts_dir / "linked.json"
+    linked.symlink_to(completion)
+    with pytest.raises(ValueError, match="outside formal artifacts"):
+        trainer_module._consumed_rollout_artifact_records(
+            [SimpleNamespace(completion=str(linked), weight_version=0)],
+            [
+                SimpleNamespace(
+                    rollout_id="session-a",
+                    training_signal=signal,
+                    artifact_identity=identity,
+                )
+            ],
+            flow_chunk_density=True,
+            formal_run_root=run_dir,
+        )
+
+
+def test_optimizer_batch_receipt_rejects_duplicate_rollout_seed(
+    cosmos_stubs: None,
+    tmp_path: Path,
+) -> None:
+    """Two distinct episode files cannot claim the same scheduled rollout seed."""
+
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    run_dir = tmp_path / "20260823T120000Z-89abcdef0123456789abcdef01234567"
+    artifacts_dir = run_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    first, first_identity = _write_consumed_disk_episode(
+        artifacts_dir,
+        session_uuid="session-a",
+        seed=41,
+        num_steps=1,
+    )
+    second, second_identity = _write_consumed_disk_episode(
+        artifacts_dir,
+        session_uuid="session-b",
+        seed=41,
+        num_steps=1,
+    )
+    signal = TrainingSignal(
+        old_logprobs=torch.zeros(1),
+        is_padding=torch.zeros(1, dtype=torch.bool),
+        actor_valid=torch.ones(1, dtype=torch.bool),
+    )
+
+    with pytest.raises(ValueError, match="ownership is invalid"):
+        trainer_module._consumed_rollout_artifact_records(
+            [
+                SimpleNamespace(completion=str(first), weight_version=0),
+                SimpleNamespace(completion=str(second), weight_version=0),
+            ],
+            [
+                SimpleNamespace(
+                    rollout_id="session-a",
+                    training_signal=signal,
+                    artifact_identity=first_identity,
+                ),
+                SimpleNamespace(
+                    rollout_id="session-b",
+                    training_signal=signal,
+                    artifact_identity=second_identity,
+                ),
+            ],
+            flow_chunk_density=True,
+            formal_run_root=run_dir,
+        )
 
 
 @pytest.mark.parametrize(
@@ -75,6 +439,29 @@ def test_ppo_update_diagnostic_receipt_is_three_state_atomic_and_immutable(
             timestamp="20260823120001",
         ),
     )
+    consumed = [
+        {
+            "rollout_index": index,
+            "transport_kind": "disk_episode_v2",
+            "completion_relative_path": f"artifacts/episode_{index}.json",
+            "episode_file_sha256": f"{index + 1:064x}",
+            "episode_file_size_bytes": 100 + index,
+            "episode_manifest_sha256": f"{index + 11:064x}",
+            "tensor_sidecar": {
+                "filename": f"episode_{index}.tensors.pt",
+                "sha256": f"{index + 21:064x}",
+                "size_bytes": 200 + index,
+            },
+            "session_uuid": f"session-{index}",
+            "rollout_seed": 1000 + index,
+            "scene_id": "hq_stairs",
+            "num_steps": 14,
+            "behavior_weight_version": 0,
+            "optimizer_sample_rows": 14,
+            "optimizer_actor_valid_rows": 14,
+        }
+        for index in range(4)
+    ]
     arguments = {
         "config": config,
         "run_config": run_config,
@@ -85,7 +472,10 @@ def test_ppo_update_diagnostic_receipt_is_three_state_atomic_and_immutable(
         "received_rollouts": 4,
         "trainable_rollouts": 4,
         "sample_rows": 56,
+        "actor_sample_rows": 56,
         "behavior_weight_versions": [0, 0, 0, 0],
+        "consumed_rollout_artifacts": consumed,
+        "consumed_rollout_batch_sha256": trainer_module.canonical_json_sha256(consumed),
         "is_master_replica": True,
         "do_save_checkpoint": True,
         "pre_update_metrics": {"train/pre_update_approx_kl": 0.0},
@@ -156,6 +546,22 @@ def test_ppo_step_receipt_brackets_optimizer_scheduler_and_guard(
         trainer_module,
         "filter_trainable_rollouts",
         lambda rollouts, **_kwargs: rollouts,
+    )
+    consumed = [
+        {
+            "rollout_index": 0,
+            "optimizer_sample_rows": 1,
+            "optimizer_actor_valid_rows": 1,
+        }
+    ]
+    monkeypatch.setattr(
+        trainer_module,
+        "_consumed_rollout_artifact_records",
+        lambda *_args, **_kwargs: (
+            consumed,
+            trainer_module.canonical_json_sha256(consumed),
+            1,
+        ),
     )
 
     trainer = object.__new__(trainer_module.AlpagymPPOTrainer)
