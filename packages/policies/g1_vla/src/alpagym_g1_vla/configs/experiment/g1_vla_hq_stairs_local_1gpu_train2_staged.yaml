@@ -17,3 +17,10 @@ cosmos:
       save_freq: 5
   rollout:
     n_generation: 2
+
+alpasim:
+  humanoid:
+    # The complete 50-update experiment consumes 100 consecutive seeds from
+    # this base. Native resume restores the logical sample cursor; later
+    # process stages must keep this original value unchanged.
+    rollout_seed_base: 202608240100000

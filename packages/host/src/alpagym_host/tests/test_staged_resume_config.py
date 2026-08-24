@@ -58,6 +58,8 @@ def test_train2_staged_profile_is_independent_from_four_rollout_smoke(
     assert staged.cosmos.train.train_policy.allowed_outdated_steps == 0
     assert staged.cosmos.train.ckpt.enable_checkpoint is True
     assert staged.cosmos.train.ckpt.save_mode == "sync"
+    assert smoke.alpasim.humanoid.rollout_seed_base == 292285
+    assert staged.alpasim.humanoid.rollout_seed_base == 202608240100000
 
 
 def test_staged_resume_accepts_step_five_to_cumulative_step_ten(

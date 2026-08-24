@@ -250,7 +250,7 @@ def test_step_five_native_restore_bootstraps_step_six_and_next_seed(
     monkeypatch: pytest.MonkeyPatch,
     cosmos_stubs: None,
 ) -> None:
-    """A sealed stage-five state restores before step six uses seed 292295."""
+    """A sealed stage-five state restores before step six uses seed base plus ten."""
 
     del cosmos_stubs
     # The focused Cosmos test shim exposes the real utils package but omits this
@@ -473,7 +473,10 @@ def test_step_five_native_restore_bootstraps_step_six_and_next_seed(
     assert restore_receipt["native_restore"]["loader_completed"] is True
 
     rollout_module = importlib.import_module("alpagym_runtime.cosmos.rollout_backend")
-    assert rollout_module._effective_humanoid_rollout_seed_base(run_config) == 292_295
+    assert (
+        rollout_module._effective_humanoid_rollout_seed_base(run_config)
+        == 202608240100010
+    )
     controller_type, data_fetch_type, r2r_type = _install_fake_cosmos_modules(
         monkeypatch
     )
