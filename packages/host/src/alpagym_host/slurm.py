@@ -16,7 +16,13 @@ import urllib.request
 from pathlib import Path
 from typing import cast
 
-from alpagym_host.config import ArtifactPaths, ExecutionBackend, ExecutionConfig, SlurmConfig
+from alpagym_host.config import (
+    ALPASIM_RUNTIME_ID_ENV,
+    ArtifactPaths,
+    ExecutionBackend,
+    ExecutionConfig,
+    SlurmConfig,
+)
 from alpagym_host.run_topology import RunHostPlan
 
 
@@ -38,7 +44,7 @@ def build_wizard_srun_command(
     wizard_workdir: Path,
     log_path: Path,
 ) -> list[str]:
-    """Build an srun command for an AlpaSim Wizard process on one Slurm host."""
+    """Build an srun command exposing the host GPUs to one AlpaSim Wizard."""
     if not host.runs_alpasim or host.alpasim_gpus < 1:
         raise ValueError("Wizard host must include AlpaSim GPUs")
 
@@ -89,13 +95,18 @@ def build_cosmos_srun_command(
     cosmos_hosts: tuple[RunHostPlan, ...],
     slurm: SlurmConfig,
     container_image: str,
-    workspace_sync_command: list[str],
-    worker_commands: tuple[list[str], ...],
+    runtime_check_command: list[str],
+    worker_commands: tuple[tuple[list[str], ...], ...],
     log_dir: Path,
 ) -> list[str]:
     """Build an srun command for Cosmos tasks across Slurm hosts."""
     if len(worker_commands) != len(cosmos_hosts):
-        raise ValueError("Cosmos worker command count must match Cosmos host count")
+        raise ValueError("Cosmos host command count must match Cosmos host count")
+    for host, host_commands in zip(cosmos_hosts, worker_commands, strict=True):
+        if len(host_commands) != len(host.cosmos_workers):
+            raise ValueError(
+                "Cosmos worker command count must match the host worker plan"
+            )
 
     hostnames = tuple(host.hostname for host in cosmos_hosts)
     cosmos_gpus_per_task = cosmos_hosts[0].cosmos_gpu_count
@@ -126,7 +137,8 @@ def build_cosmos_srun_command(
             "bash",
             "-lc",
             _cosmos_launcher_script(
-                workspace_sync_command=workspace_sync_command,
+                runtime_check_command=runtime_check_command,
+                cosmos_hosts=cosmos_hosts,
                 worker_commands=worker_commands,
                 export_env=slurm.export_env,
             ),
@@ -136,8 +148,9 @@ def build_cosmos_srun_command(
 
 
 def _cosmos_launcher_script(
-    workspace_sync_command: list[str],
-    worker_commands: tuple[list[str], ...],
+    runtime_check_command: list[str],
+    cosmos_hosts: tuple[RunHostPlan, ...],
+    worker_commands: tuple[tuple[list[str], ...], ...],
     export_env: list[str] | None = None,
 ) -> str:
     """Render the per-task dispatcher for one multi-task Cosmos Slurm step.
@@ -149,14 +162,20 @@ def _cosmos_launcher_script(
     """
     lines = [
         *_container_shell_exports(export_env or []),
-        shlex.join(workspace_sync_command),
+        shlex.join(runtime_check_command),
         'case "$SLURM_PROCID" in',
     ]
-    for worker_index, worker_command in enumerate(worker_commands):
+    for host_index, (host, host_commands) in enumerate(
+        zip(cosmos_hosts, worker_commands, strict=True)
+    ):
+        host_script = _cosmos_host_worker_script(
+            host=host,
+            worker_commands=host_commands,
+        )
         lines.extend(
             [
-                f"  {worker_index})",
-                f"    exec {shlex.join(worker_command)}",
+                f"  {host_index})",
+                *[f"    {line}" for line in host_script.splitlines()],
                 "    ;;",
             ]
         )
@@ -186,6 +205,57 @@ def _container_shell_exports(export_env: list[str]) -> list[str]:
         if separator and name in {"HOME", "PATH"}:
             exports.append(f"export {name}={shlex.quote(value)}")
     return exports
+
+
+def _cosmos_host_worker_script(
+    host: RunHostPlan,
+    worker_commands: tuple[list[str], ...],
+) -> str:
+    """Render one Slurm task's GPU-scoped Cosmos worker commands."""
+    if (
+        len(host.cosmos_workers) == 1
+        and host.cosmos_workers[0].gpu_ids == host.cosmos_gpu_ids
+    ):
+        return f"exec {shlex.join(worker_commands[0])}"
+
+    command_lines: list[str] = []
+    for worker, command in zip(host.cosmos_workers, worker_commands, strict=True):
+        environment = [
+            f"CUDA_VISIBLE_DEVICES={','.join(map(str, worker.gpu_ids))}",
+        ]
+        if worker.alpasim_runtime_id is not None:
+            environment.append(f"{ALPASIM_RUNTIME_ID_ENV}={worker.alpasim_runtime_id}")
+        command_lines.append(shlex.join(["env", *environment, *command]))
+
+    if len(command_lines) == 1:
+        return f"exec {command_lines[0]}"
+
+    lines = [
+        "pids=()",
+        'cleanup() { kill "${pids[@]}" 2>/dev/null || true; }',
+        "trap cleanup EXIT TERM INT",
+    ]
+    for command_line in command_lines:
+        lines.extend([f"{command_line} &", 'pids+=("$!")'])
+    lines.extend(
+        [
+            'remaining="${#pids[@]}"',
+            "status=0",
+            "while (( remaining > 0 )); do",
+            "  if wait -n; then",
+            "    ((remaining-=1))",
+            "  else",
+            '    status="$?"',
+            "    cleanup",
+            '    wait "${pids[@]}" 2>/dev/null || true',
+            "    break",
+            "  fi",
+            "done",
+            "trap - EXIT TERM INT",
+            'exit "$status"',
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _gpu_mask(gpu_ids: tuple[int, ...]) -> str:
@@ -222,7 +292,9 @@ def _validate_slurm_container_settings(slurm: SlurmConfig, backend_name: str) ->
         if value is None or value == ""
     ]
     if missing_settings:
-        raise ValueError(f"{', '.join(missing_settings)} must be set for {backend_name}")
+        raise ValueError(
+            f"{', '.join(missing_settings)} must be set for {backend_name}"
+        )
     if slurm.cpus_per_task is not None and slurm.cpus_per_task <= 0:
         raise ValueError("execution.slurm.cpus_per_task must be positive when set")
 
@@ -240,7 +312,9 @@ def _validate_slurm_container_settings(slurm: SlurmConfig, backend_name: str) ->
     try:
         uv_cache_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        raise ValueError(f"execution.slurm.uv_cache_dir must be creatable: {uv_cache_dir}") from exc
+        raise ValueError(
+            f"execution.slurm.uv_cache_dir must be creatable: {uv_cache_dir}"
+        ) from exc
     _validate_writable_directory(uv_cache_dir, "execution.slurm.uv_cache_dir")
     validate_docker_container(
         container_image=cast(str, slurm.container_image),
@@ -372,18 +446,24 @@ def _resolve_container_digest(container_image: str) -> str:
     # endpoint to authenticate against.
     challenge = ""
     try:
-        with urllib.request.urlopen(urllib.request.Request(f"https://{registry}/v2/"), timeout=30):
+        with urllib.request.urlopen(
+            urllib.request.Request(f"https://{registry}/v2/"), timeout=30
+        ):
             pass
     except urllib.error.HTTPError as exc:
         challenge = exc.headers.get("WWW-Authenticate", "") or ""
     realm = re.search(r'realm="([^"]+)"', challenge)
     service = re.search(r'service="([^"]+)"', challenge)
     if realm is None or service is None:
-        raise ValueError(f"{registry} did not issue a Bearer token challenge: {challenge!r}")
+        raise ValueError(
+            f"{registry} did not issue a Bearer token challenge: {challenge!r}"
+        )
 
     basic = base64.b64encode(f"{login}:{password}".encode()).decode()
     token_url = f"{realm.group(1)}?service={service.group(1)}&scope=repository:{repository}:pull"
-    token_request = urllib.request.Request(token_url, headers={"Authorization": f"Basic {basic}"})
+    token_request = urllib.request.Request(
+        token_url, headers={"Authorization": f"Basic {basic}"}
+    )
     with urllib.request.urlopen(token_request, timeout=30) as response:
         token_response = json.load(response)
     token = token_response.get("token") or token_response.get("access_token")
@@ -429,8 +509,16 @@ def _split_registry_repository_tag(container_image: str) -> tuple[str, str, str]
     if "@" in registry:
         registry = registry.rsplit("@", maxsplit=1)[1]
     repository, tag_separator, tag = remainder.rpartition(":")
-    if not registry or not host_separator or not repository or not tag_separator or "/" in tag:
-        raise ValueError(f"Docker image reference must be registry/repo:tag: {container_image}")
+    if (
+        not registry
+        or not host_separator
+        or not repository
+        or not tag_separator
+        or "/" in tag
+    ):
+        raise ValueError(
+            f"Docker image reference must be registry/repo:tag: {container_image}"
+        )
     return registry, repository, tag
 
 
@@ -486,14 +574,18 @@ def _enroot_registry_credentials(registry: str) -> tuple[str, str]:
         )
     credentials_path = Path(enroot_config_path) / ".credentials"
     if not credentials_path.is_file():
-        raise ValueError(f"{credentials_path} must exist before importing Docker images")
+        raise ValueError(
+            f"{credentials_path} must exist before importing Docker images"
+        )
     credentials = credentials_path.read_text(encoding="utf-8")
     match = re.search(
         rf"(?:^|\s)machine\s+{re.escape(registry)}\s+login\s+(\S+)\s+password\s+(\S+)",
         credentials,
     )
     if match is None:
-        raise ValueError(f"{credentials_path} must contain a machine entry for {registry}")
+        raise ValueError(
+            f"{credentials_path} must contain a machine entry for {registry}"
+        )
     return match.group(1), match.group(2)
 
 
@@ -592,5 +684,7 @@ def submit_slurm_job(
     )
     match = re.search(r"Submitted batch job (\S+)", result.stdout)
     if match is None:
-        raise RuntimeError(f"Could not parse sbatch job id from stdout: {result.stdout!r}")
+        raise RuntimeError(
+            f"Could not parse sbatch job id from stdout: {result.stdout!r}"
+        )
     return match.group(1)

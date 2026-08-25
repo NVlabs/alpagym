@@ -5,6 +5,7 @@
 """Cosmos-RL rollout backend driving AlpaSim simulator sessions."""
 
 import atexit
+import asyncio
 import logging
 import os
 import socket
@@ -18,7 +19,12 @@ import yaml
 from alpagym_runtime.alpasim.grpc_import import ensure_alpasim_grpc_source
 
 ensure_alpasim_grpc_source()
-from alpagym_host.config import ExecutionBackend, RunConfig, load_run_config
+from alpagym_host.config import (
+    ALPASIM_RUNTIME_ID_ENV,
+    ExecutionBackend,
+    RunConfig,
+    load_run_config,
+)
 from alpagym_host.endpoint_registry import (
     FileTopologyRegistry,
     TopologyEndpoint,
@@ -31,6 +37,7 @@ from cosmos_rl.rollout.schema import RolloutResult
 
 from alpagym_runtime.alpasim.driver_server import EgodriverServer
 from alpagym_runtime.alpasim.humanoid_policy_server import HumanoidPolicyServer
+from alpagym_runtime.cosmos.dataset import repeat_scene_ids
 from alpagym_runtime.episode_runner.streaming_worker import StreamingRolloutWorker
 from alpagym_runtime.inference.inference_engine import InferenceEngine
 from alpagym_runtime.perf.instrument.lifecycle import initialize_perf
@@ -129,7 +136,12 @@ class AlpagymRollout(RolloutBase):
                 encoding="utf-8"
             )
         )
-        scene_ids = tuple(str(scene_id) for scene_id in scene_id_data["scene_ids"])
+        scene_ids = tuple(
+            repeat_scene_ids(
+                [str(scene_id) for scene_id in scene_id_data["scene_ids"]],
+                self._run_config.dataset.scene_repetitions,
+            )
+        )
 
         logger.info(
             "[alpagym] Initializing rollout inference wrapper: colocated_model=%s",
@@ -157,7 +169,8 @@ class AlpagymRollout(RolloutBase):
             )
         alpasim_runtime_endpoint: TopologyEndpoint = (
             self._topology_registry.acquire_alpasim_runtime(
-                driver_id=policy_endpoint_id
+                driver_id=policy_endpoint_id,
+                preferred_runtime_id=os.environ.get(ALPASIM_RUNTIME_ID_ENV),
             )
         )
         logger.info(
@@ -323,12 +336,6 @@ class AlpagymRollout(RolloutBase):
         for payload in payloads:
             self._worker.submit_payload(payload)
 
-    @measure_perf(
-        "rollout/generate",
-        category="orchestration",
-        cpu_snapshot=True,
-        gpu_snapshot=True,
-    )
     def rollout_generation(
         self,
         payloads: list[RLPayload],
@@ -337,7 +344,7 @@ class AlpagymRollout(RolloutBase):
         data_fetcher: Any = None,
         is_validation: bool = False,
         current_weight_version: int | None = None,
-    ) -> list[RolloutResult]:
+    ) -> Any:
         """Run AlpaSim sessions and return Cosmos-RL rollout results.
 
         The batch only exists at this boundary: each payload is submitted
@@ -346,14 +353,69 @@ class AlpagymRollout(RolloutBase):
         the in-memory ``EpisodeOutput``s; the reward dispatcher reads
         ``reward.total`` off them and the packer's ``get_rollout_output``
         egresses them to the transport later. No write or handle happens here.
+
+        Cosmos calls this method synchronously in its regular rollout path and
+        awaits it from the async scheduler. The async scheduler handles one
+        payload at a time and records the model version on that payload.
         """
-        # `current_weight_version` is forwarded by Cosmos-RL's
-        # `_call_rollout_generation` so async weight sync can tag in-flight
-        # rollouts. `data_packer` is the egress
-        # path used later in `get_rollout_output`, not here. Declaring and
-        # deleting the unused kwargs is preferred over a `**kwargs` shim so a
-        # new Cosmos kwarg surfaces as a loud TypeError instead of being
-        # silently absorbed.
+        if self.config.rollout.mode == "async":
+            if len(payloads) != 1:
+                raise ValueError("async rollout_generation requires one payload")
+            return self._rollout_generation_async(
+                payloads=payloads,
+                stream=stream,
+                data_packer=data_packer,
+                data_fetcher=data_fetcher,
+                is_validation=is_validation,
+                current_weight_version=int(payloads[0].weight_version),
+            )
+        return self._rollout_generation_sync(
+            payloads=payloads,
+            stream=stream,
+            data_packer=data_packer,
+            data_fetcher=data_fetcher,
+            is_validation=is_validation,
+            current_weight_version=current_weight_version,
+        )
+
+    async def _rollout_generation_async(
+        self,
+        payloads: list[RLPayload],
+        stream: Any,
+        data_packer: Any,
+        data_fetcher: Any,
+        is_validation: bool,
+        current_weight_version: int,
+    ) -> list[RolloutResult]:
+        """Run blocking simulator work without blocking Cosmos's async scheduler."""
+        return await asyncio.to_thread(
+            self._rollout_generation_sync,
+            payloads=payloads,
+            stream=stream,
+            data_packer=data_packer,
+            data_fetcher=data_fetcher,
+            is_validation=is_validation,
+            current_weight_version=current_weight_version,
+        )
+
+    @measure_perf(
+        "rollout/generate",
+        category="orchestration",
+        cpu_snapshot=True,
+        gpu_snapshot=True,
+    )
+    def _rollout_generation_sync(
+        self,
+        payloads: list[RLPayload],
+        stream: Any,
+        data_packer: Any,
+        data_fetcher: Any,
+        is_validation: bool,
+        current_weight_version: int | None,
+    ) -> list[RolloutResult]:
+        """Submit simulator sessions and wait for their episode outputs."""
+        # `data_packer` is the egress path used later in
+        # `get_rollout_output`, not here.
         del stream, data_fetcher, data_packer
         if self._worker is None:
             raise RuntimeError("rollout_generation called before init_engine")

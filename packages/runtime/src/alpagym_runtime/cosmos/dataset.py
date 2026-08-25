@@ -4,6 +4,11 @@
 from torch.utils.data import Dataset
 
 
+def repeat_scene_ids(scene_ids: list[str], repetitions: int) -> list[str]:
+    """Repeat each runtime scene as an independent Cosmos prompt work item."""
+    return [scene_id for scene_id in scene_ids for _ in range(repetitions)]
+
+
 class AlpagymSceneDataset(Dataset):
     """Dataset exposing scene IDs as Cosmos prompt work items."""
 

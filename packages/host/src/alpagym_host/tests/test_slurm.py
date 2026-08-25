@@ -18,7 +18,7 @@ from alpagym_host.config import (
     SeparateNodesSlurmTopologyConfig,
     SlurmConfig,
 )
-from alpagym_host.run_topology import RunHostPlan
+from alpagym_host.run_topology import CosmosWorkerPlan, RunHostPlan
 from alpagym_host.slurm import (
     _resolve_container_digest,
     _split_registry_repository_tag,
@@ -41,7 +41,9 @@ def test_prepare_container_image_imports_missing_docker_uri(
     enroot_config_path.mkdir()
     container_image = "registry.example.com/team/alpagym:abc123"
     image_digest = f"sha256:{'a' * 64}"
-    expected_image = cache_root / f"registry.example.com_team_alpagym_sha256_{'a' * 64}.sqsh"
+    expected_image = (
+        cache_root / f"registry.example.com_team_alpagym_sha256_{'a' * 64}.sqsh"
+    )
     (enroot_config_path / ".credentials").write_text(
         "machine registry.example.com login user password token\n",
         encoding="utf-8",
@@ -54,7 +56,9 @@ def test_prepare_container_image_imports_missing_docker_uri(
     )
     monkeypatch.setenv("ENROOT_CONFIG_PATH", str(enroot_config_path))
     monkeypatch.setenv("ENROOT_TEMP_PATH", str(tmp_path / "enroot-temp"))
-    monkeypatch.setattr("alpagym_host.slurm._resolve_container_digest", lambda image: image_digest)
+    monkeypatch.setattr(
+        "alpagym_host.slurm._resolve_container_digest", lambda image: image_digest
+    )
 
     import_calls: list[dict[str, Any]] = []
 
@@ -84,7 +88,9 @@ def test_prepare_container_image_imports_missing_docker_uri(
     # Import uses the tag URI; the resolved digest only names the cache file (enroot has
     # no digest-pinned import URI).
     assert import_command[4] == "docker://registry.example.com#team/alpagym:abc123"
-    assert import_calls[0]["kwargs"]["env"]["ENROOT_CONFIG_PATH"] == str(enroot_config_path)
+    assert import_calls[0]["kwargs"]["env"]["ENROOT_CONFIG_PATH"] == str(
+        enroot_config_path
+    )
 
 
 def test_prepare_container_image_refreshes_moving_tag_when_digest_changes(
@@ -99,7 +105,9 @@ def test_prepare_container_image_refreshes_moving_tag_when_digest_changes(
     container_image = "registry.example.com/team/alpagym:latest"
     image_digest = f"sha256:{'b' * 64}"
     stale_tag_cache = cache_root / "registry.example.com_team_alpagym_latest.sqsh"
-    expected_image = cache_root / f"registry.example.com_team_alpagym_sha256_{'b' * 64}.sqsh"
+    expected_image = (
+        cache_root / f"registry.example.com_team_alpagym_sha256_{'b' * 64}.sqsh"
+    )
     stale_tag_cache.write_text("old latest", encoding="utf-8")
     (enroot_config_path / ".credentials").write_text(
         "machine registry.example.com login user password token\n",
@@ -107,7 +115,9 @@ def test_prepare_container_image_refreshes_moving_tag_when_digest_changes(
     )
     monkeypatch.setenv("ENROOT_CONFIG_PATH", str(enroot_config_path))
     monkeypatch.setenv("ENROOT_TEMP_PATH", str(tmp_path / "enroot-temp"))
-    monkeypatch.setattr("alpagym_host.slurm._resolve_container_digest", lambda image: image_digest)
+    monkeypatch.setattr(
+        "alpagym_host.slurm._resolve_container_digest", lambda image: image_digest
+    )
 
     import_commands: list[list[str]] = []
 
@@ -115,7 +125,9 @@ def test_prepare_container_image_refreshes_moving_tag_when_digest_changes(
         del kwargs
         command = args[0]
         import_commands.append(command)
-        Path(command[command.index("--output") + 1]).write_text("new latest", encoding="utf-8")
+        Path(command[command.index("--output") + 1]).write_text(
+            "new latest", encoding="utf-8"
+        )
         return CompletedProcess(args=command, returncode=0)
 
     monkeypatch.setattr("alpagym_host.slurm.subprocess.run", fake_subprocess_run)
@@ -142,14 +154,18 @@ def test_prepare_container_image_reuses_digest_cache_without_import(
     enroot_config_path.mkdir()
     container_image = "registry.example.com/team/alpagym:latest"
     image_digest = f"sha256:{'c' * 64}"
-    expected_image = cache_root / f"registry.example.com_team_alpagym_sha256_{'c' * 64}.sqsh"
+    expected_image = (
+        cache_root / f"registry.example.com_team_alpagym_sha256_{'c' * 64}.sqsh"
+    )
     expected_image.write_text("cached latest", encoding="utf-8")
     (enroot_config_path / ".credentials").write_text(
         "machine registry.example.com login user password token\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("ENROOT_CONFIG_PATH", str(enroot_config_path))
-    monkeypatch.setattr("alpagym_host.slurm._resolve_container_digest", lambda image: image_digest)
+    monkeypatch.setattr(
+        "alpagym_host.slurm._resolve_container_digest", lambda image: image_digest
+    )
 
     def fail_on_subprocess(*args, **kwargs):
         del kwargs
@@ -200,7 +216,9 @@ def test_split_registry_repository_tag_requires_tag() -> None:
 def test_split_registry_repository_tag_rejects_digest_pinned_ref() -> None:
     """Digest-pinned refs are rejected instead of mixing pin and moving-tag semantics."""
     with pytest.raises(ValueError, match="tag-based"):
-        _split_registry_repository_tag(f"registry.example.com/team/alpagym@sha256:{'a' * 64}")
+        _split_registry_repository_tag(
+            f"registry.example.com/team/alpagym@sha256:{'a' * 64}"
+        )
 
 
 def test_validate_docker_container_checks_scheme_registry_and_tag(
@@ -282,7 +300,10 @@ def test_resolve_container_digest_uses_timeouts_and_access_token(
 
     monkeypatch.setattr("alpagym_host.slurm.urllib.request.urlopen", fake_urlopen)
 
-    assert _resolve_container_digest("registry.example.com/team/alpagym:latest") == image_digest
+    assert (
+        _resolve_container_digest("registry.example.com/team/alpagym:latest")
+        == image_digest
+    )
     assert calls == [
         ("https://registry.example.com/v2/", 30),
         (
@@ -312,14 +333,18 @@ def test_concurrent_container_image_import_never_serves_partial(
     enroot_config_path.mkdir()
     container_image = "registry.example.com/team/alpagym:abc123"
     image_digest = f"sha256:{'d' * 64}"
-    expected_image = cache_root / f"registry.example.com_team_alpagym_sha256_{'d' * 64}.sqsh"
+    expected_image = (
+        cache_root / f"registry.example.com_team_alpagym_sha256_{'d' * 64}.sqsh"
+    )
     (enroot_config_path / ".credentials").write_text(
         "machine registry.example.com login user password token\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("ENROOT_CONFIG_PATH", str(enroot_config_path))
     monkeypatch.setenv("ENROOT_TEMP_PATH", str(tmp_path / "enroot-temp"))
-    monkeypatch.setattr("alpagym_host.slurm._resolve_container_digest", lambda image: image_digest)
+    monkeypatch.setattr(
+        "alpagym_host.slurm._resolve_container_digest", lambda image: image_digest
+    )
 
     barrier = threading.Barrier(workers)
     real_replace = os.replace
@@ -334,7 +359,9 @@ def test_concurrent_container_image_import_never_serves_partial(
             index = counter["n"]
             counter["n"] += 1
         output = Path(command[command.index("--output") + 1])
-        output.write_text(f"SQSHFS-COMPLETE-{index}", encoding="utf-8")  # a complete image
+        output.write_text(
+            f"SQSHFS-COMPLETE-{index}", encoding="utf-8"
+        )  # a complete image
         with lock:
             output_targets.append(output)
         return CompletedProcess(args=command, returncode=0)
@@ -354,14 +381,18 @@ def test_concurrent_container_image_import_never_serves_partial(
         )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = [future.result() for future in [pool.submit(prepare) for _ in range(workers)]]
+        results = [
+            future.result() for future in [pool.submit(prepare) for _ in range(workers)]
+        ]
 
     assert all(result == str(expected_image) for result in results)
     assert expected_image.read_text(encoding="utf-8") in {
         f"SQSHFS-COMPLETE-{i}" for i in range(workers)
     }  # one writer's full image, never a truncated or interleaved one
     # every import wrote to a private temp file, never the published cache path directly
-    assert all(t != expected_image and t.parent.parent == cache_root for t in output_targets)
+    assert all(
+        t != expected_image and t.parent.parent == cache_root for t in output_targets
+    )
     assert [p for p in cache_root.iterdir() if p.name.startswith(".import-")] == []
 
 
@@ -471,7 +502,10 @@ def test_render_submit_script_accepts_multi_node_slurm_config(tmp_path: Path) ->
 
     assert "#SBATCH --nodes=3" in script
     assert "command=run" in script
-    assert "execution.resolved_config_path=" + str(artifact_paths.resolved_config_path) in script
+    assert (
+        "execution.resolved_config_path=" + str(artifact_paths.resolved_config_path)
+        in script
+    )
     # The compute-node re-entry must reselect both mandatory Hydra groups.
     assert "deploy=cluster" in script
     assert "topology=slurm_distributed_1_2_2" in script
@@ -490,6 +524,7 @@ def test_cosmos_srun_command_disables_cpu_binding_for_nonexclusive_steps(
                 runs_alpasim=False,
                 cosmos_gpus=2,
                 alpasim_gpus=0,
+                cosmos_workers=(CosmosWorkerPlan((0, 1), 0),),
             ),
         ),
         slurm=_slurm_config(
@@ -499,8 +534,8 @@ def test_cosmos_srun_command_disables_cpu_binding_for_nonexclusive_steps(
             exclusive=False,
         ),
         container_image="/containers/alpagym.sqsh",
-        workspace_sync_command=["true"],
-        worker_commands=(["python", "-m", "cosmos_rl.launcher.launch_all"],),
+        runtime_check_command=["true"],
+        worker_commands=((["python", "-m", "cosmos_rl.launcher.launch_all"],),),
         log_dir=tmp_path / "logs",
     )
 
@@ -521,6 +556,7 @@ def test_cosmos_srun_command_keeps_default_cpu_binding_for_exclusive_steps(
                 runs_alpasim=False,
                 cosmos_gpus=8,
                 alpasim_gpus=0,
+                cosmos_workers=(CosmosWorkerPlan(tuple(range(8)), 0),),
             ),
         ),
         slurm=_slurm_config(
@@ -530,8 +566,8 @@ def test_cosmos_srun_command_keeps_default_cpu_binding_for_exclusive_steps(
             exclusive=True,
         ),
         container_image="/containers/alpagym.sqsh",
-        workspace_sync_command=["true"],
-        worker_commands=(["python", "-m", "cosmos_rl.launcher.launch_all"],),
+        runtime_check_command=["true"],
+        worker_commands=((["python", "-m", "cosmos_rl.launcher.launch_all"],),),
         log_dir=tmp_path / "logs",
     )
 
@@ -556,12 +592,13 @@ def test_slurm_mem_is_requested_for_batch_and_container_step(tmp_path: Path) -> 
                 runs_alpasim=False,
                 cosmos_gpus=8,
                 alpasim_gpus=0,
+                cosmos_workers=(CosmosWorkerPlan(tuple(range(8)), 0),),
             ),
         ),
         slurm=slurm,
         container_image="/containers/alpagym.sqsh",
-        workspace_sync_command=["true"],
-        worker_commands=(["python", "-m", "cosmos_rl.launcher.launch_all"],),
+        runtime_check_command=["true"],
+        worker_commands=((["python", "-m", "cosmos_rl.launcher.launch_all"],),),
         log_dir=tmp_path / "logs",
     )
     script = render_submit_script(
@@ -603,7 +640,9 @@ def test_submit_slurm_job_writes_script_and_calls_sbatch(
     execution = ExecutionConfig(
         backend=ExecutionBackend.slurm,
         resolved_config_path=None,
-        slurm=_slurm_config(partition="batch", account="research", container_image="/c.sqsh"),
+        slurm=_slurm_config(
+            partition="batch", account="research", container_image="/c.sqsh"
+        ),
     )
 
     job_id = submit_slurm_job(
@@ -626,7 +665,10 @@ def test_submit_slurm_job_writes_script_and_calls_sbatch(
     assert "set -euo pipefail" in script
     assert "export UV_CACHE_DIR=/tmp/alpagym-uv-cache" in script
     assert "cd /repo/projects/alpagym" in script
-    assert "execution.resolved_config_path=" + str(artifact_paths.resolved_config_path) in script
+    assert (
+        "execution.resolved_config_path=" + str(artifact_paths.resolved_config_path)
+        in script
+    )
     assert "command=run" in script
     # Carry the deploy and topology choices so the compute-node re-entry
     # satisfies both mandatory Hydra groups when it composes default.yaml.
@@ -692,7 +734,9 @@ def _slurm_config(
     container_mounts: list[str] | None = None,
     export_env: list[str] | None = None,
     nodes: int = 1,
-    topology: AllInOneSlurmTopologyConfig | SeparateNodesSlurmTopologyConfig | None = None,
+    topology: AllInOneSlurmTopologyConfig
+    | SeparateNodesSlurmTopologyConfig
+    | None = None,
     mem: str | None = None,
 ) -> SlurmConfig:
     """Build a Slurm config for tests."""
@@ -713,7 +757,9 @@ def _slurm_config(
         container_mounts=container_mounts
         if container_mounts is not None
         else [f"{uv_cache_dir}:{uv_cache_dir}"],
-        export_env=export_env if export_env is not None else [f"UV_CACHE_DIR={uv_cache_dir}"],
+        export_env=export_env
+        if export_env is not None
+        else [f"UV_CACHE_DIR={uv_cache_dir}"],
         mem=mem,
     )
 

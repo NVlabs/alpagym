@@ -1,0 +1,14 @@
+# @package _global_
+
+defaults:
+  - /topology/shared/slurm_trainer_and_rollout_cells
+  - _self_
+
+execution:
+  slurm:
+    nodes: 1
+
+cosmos:
+  launch:
+    policy_replicas: 2
+    rollout_replicas: 6

@@ -9,11 +9,17 @@ import pytest
 from alpagym_host.endpoint_registry import FileTopologyRegistry, TopologyEndpoint
 
 
-def test_file_topology_registry_lists_and_assigns_runtime_endpoints(tmp_path: Path) -> None:
+def test_file_topology_registry_lists_and_assigns_runtime_endpoints(
+    tmp_path: Path,
+) -> None:
     """Registry returns all runtimes and balances driver assignments."""
     registry = FileTopologyRegistry(tmp_path / "topology")
-    registry.publish_alpasim_runtime(TopologyEndpoint("alpasim-runtime-0", "node-a", 30051, 100))
-    registry.publish_alpasim_runtime(TopologyEndpoint("alpasim-runtime-1", "node-b", 30051, 1))
+    registry.publish_alpasim_runtime(
+        TopologyEndpoint("alpasim-runtime-0", "node-a", 30051, 100)
+    )
+    registry.publish_alpasim_runtime(
+        TopologyEndpoint("alpasim-runtime-1", "node-b", 30051, 1)
+    )
 
     endpoints = registry.list_alpasim_runtimes()
 
@@ -25,6 +31,26 @@ def test_file_topology_registry_lists_and_assigns_runtime_endpoints(tmp_path: Pa
     assert registry.acquire_alpasim_runtime(driver_id="driver-b").host == "node-b"
     assert registry.acquire_alpasim_runtime(driver_id="driver-c").host == "node-a"
     assert registry.acquire_alpasim_runtime(driver_id="driver-a").host == "node-a"
+
+
+def test_file_topology_registry_honors_gpu_local_runtime_affinity(
+    tmp_path: Path,
+) -> None:
+    """A rollout cell is assigned to its explicitly pinned AlpaSim runtime."""
+    registry = FileTopologyRegistry(tmp_path / "topology")
+    registry.publish_alpasim_runtime(
+        TopologyEndpoint("alpasim-runtime-0", "node", 6000, 1)
+    )
+    registry.publish_alpasim_runtime(
+        TopologyEndpoint("alpasim-runtime-1", "node", 6100, 1)
+    )
+
+    endpoint = registry.acquire_alpasim_runtime(
+        driver_id="rollout-cell-1",
+        preferred_runtime_id="alpasim-runtime-1",
+    )
+
+    assert endpoint.id == "alpasim-runtime-1"
 
 
 def test_nccl_master_round_trips(tmp_path: Path) -> None:

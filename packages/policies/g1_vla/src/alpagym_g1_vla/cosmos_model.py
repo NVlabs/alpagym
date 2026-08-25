@@ -20,6 +20,7 @@ from typing import Any, Callable, Mapping, Protocol, cast
 
 import torch
 import torch.nn as nn
+from accelerate import init_on_device
 from cosmos_rl.policy.model.base import BaseModel, IdentityWeightMapper, ModelRegistry
 from cosmos_rl.utils.model_config import register_local_model_config
 from cosmos_rl.utils.util import cosmos_default_dtype
@@ -441,10 +442,15 @@ class VlaPsiPPOModel(BaseModel):
         phases separate matches the native Cosmos model contract.
         """
         del cosmos_config
+        # Flow-PPO compares rollout and learner densities exactly. Keep BF16
+        # GEMM accumulation identical across Cosmos trainer and rollout processes.
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
         self._restore_qwen3_vl_rotary_buffers()
         if not self._critic_initialized:
-            self.actor_critic.critic.prefix_projection.reset_parameters()
-            self.actor_critic.critic.value_head._init_weights("relu")
+            with torch.random.fork_rng():
+                torch.manual_seed(0)
+                self.actor_critic.critic.prefix_projection.reset_parameters()
+                self.actor_critic.critic.value_head._init_weights("relu")
             self._critic_initialized = True
         self.actor_critic.critic.float()
         psi_runtime = cast(_PsiRuntimeProtocol, self.actor_critic.psi_model)
@@ -592,8 +598,9 @@ def load_vla_rollout_model(
     Args:
         model_root: Exact pinned VLA model directory under ``models/``.
         device: CUDA device that owns the complete model.
-        dtype: Required backbone/action construction dtype. V1 accepts bf16;
-            its numerical-stability critic remains float32.
+        dtype: Required forward-compute dtype. V1 accepts bf16. Parameters are
+            stored in float32 to match Cosmos's master weights and are cast by
+            the policy's bf16 autocast context during inference.
 
     Returns:
         A fully materialized, strict-loaded evaluation wrapper.
@@ -607,7 +614,9 @@ def load_vla_rollout_model(
 
     register_vla_psi_ppo_model()
     config = _config_from_attested_model_root(str(model_root))
-    with torch.device("meta"), cosmos_default_dtype(dtype):
+    with init_on_device("meta", include_buffers=False), cosmos_default_dtype(
+        torch.float32
+    ):
         model = VlaPsiPPOModel(config)
     model._apply(
         lambda tensor: (

@@ -5,8 +5,14 @@ from alpagym_host.config import (
     AllInOneSlurmTopologyConfig,
     ExecutionBackend,
     SeparateNodesSlurmTopologyConfig,
+    TrainerAndRolloutCellsSlurmTopologyConfig,
 )
-from alpagym_host.run_topology import RunHostPlan, build_local_topology, build_slurm_topology
+from alpagym_host.run_topology import (
+    CosmosWorkerPlan,
+    RunHostPlan,
+    build_local_topology,
+    build_slurm_topology,
+)
 
 
 def test_build_local_topology_creates_one_logical_host() -> None:
@@ -35,6 +41,8 @@ def test_build_slurm_topology_splits_one_node_between_cosmos_and_alpasim() -> No
         hostnames=["single-0"],
         gpus_per_node=8,
         topology=AllInOneSlurmTopologyConfig(alpasim_gpus=4),
+        policy_replicas=1,
+        rollout_replicas=3,
     )
 
     assert topology.cosmos_hosts == ("single-0",)
@@ -51,6 +59,8 @@ def test_build_slurm_topology_separates_cosmos_and_alpasim_nodes() -> None:
         hostnames=["cosmos-0", "cosmos-1", "alpasim-0"],
         gpus_per_node=8,
         topology=SeparateNodesSlurmTopologyConfig(cosmos_nodes=2, alpasim_nodes=1),
+        policy_replicas=1,
+        rollout_replicas=2,
     )
 
     assert topology.cosmos_hosts == ("cosmos-0", "cosmos-1")
@@ -61,3 +71,31 @@ def test_build_slurm_topology_separates_cosmos_and_alpasim_nodes() -> None:
     assert topology.hosts[1].alpasim_gpu_ids == ()
     assert topology.hosts[2].cosmos_gpu_ids == ()
     assert topology.hosts[2].alpasim_gpu_ids == (0, 1, 2, 3, 4, 5, 6, 7)
+
+
+def test_build_slurm_topology_creates_gpu_local_rollout_cells() -> None:
+    """Each rollout worker shares one physical GPU with its pinned AlpaSim runtime."""
+    topology = build_slurm_topology(
+        backend=ExecutionBackend.slurm,
+        hostnames=["cell-0"],
+        gpus_per_node=8,
+        topology=TrainerAndRolloutCellsSlurmTopologyConfig(),
+        policy_replicas=2,
+        rollout_replicas=6,
+    )
+
+    assert topology.cosmos_host_plans[0].cosmos_workers == (
+        CosmosWorkerPlan(gpu_ids=(0,), global_worker_index=0),
+        CosmosWorkerPlan(gpu_ids=(1,), global_worker_index=1),
+        *(
+            CosmosWorkerPlan(
+                gpu_ids=(gpu_id,),
+                global_worker_index=gpu_id,
+                alpasim_runtime_id=f"alpasim-runtime-{gpu_id - 2}",
+            )
+            for gpu_id in range(2, 8)
+        ),
+    )
+    assert [host.alpasim_gpu_ids for host in topology.alpasim_host_plans] == [
+        (gpu_id,) for gpu_id in range(2, 8)
+    ]

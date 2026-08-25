@@ -383,6 +383,28 @@ def test_post_to_empty_restores_nonpersistent_qwen_rotary_buffers(
     assert text_rotary.original_inv_freq is text_rotary.inv_freq
 
 
+def test_post_to_empty_aligns_bf16_accumulation_across_replay_processes(
+    tiny_source: tuple[Path, VlaSourceBundle, dict[str, torch.Tensor]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rollout and learner use one BF16 GEMM accumulation contract."""
+    root, bundle, _expected = tiny_source
+    model = _build_materialized(root)
+    monkeypatch.setattr(
+        torch.backends.cuda.matmul,
+        "allow_bf16_reduced_precision_reduction",
+        True,
+    )
+
+    model.post_to_empty_hook(
+        SimpleNamespace(
+            policy=SimpleNamespace(model_name_or_path=str(bundle.model_root)),
+        )
+    )
+
+    assert not torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+
+
 def test_optimizer_parts_exactly_partition_trainable_parameters(
     tiny_source: tuple[Path, VlaSourceBundle, dict[str, torch.Tensor]],
 ) -> None:
@@ -413,6 +435,31 @@ def test_optimizer_parts_exactly_partition_trainable_parameters(
         == trainable_parameter_ids
     )
     assert not model.actor_critic.psi_model.action_header.fixed_encoding.requires_grad
+
+
+def test_critic_initialization_is_independent_of_process_rng(
+    tiny_source: tuple[Path, VlaSourceBundle, dict[str, torch.Tensor]],
+) -> None:
+    """Disaggregated policy and rollout processes start from identical critics."""
+    root, bundle, _expected = tiny_source
+    critics: list[dict[str, torch.Tensor]] = []
+    for seed in (11, 29):
+        torch.manual_seed(seed)
+        model = _build_materialized(root)
+        model.post_to_empty_hook(
+            SimpleNamespace(
+                policy=SimpleNamespace(model_name_or_path=str(bundle.model_root)),
+            )
+        )
+        critics.append(
+            {
+                name: tensor.detach().clone()
+                for name, tensor in model.actor_critic.critic.state_dict().items()
+            }
+        )
+
+    assert critics[0].keys() == critics[1].keys()
+    assert all(torch.equal(critics[0][name], critics[1][name]) for name in critics[0])
 
 
 def test_checkpoint_key_mismatch_fails_closed(
@@ -510,6 +557,72 @@ def test_rollout_loader_rejects_unattested_runtime_shape(tmp_path: Path) -> None
         cosmos_model.load_vla_rollout_model(
             tmp_path, torch.device("cpu"), torch.bfloat16
         )
+
+
+def test_rollout_loader_matches_trainer_float32_master_dtype(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rollout must not quantize weights before Cosmos weight synchronization."""
+    observed: dict[str, object] = {}
+
+    class _FakeModel:
+        def __init__(self, config: object) -> None:
+            observed["config"] = config
+            observed["construction_dtype"] = torch.get_default_dtype()
+
+        def _apply(self, function: object) -> _FakeModel:
+            observed["apply"] = function
+            return self
+
+        def post_to_empty_hook(self, config: object) -> None:
+            observed["post_config"] = config
+
+        def load_hf_weights(
+            self, path: str, parallel_dims: object, device: torch.device
+        ) -> None:
+            observed["load"] = (path, parallel_dims, device)
+
+        def eval(self) -> _FakeModel:
+            observed["eval"] = True
+            return self
+
+    marker = object()
+    monkeypatch.setattr(cosmos_model, "register_vla_psi_ppo_model", lambda: None)
+    monkeypatch.setattr(
+        cosmos_model, "_config_from_attested_model_root", lambda _: marker
+    )
+    monkeypatch.setattr(cosmos_model, "VlaPsiPPOModel", _FakeModel)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    result = cosmos_model.load_vla_rollout_model(
+        tmp_path, torch.device("cuda:0"), torch.bfloat16
+    )
+
+    assert isinstance(result, _FakeModel)
+    assert observed["config"] is marker
+    assert observed["construction_dtype"] is torch.float32
+    assert observed["eval"] is True
+
+
+def test_rollout_meta_context_preserves_nonpersistent_buffers() -> None:
+    """Rollout construction retains rotary buffers excluded from checkpoints."""
+
+    class _TinyRotary(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.register_buffer(
+                "inv_freq",
+                torch.tensor([1.0, 0.5], dtype=torch.float32),
+                persistent=False,
+            )
+
+    with cosmos_model.init_on_device("meta", include_buffers=False):
+        module = _TinyRotary()
+
+    assert module.weight.device.type == "meta"
+    assert module.inv_freq.device.type == "cpu"
+    assert torch.equal(module.inv_freq, torch.tensor([1.0, 0.5]))
 
 
 def test_attested_psi_namespace_package_is_accepted(

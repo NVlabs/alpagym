@@ -1,0 +1,41 @@
+# @package _global_
+
+defines:
+  nre_cache_size: 16
+  physics_cache_size: 16
+
+services:
+  renderer:
+    environments:
+      - OMP_NUM_THREADS=1
+      - HOME=/tmp
+    replicas_per_container: 1
+    gpus: [0]
+  driver:
+    replicas_per_container: 1
+    gpus: [0]
+  physics:
+    replicas_per_container: 1
+    gpus: [0]
+  controller:
+    replicas_per_container: 1
+    gpus: null
+  trafficsim:
+    replicas_per_container: 1
+    gpus: [0]
+
+runtime:
+  nr_workers: 1
+  endpoints:
+    renderer:
+      n_concurrent_rollouts: 1
+    driver:
+      n_concurrent_rollouts: 1
+    physics:
+      n_concurrent_rollouts: 1
+      skip: false
+    controller:
+      n_concurrent_rollouts: 1
+      skip: false
+    trafficsim:
+      skip: true

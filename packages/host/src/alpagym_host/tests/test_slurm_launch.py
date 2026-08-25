@@ -4,8 +4,12 @@
 from pathlib import Path
 
 from alpagym_host.config import SeparateNodesSlurmTopologyConfig, SlurmConfig
-from alpagym_host.run_topology import RunHostPlan, RunTopologyPlan
-from alpagym_host.slurm import _gpu_mask, build_cosmos_srun_command, build_wizard_srun_command
+from alpagym_host.run_topology import CosmosWorkerPlan, RunHostPlan, RunTopologyPlan
+from alpagym_host.slurm import (
+    _gpu_mask,
+    build_cosmos_srun_command,
+    build_wizard_srun_command,
+)
 
 
 def test_build_wizard_srun_command_leaves_gpu_binding_to_nested_services() -> None:
@@ -56,7 +60,9 @@ def test_build_wizard_srun_command_scrubs_uv_project_env_before_exec() -> None:
 
     script = command[-1]
     assert "unset UV_PROJECT_ENVIRONMENT VIRTUAL_ENV" in script
-    assert script.index("unset UV_PROJECT_ENVIRONMENT VIRTUAL_ENV") < script.index("exec ")
+    assert script.index("unset UV_PROJECT_ENVIRONMENT VIRTUAL_ENV") < script.index(
+        "exec "
+    )
 
 
 def test_build_wizard_srun_command_reapplies_container_home_and_path() -> None:
@@ -112,7 +118,9 @@ def test_build_wizard_srun_command_disables_cpu_binding_for_nonexclusive_step() 
     assert "--cpu-bind=none" in command
 
 
-def test_build_wizard_srun_command_keeps_default_cpu_binding_for_exclusive_step() -> None:
+def test_build_wizard_srun_command_keeps_default_cpu_binding_for_exclusive_step() -> (
+    None
+):
     host = RunHostPlan(
         hostname="alpasim-0",
         host_index=0,
@@ -144,6 +152,7 @@ def test_build_cosmos_srun_command_passes_worker_flags_to_cosmos_launcher() -> N
                 runs_alpasim=False,
                 cosmos_gpus=4,
                 alpasim_gpus=0,
+                cosmos_workers=(CosmosWorkerPlan((0, 1, 2, 3), 0),),
             ),
             RunHostPlan(
                 hostname="mixed-0",
@@ -152,6 +161,7 @@ def test_build_cosmos_srun_command_passes_worker_flags_to_cosmos_launcher() -> N
                 runs_alpasim=True,
                 cosmos_gpus=4,
                 alpasim_gpus=4,
+                cosmos_workers=(CosmosWorkerPlan((0, 1, 2, 3), 1),),
             ),
         )
     )
@@ -160,7 +170,7 @@ def test_build_cosmos_srun_command_passes_worker_flags_to_cosmos_launcher() -> N
         cosmos_hosts=topology.cosmos_host_plans,
         slurm=_slurm_config(),
         container_image="/containers/alpagym.sqsh",
-        workspace_sync_command=[
+        runtime_check_command=[
             "uv",
             "sync",
             "--frozen",
@@ -170,38 +180,42 @@ def test_build_cosmos_srun_command_passes_worker_flags_to_cosmos_launcher() -> N
             "/workspace/alpagym",
         ],
         worker_commands=(
-            [
-                "uv",
-                "run",
-                "python",
-                "-m",
-                "cosmos_rl.launcher.launch_all",
-                "--config",
-                "/tmp/cosmos.toml",
-                "--num-workers",
-                "2",
-                "--worker-idx",
-                "0",
-                "--port",
-                "29500",
-                "alpagym_runtime.cosmos.entrypoint",
-            ],
-            [
-                "uv",
-                "run",
-                "python",
-                "-m",
-                "cosmos_rl.launcher.launch_all",
-                "--config",
-                "/tmp/cosmos.toml",
-                "--num-workers",
-                "2",
-                "--worker-idx",
-                "1",
-                "--url",
-                "policy-0:29500",
-                "alpagym_runtime.cosmos.entrypoint",
-            ],
+            (
+                [
+                    "uv",
+                    "run",
+                    "python",
+                    "-m",
+                    "cosmos_rl.launcher.launch_all",
+                    "--config",
+                    "/tmp/cosmos.toml",
+                    "--num-workers",
+                    "2",
+                    "--worker-idx",
+                    "0",
+                    "--port",
+                    "29500",
+                    "alpagym_runtime.cosmos.entrypoint",
+                ],
+            ),
+            (
+                [
+                    "uv",
+                    "run",
+                    "python",
+                    "-m",
+                    "cosmos_rl.launcher.launch_all",
+                    "--config",
+                    "/tmp/cosmos.toml",
+                    "--num-workers",
+                    "2",
+                    "--worker-idx",
+                    "1",
+                    "--url",
+                    "policy-0:29500",
+                    "alpagym_runtime.cosmos.entrypoint",
+                ],
+            ),
         ),
         log_dir=Path("/tmp/alpagym/logs"),
     )
@@ -232,6 +246,7 @@ def test_build_cosmos_srun_command_reapplies_container_home_and_path() -> None:
         runs_alpasim=True,
         cosmos_gpus=1,
         alpasim_gpus=1,
+        cosmos_workers=(CosmosWorkerPlan((0,), 0),),
     )
     slurm = _slurm_config()
     slurm.export_env = [
@@ -243,8 +258,8 @@ def test_build_cosmos_srun_command_reapplies_container_home_and_path() -> None:
         cosmos_hosts=(host,),
         slurm=slurm,
         container_image="/containers/alpagym.sqsh",
-        workspace_sync_command=["uv", "sync"],
-        worker_commands=(["uv", "run", "python", "worker.py"],),
+        runtime_check_command=["true"],
+        worker_commands=((["uv", "run", "python", "worker.py"],),),
         log_dir=Path("/tmp/alpagym/logs"),
     )
 
@@ -252,6 +267,38 @@ def test_build_cosmos_srun_command_reapplies_container_home_and_path() -> None:
         "export HOME=/lustre/run-home\n"
         "export PATH=/cm/slurm/bin:/opt/venv/bin\n"
     )
+
+
+def test_build_cosmos_srun_command_pins_colocated_rollout_cell() -> None:
+    """One host task launches GPU-scoped workers with explicit runtime affinity."""
+    host = RunHostPlan(
+        hostname="cell-0",
+        host_index=0,
+        runs_cosmos=True,
+        runs_alpasim=False,
+        cosmos_gpus=2,
+        alpasim_gpus=0,
+        cosmos_workers=(
+            CosmosWorkerPlan((0,), 0),
+            CosmosWorkerPlan((1,), 1, "alpasim-runtime-0"),
+        ),
+    )
+
+    command = build_cosmos_srun_command(
+        cosmos_hosts=(host,),
+        slurm=_slurm_config(),
+        container_image="/containers/alpagym.sqsh",
+        runtime_check_command=["true"],
+        worker_commands=((["trainer"], ["rollout"]),),
+        log_dir=Path("/tmp/alpagym/logs"),
+    )
+
+    script = command[-1]
+    assert "CUDA_VISIBLE_DEVICES=0 trainer &" in script
+    assert (
+        "CUDA_VISIBLE_DEVICES=1 ALPAGYM_ALPASIM_RUNTIME_ID=alpasim-runtime-0 rollout &"
+    ) in script
+    assert "wait -n" in script
 
 
 def test_gpu_mask_preserves_non_contiguous_gpu_ids() -> None:

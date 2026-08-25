@@ -25,7 +25,7 @@ from alpagym_runtime.cosmos.colocated_fresh_rollout_bridge import (
 from alpagym_runtime.cosmos.colocated_resume_bridge import (
     install_colocated_resume_bootstrap_bridge,
 )
-from alpagym_runtime.cosmos.dataset import AlpagymSceneDataset
+from alpagym_runtime.cosmos.dataset import AlpagymSceneDataset, repeat_scene_ids
 from alpagym_runtime.cosmos.nccl_cleanup_hooks import (
     install_cosmos_nccl_cleanup_publisher_opt_in,
 )
@@ -55,7 +55,9 @@ def _build_dataset(config: Any) -> AlpagymSceneDataset:
         run_config.artifact_paths.alpasim_scene_ids_path.read_text(encoding="utf-8")
     )
     scene_ids = [str(scene_id) for scene_id in scene_id_data["scene_ids"]]
-    return AlpagymSceneDataset(scene_ids=scene_ids)
+    return AlpagymSceneDataset(
+        scene_ids=repeat_scene_ids(scene_ids, run_config.dataset.scene_repetitions)
+    )
 
 
 def _install_policy_bundle_runtime_hooks(policy_bundle: Any, run_config: Any) -> None:
@@ -158,6 +160,41 @@ def _install_alpagym_rollout_teardown() -> None:
     LLMRolloutWorker.destroy_worker = destroy_worker_with_alpagym_teardown
 
 
+def _enable_alpagym_async_rollout() -> None:
+    """Declare the AlpaGym backend compatible with Cosmos's async scheduler."""
+    from cosmos_rl.rollout.worker.rollout_control import (
+        DisaggregatedRolloutControlWorker,
+    )
+
+    if "alpagym_rollout" not in DisaggregatedRolloutControlWorker.SUPPORT_ASYNC_BACKEND:
+        DisaggregatedRolloutControlWorker.SUPPORT_ASYNC_BACKEND.append(
+            "alpagym_rollout"
+        )
+
+    original_stream_generation_step = (
+        DisaggregatedRolloutControlWorker.stream_generation_step
+    )
+    if getattr(
+        original_stream_generation_step,
+        "_alpagym_idempotent_prompt_end_wrap",
+        False,
+    ):
+        return
+
+    def stream_generation_step_with_idempotent_prompt_end(self: Any) -> None:
+        """Keep drained async replicas alive while they await controller stop."""
+        if self.state.prompt_consume_end():
+            if self.should_report:
+                self.send_end_signal()
+            return
+        original_stream_generation_step(self)
+
+    stream_generation_step_with_idempotent_prompt_end._alpagym_idempotent_prompt_end_wrap = True  # type: ignore[attr-defined]
+    DisaggregatedRolloutControlWorker.stream_generation_step = (
+        stream_generation_step_with_idempotent_prompt_end
+    )
+
+
 # `@record` installs an excepthook that dumps uncaught exceptions (with full
 # traceback) to `$TORCHELASTIC_ERROR_FILE`, which torchrun sets per-child in
 # `cosmos_rl.launcher.utility.launch_processes` for Policy/Rollout workers.
@@ -205,6 +242,8 @@ def main(argv: list[str] | None = None) -> None:
         _nccl_store_master = start_nccl_store_master(run_config)
     elif cosmos_role == "Rollout":
         _install_alpagym_rollout_teardown()
+        if run_config.cosmos.rollout.mode == "async":
+            _enable_alpagym_async_rollout()
 
     policy_bundle = get_policy_bundle(run_config.policy.model.kind)
     _install_policy_bundle_runtime_hooks(policy_bundle, run_config)

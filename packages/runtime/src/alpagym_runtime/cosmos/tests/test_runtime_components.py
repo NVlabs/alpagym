@@ -446,8 +446,13 @@ def test_rollout_init_acquires_runtime_for_driver(
             """Accept the configured registry directory."""
             self.registry_dir = registry_dir
 
-        def acquire_alpasim_runtime(self, driver_id: str) -> TopologyEndpoint:
+        def acquire_alpasim_runtime(
+            self,
+            driver_id: str,
+            preferred_runtime_id: str | None = None,
+        ) -> TopologyEndpoint:
             """Return the endpoint assigned to the driver."""
+            assert preferred_runtime_id is None
             self.acquired_driver_ids.append(driver_id)
             endpoints = [
                 TopologyEndpoint(
@@ -555,7 +560,7 @@ def test_rollout_init_acquires_runtime_for_driver(
     monkeypatch.setattr(
         rollout_module,
         "build_inference_engine",
-        lambda config: FakeInferenceEngine(),
+        lambda config, *, existing_model=None: FakeInferenceEngine(),
     )
     monkeypatch.setattr(
         rollout_module, "build_policy_factory", lambda config, engine: object()

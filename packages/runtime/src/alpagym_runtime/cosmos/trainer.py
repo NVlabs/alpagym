@@ -1139,6 +1139,7 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
             )
             logical_rollout_samples = (
                 len(scene_ids)
+                * run_config.dataset.scene_repetitions
                 * run_config.cosmos.rollout.n_generation
                 * run_config.cosmos.train.num_epochs
             )
@@ -3628,6 +3629,13 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
             raise FloatingPointError(
                 f"PPO {phase_label} behavior KL {approx_kl:.6g} exceeds "
                 f"{target_mode} acceptance limit {float(acceptance_limit):.6g}; "
+                f"ratio_p01={float(metrics[f'{prefix}_ratio_p01']):.6g}, "
+                f"ratio_p50={float(metrics[f'{prefix}_ratio_p50']):.6g}, "
+                f"ratio_p99={float(metrics[f'{prefix}_ratio_p99']):.6g}, "
+                "max_abs_log_ratio="
+                f"{float(metrics[f'{prefix}_max_abs_log_ratio']):.6g}, "
+                "max_abs_ratio_error="
+                f"{float(metrics[f'{prefix}_max_abs_ratio_error']):.6g}; "
                 "refusing to advance scheduler, checkpoint, or weight sync"
             )
         if phase == "post_update" and approx_kl > target:

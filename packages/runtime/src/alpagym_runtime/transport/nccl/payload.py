@@ -17,10 +17,12 @@ from alpagym_runtime.types import EpisodeOutput
 TENSOR_KEY_MARKER = "__tensor_key__"
 _DATACLASS_TYPE_MARKER = "__dataclass_type__"
 _BOOL_TENSOR_MARKER = "__bool_tensor__"
+_EMPTY_TENSOR_MARKER = "__empty_tensor__"
 _RESERVED_DICT_MARKERS = {
     TENSOR_KEY_MARKER,
     _DATACLASS_TYPE_MARKER,
     _BOOL_TENSOR_MARKER,
+    _EMPTY_TENSOR_MARKER,
 }
 _ALLOWED_DATACLASS_TYPE_PREFIX = "alpagym_runtime."
 
@@ -71,12 +73,12 @@ def _pack(
     """
     if isinstance(value, torch.Tensor):
         if reject_empty_tensors and value.numel() == 0:
-            # pynccl rejects empty buffers; fail here at pack time rather than
-            # after the manifest is published and the rendezvous is open, which
-            # would raise mid-send and poison the communicator.
-            raise ValueError(
-                f"NCCL transport cannot ship a zero-element tensor (shape={tuple(value.shape)})"
-            )
+            return {
+                _EMPTY_TENSOR_MARKER: True,
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+                "device": str(value.device),
+            }
         key = f"tensor_{len(tensors)}"
         # pynccl cannot send torch.bool; ship bool tensors as uint8 and restore
         # the bool dtype on unpack (see _resolve_tensor_leaf).
@@ -145,6 +147,13 @@ def _resolve_tensor_leaf(
     leaf: dict[str, Any], tensors: dict[str, torch.Tensor]
 ) -> torch.Tensor:
     """Return the tensor for a manifest tensor-ref leaf, restoring bool dtype if marked."""
+    if leaf.get(_EMPTY_TENSOR_MARKER):
+        dtype_name = leaf["dtype"].removeprefix("torch.")
+        return torch.empty(
+            leaf["shape"],
+            dtype=getattr(torch, dtype_name),
+            device=leaf["device"],
+        )
     tensor = tensors[leaf[TENSOR_KEY_MARKER]]
     if leaf.get(_BOOL_TENSOR_MARKER):
         return tensor.to(torch.bool)
@@ -159,7 +168,9 @@ def _unpack(value: Any, type_hint: Any, tensors: dict[str, torch.Tensor]) -> Any
         - type_hint kind: ``Optional[T]``, ``tuple``, ``dict``/``Mapping``, dataclass,
           ``Any``, or leaf (primitive).
     """
-    if isinstance(value, dict) and TENSOR_KEY_MARKER in value:
+    if isinstance(value, dict) and (
+        TENSOR_KEY_MARKER in value or _EMPTY_TENSOR_MARKER in value
+    ):
         return _resolve_tensor_leaf(value, tensors)
 
     origin = get_origin(type_hint)
@@ -218,7 +229,7 @@ def _resolve_tensor_refs(value: Any, tensors: dict[str, torch.Tensor]) -> Any:
       survive a round-trip through ``dict[str, Any]`` slots.
     """
     if isinstance(value, dict):
-        if TENSOR_KEY_MARKER in value:
+        if TENSOR_KEY_MARKER in value or _EMPTY_TENSOR_MARKER in value:
             return _resolve_tensor_leaf(value, tensors)
         if _DATACLASS_TYPE_MARKER in value:
             return _reconstruct_dataclass(value, tensors)

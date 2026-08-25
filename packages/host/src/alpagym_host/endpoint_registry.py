@@ -44,7 +44,9 @@ def rollout_worker_capacity(
     among rollout workers, or AlpaSim runtimes cannot be cleanly divided among
     rollout replicas.
     """
-    return math.ceil(runtime_capacity / max(1, rollout_replicas // alpasim_runtime_count))
+    return math.ceil(
+        runtime_capacity / max(1, rollout_replicas // alpasim_runtime_count)
+    )
 
 
 class FileTopologyRegistry:
@@ -84,7 +86,8 @@ class FileTopologyRegistry:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = path.with_suffix(".yaml.tmp")
         tmp_path.write_text(
-            yaml.safe_dump({"host": host, "port": port}, sort_keys=False), encoding="utf-8"
+            yaml.safe_dump({"host": host, "port": port}, sort_keys=False),
+            encoding="utf-8",
         )
         tmp_path.replace(path)
 
@@ -118,7 +121,9 @@ class FileTopologyRegistry:
             if isinstance(port, bool) or not isinstance(port, int):
                 raise TypeError(f"NCCL master port must be an int, got {port!r}")
             return host, port
-        raise RuntimeError(f"NCCL master endpoint was not published at {path} within {timeout_s}s")
+        raise RuntimeError(
+            f"NCCL master endpoint was not published at {path} within {timeout_s}s"
+        )
 
     def clear_nccl_master(self) -> None:
         """Remove any stale NCCL master endpoint before the Controller republishes.
@@ -132,7 +137,9 @@ class FileTopologyRegistry:
 
     def list_alpasim_runtimes(self) -> list[TopologyEndpoint]:
         """Return all published AlpaSim RuntimeService endpoints."""
-        alpasim_runtime_paths = sorted((self._registry_dir / "alpasim_runtimes").glob("*.yaml"))
+        alpasim_runtime_paths = sorted(
+            (self._registry_dir / "alpasim_runtimes").glob("*.yaml")
+        )
         endpoints: list[TopologyEndpoint] = []
         for path in alpasim_runtime_paths:
             data = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -146,16 +153,27 @@ class FileTopologyRegistry:
             )
         return endpoints
 
-    def acquire_alpasim_runtime(self, driver_id: str) -> TopologyEndpoint:
-        """Return the AlpaSim runtime endpoint assigned to a driver."""
+    def acquire_alpasim_runtime(
+        self,
+        driver_id: str,
+        preferred_runtime_id: str | None = None,
+    ) -> TopologyEndpoint:
+        """Return the assigned runtime, honoring explicit GPU-local affinity."""
         lock_path = self._registry_dir / "alpasim_assignments.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("w", encoding="utf-8") as lock_file:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
-            return self._acquire_alpasim_runtime_locked(driver_id=driver_id)
+            return self._acquire_alpasim_runtime_locked(
+                driver_id=driver_id,
+                preferred_runtime_id=preferred_runtime_id,
+            )
 
-    def _acquire_alpasim_runtime_locked(self, driver_id: str) -> TopologyEndpoint:
-        """Assign a driver to the least-used runtime while holding the registry lock."""
+    def _acquire_alpasim_runtime_locked(
+        self,
+        driver_id: str,
+        preferred_runtime_id: str | None,
+    ) -> TopologyEndpoint:
+        """Assign a driver under the requested affinity while holding the lock."""
         endpoints = self.list_alpasim_runtimes()
         if not endpoints:
             raise RuntimeError(f"No AlpaSim runtime endpoints in {self._registry_dir}")
@@ -172,6 +190,11 @@ class FileTopologyRegistry:
                 raise RuntimeError(
                     f"Driver {driver_id!r} is assigned to unknown AlpaSim runtime {runtime_id!r}"
                 )
+            if preferred_runtime_id is not None and runtime_id != preferred_runtime_id:
+                raise RuntimeError(
+                    f"Driver {driver_id!r} is assigned to {runtime_id!r}, "
+                    f"not required runtime {preferred_runtime_id!r}"
+                )
             return endpoints_by_id[runtime_id]
 
         assignment_counts = {endpoint.id: 0 for endpoint in endpoints}
@@ -181,10 +204,18 @@ class FileTopologyRegistry:
             if runtime_id in assignment_counts:
                 assignment_counts[runtime_id] += 1
 
-        endpoint = min(
-            endpoints,
-            key=lambda candidate: (assignment_counts[candidate.id], candidate.id),
-        )
+        if preferred_runtime_id is not None:
+            if preferred_runtime_id not in endpoints_by_id:
+                raise RuntimeError(
+                    f"Driver {driver_id!r} requires unknown AlpaSim runtime "
+                    f"{preferred_runtime_id!r}"
+                )
+            endpoint = endpoints_by_id[preferred_runtime_id]
+        else:
+            endpoint = min(
+                endpoints,
+                key=lambda candidate: (assignment_counts[candidate.id], candidate.id),
+            )
         assignment_path.write_text(
             yaml.safe_dump(
                 {"driver_id": driver_id, "alpasim_runtime_id": endpoint.id},

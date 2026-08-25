@@ -28,6 +28,7 @@ from alpagym_host.config import (
     SeparateNodesSlurmTopologyConfig,
     SlurmConfig,
     SlurmLayout,
+    TrainerAndRolloutCellsSlurmTopologyConfig,
     TransportKind,
     alpagym_project_root,
 )
@@ -215,7 +216,9 @@ def _validate_checkpoint_resume_config(
     for name, value in positive_integers.items():
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"{name} must be a positive integer for continuation")
-    logical_samples = len(scene_ids) * n_generation * num_epochs
+    logical_samples = (
+        len(scene_ids) * config.dataset.scene_repetitions * n_generation * num_epochs
+    )
     samples_per_update = train_batch_per_replica * policy_replicas
     if logical_samples % samples_per_update != 0:
         raise ValueError(
@@ -324,6 +327,8 @@ def _validate_wizard_startup_config(
         raise ValueError("dataset.scene_ids must be non-empty when set")
     if dataset.test_suite_id is not None and not dataset.test_suite_id:
         raise ValueError("dataset.test_suite_id must be non-empty when set")
+    if dataset.scene_repetitions <= 0:
+        raise ValueError("dataset.scene_repetitions must be positive")
 
 
 def _validate_humanoid_config(config: RunConfig, *, training: bool = True) -> None:
@@ -553,11 +558,49 @@ def _validate_humanoid_config(config: RunConfig, *, training: bool = True) -> No
             "humanoid rollouts require prefetch_rollout=false until Cosmos passes "
             "current_weight_version to its prefetch hook"
         )
-    if training and config.cosmos.mode is not CosmosRLMode.colocated:
+    rollout_mode = config.cosmos.rollout.mode
+    if rollout_mode not in {"sync", "async"}:
+        raise ValueError("cosmos.rollout.mode must be 'sync' or 'async'")
+    if config.cosmos.rollout.async_r2r_sync not in {
+        "disabled",
+        "generation",
+        "inference",
+    }:
+        raise ValueError(
+            "cosmos.rollout.async_r2r_sync must be disabled, generation, or inference"
+        )
+    if config.cosmos.rollout.async_config.max_concurrent_requests <= 0:
+        raise ValueError(
+            "cosmos.rollout.async_config.max_concurrent_requests must be positive"
+        )
+    if training and rollout_mode == "async":
+        if config.cosmos.mode is not CosmosRLMode.disaggregated:
+            raise ValueError("async humanoid rollout requires disaggregated Cosmos")
+        if config.cosmos.rollout.async_r2r_sync != "disabled":
+            raise ValueError(
+                "async humanoid rollout requires async_r2r_sync=disabled"
+            )
+        if config.cosmos.train.train_policy.on_policy:
+            raise ValueError(
+                "async humanoid rollout requires on_policy=false and bounded staleness"
+            )
+    distributed_rollout_cells = (
+        config.cosmos.mode is CosmosRLMode.disaggregated
+        and config.policy.model.kind == "g1_vla"
+        and ExecutionBackend(config.execution.backend) is ExecutionBackend.slurm
+        and isinstance(
+            config.execution.slurm.topology,
+            TrainerAndRolloutCellsSlurmTopologyConfig,
+        )
+    )
+    if (
+        config.cosmos.mode is not CosmosRLMode.colocated
+        and not distributed_rollout_cells
+    ):
         raise ValueError(
             "standalone humanoid rollouts currently support cosmos.mode=colocated only; "
-            "distributed async requires start-version reporting and session-boundary "
-            "weight synchronization"
+            "distributed mode is qualified only for the G1 trainer-and-rollout-cells "
+            "topology"
         )
 
 
@@ -683,6 +726,13 @@ def _validate_slurm_topology_config(slurm: SlurmConfig) -> None:
                 raise ValueError(
                     "separate_nodes requires nodes to equal cosmos_nodes + alpasim_nodes"
                 )
+        case SlurmLayout.trainer_and_rollout_cells:
+            if not isinstance(
+                slurm.topology, TrainerAndRolloutCellsSlurmTopologyConfig
+            ):
+                raise TypeError(type(slurm.topology))
+            if slurm.nodes != 1:
+                raise ValueError("trainer_and_rollout_cells requires nodes=1")
 
 
 def _validate_policy_model_path(config: RunConfig) -> None:
@@ -1045,6 +1095,8 @@ def _validate_slurm_cosmos_gpu_capacity(config: RunConfig) -> None:
         hostnames=[f"node-{host_index}" for host_index in range(slurm.nodes)],
         gpus_per_node=slurm.gpus_per_node,
         topology=slurm.topology,
+        policy_replicas=config.cosmos.launch.policy_replicas,
+        rollout_replicas=config.cosmos.launch.rollout_replicas,
     )
     cosmos_hosts = topology.cosmos_host_plans
     cosmos_gpus_per_host = cosmos_hosts[0].cosmos_gpu_count
@@ -1052,6 +1104,13 @@ def _validate_slurm_cosmos_gpu_capacity(config: RunConfig) -> None:
     rollout_gpus_per_replica = _rollout_gpus_per_replica(
         config.cosmos.rollout.parallelism
     )
+
+    if isinstance(slurm.topology, TrainerAndRolloutCellsSlurmTopologyConfig) and (
+        policy_gpus_per_replica != 1 or rollout_gpus_per_replica != 1
+    ):
+        raise ValueError(
+            "trainer_and_rollout_cells requires one GPU per policy and rollout replica"
+        )
 
     errors: list[str] = []
     if policy_gpus_per_replica > cosmos_gpus_per_host:

@@ -1,0 +1,16 @@
+# @package _global_
+
+defaults:
+  - /execution/slurm/topology@execution.slurm.topology: trainer_and_rollout_cells
+  - override /transport: nccl
+  - _self_
+
+execution:
+  backend: slurm
+
+alpasim:
+  wizard_args:
+    topology: alpagym_1gpu_rollout_cell
+
+cosmos:
+  mode: disaggregated

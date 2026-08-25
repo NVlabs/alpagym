@@ -75,6 +75,7 @@ def _build_wizard_command(
     alpasim_run_dir: Path,
     checkout_root: Path,
     python_executable: Path | None = None,
+    baseport: int | None = None,
 ) -> list[str]:
     """Build argv that runs the AlpaSim Wizard from the checkout venv's interpreter."""
     wizard_args = config.wizard_args
@@ -108,6 +109,7 @@ def _build_wizard_command(
         f"driver_source={wizard_args.driver_source}",
         f"wizard.run_method={execution_backend.wizard_run_method}",
         "wizard.run_mode=SERVER",
+        f"wizard.baseport={baseport if baseport is not None else wizard_args.baseport}",
         "wizard.debug_flags.use_localhost=true",
         "runtime.simulation_config.send_recording_ground_truth=true",
         "runtime.simulation_config.skip_driver_during_force_gt=true",

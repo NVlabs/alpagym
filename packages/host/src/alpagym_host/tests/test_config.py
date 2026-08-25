@@ -26,6 +26,7 @@ from alpagym_host.config import (
     ProvenanceMode,
     RunConfig,
     SeparateNodesSlurmTopologyConfig,
+    TrainerAndRolloutCellsSlurmTopologyConfig,
     TransportKind,
     load_run_config,
     register_config_schema,
@@ -197,6 +198,22 @@ def test_host_writes_and_loads_handoff_artifacts(
     assert cosmos_config["custom"] == {
         "resolved_config_path": str(artifact_paths.resolved_config_path),
     }
+
+
+def test_one_node_rollout_cell_preset_composes_typed_topology(tmp_path: Path) -> None:
+    """The 2+6 preset composes the qualified one-node topology and NCCL transport."""
+    run_config = _make_run_config(
+        tmp_path,
+        "topology=slurm_1node_2_trainers_6_rollout_cells",
+    )
+
+    assert isinstance(
+        run_config.execution.slurm.topology,
+        TrainerAndRolloutCellsSlurmTopologyConfig,
+    )
+    assert run_config.cosmos.launch.policy_replicas == 2
+    assert run_config.cosmos.launch.rollout_replicas == 6
+    assert run_config.transport.kind is TransportKind.nccl
 
 
 def test_host_writes_alpagym_ppo_trainer_config(
@@ -1581,6 +1598,18 @@ def test_humanoid_config_rejects_unqualified_distributed_async_mode(
         validate_run_config(run_config, "run")
 
 
+def test_g1_vla_allows_distributed_trainer_and_rollout_cells() -> None:
+    """The qualified G1 cell topology may separate trainer and rollout processes."""
+    config = _make_valid_vla_validation_config()
+    config.cosmos.mode = CosmosRLMode.disaggregated
+    config.execution = SimpleNamespace(
+        backend=ExecutionBackend.slurm,
+        slurm=SimpleNamespace(topology=TrainerAndRolloutCellsSlurmTopologyConfig()),
+    )
+
+    _validate_humanoid_config(config)
+
+
 @pytest.mark.parametrize(
     ("override", "match"),
     [
@@ -2200,7 +2229,12 @@ def _make_valid_vla_validation_config() -> RunConfig:
             dataset=SimpleNamespace(scene_ids=["stairs"]),
             cosmos=SimpleNamespace(
                 mode=CosmosRLMode.colocated,
-                rollout=SimpleNamespace(prefetch_rollout=False),
+                rollout=SimpleNamespace(
+                    prefetch_rollout=False,
+                    mode="sync",
+                    async_r2r_sync="disabled",
+                    async_config=SimpleNamespace(max_concurrent_requests=10),
+                ),
                 train=SimpleNamespace(
                     seed=20260822,
                     deterministic=True,
