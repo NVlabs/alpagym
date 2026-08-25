@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -364,6 +365,37 @@ def test_candidate_publish_never_replaces_concurrent_empty_destination(
         path.name.startswith(f".{candidate_path.name}.tmp-")
         for path in candidate_path.parent.iterdir()
     )
+
+
+def test_candidate_publish_supports_filesystems_without_renameat2_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate_path = _candidate_path(tmp_path)
+
+    class UnsupportedRenameAt2:
+        argtypes: list[object] = []
+        restype: object | None = None
+
+        def __call__(self, *_args: object) -> int:
+            return -1
+
+    monkeypatch.setattr(
+        candidate_overlay_module,
+        "CDLL",
+        lambda *_args, **_kwargs: SimpleNamespace(renameat2=UnsupportedRenameAt2()),
+    )
+    monkeypatch.setattr(candidate_overlay_module, "get_errno", lambda: errno.EINVAL)
+
+    export_model_checkpoint(
+        _tiny_model(fill=1.0), candidate_path, _export_context()
+    )
+
+    assert {path.name for path in candidate_path.iterdir()} == {
+        CANDIDATE_MANIFEST_FILENAME,
+        CANDIDATE_WEIGHTS_FILENAME,
+    }
+    assert candidate_path.stat().st_mode & 0o222 == 0
 
 
 def test_candidate_tamper_and_wrong_base_fail_closed(tmp_path: Path) -> None:

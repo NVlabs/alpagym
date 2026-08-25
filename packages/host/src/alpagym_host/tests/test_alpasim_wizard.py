@@ -605,6 +605,20 @@ def test_start_wizard_runs_checkout_interpreter_with_clean_env(
     )
 
 
+def test_wizard_command_accepts_prebuilt_container_python(tmp_path: Path) -> None:
+    """Slurm launches Wizard with the image interpreter, not a source-tree symlink."""
+    command = _build_wizard_command(
+        config=_alpasim_config(),
+        execution_backend=ExecutionBackend.slurm,
+        dataset=DatasetConfig(scene_ids=["scene_a"], test_suite_id=None),
+        alpasim_run_dir=tmp_path / "run",
+        checkout_root=tmp_path / "alpasim",
+        python_executable=Path("/opt/venv/bin/python"),
+    )
+
+    assert command[0] == "/opt/venv/bin/python"
+
+
 def test_wizard_compose_project_is_stable_and_run_unique(tmp_path: Path) -> None:
     """Identical runtime indices in different runs never share cleanup labels."""
     first = tmp_path / "run-a" / "alpasim" / "wizard_0"

@@ -211,7 +211,10 @@ def execute_run(config: RunConfig) -> None:
         container_image = None
 
     _log_topology(topology)
-    alpasim_checkout_root = resolve_alpasim_checkout(config=config.alpasim)
+    alpasim_checkout_root = resolve_alpasim_checkout(
+        config=config.alpasim,
+        prepare_local_env=not execution_backend.is_slurm_run,
+    )
     if config.cosmos.train.deterministic:
         workspace_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
         if workspace_config not in (None, ":4096:8"):
@@ -698,11 +701,13 @@ def _start_wizard_process(
         dataset=config.dataset,
         alpasim_run_dir=wizard_log_dir,
         checkout_root=alpasim_checkout_root,
+        python_executable=Path("/opt/venv/bin/python"),
     )
     command = build_wizard_srun_command(
         host=host,
         slurm=config.execution.slurm,
         wizard_command=wizard_command,
+        wizard_workdir=alpasim_checkout_root,
         log_path=(
             config.artifact_paths.log_dir / f"wizard_{runtime_index}.log"
         ).resolve(),
@@ -765,17 +770,11 @@ def _build_cosmos_command(
                 worker_index=worker_index,
             )
         )
-    workspace_setup_commands = [
-        [
-            "uv",
-            "sync",
-            "--frozen",
-            "--inexact",
-            "--all-packages",
-            "--project",
-            str(config.execution.slurm.container_workdir),
-        ]
-    ]
+    # The Slurm image is the dependency boundary. Source checkouts are mounted
+    # as overlays and the launcher below uses ``uv run --no-sync``; mutating the
+    # image environment or building a second venv at job startup defeats image
+    # caching and can silently change the pinned runtime.
+    workspace_setup_commands = [["true"]]
     return build_cosmos_srun_command(
         cosmos_hosts=cosmos_hosts,
         slurm=config.execution.slurm,

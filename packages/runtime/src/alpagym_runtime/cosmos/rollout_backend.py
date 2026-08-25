@@ -131,7 +131,14 @@ class AlpagymRollout(RolloutBase):
         )
         scene_ids = tuple(str(scene_id) for scene_id in scene_id_data["scene_ids"])
 
-        self._inference_engine = build_inference_engine(self._run_config)
+        logger.info(
+            "[alpagym] Initializing rollout inference wrapper: colocated_model=%s",
+            self._model is not None,
+        )
+        self._inference_engine = build_inference_engine(
+            self._run_config,
+            existing_model=self._model,
+        )
         self._model = self._inference_engine.get_model()
         self._humanoid_session_model_leases = (
             self._inference_engine.requires_session_model_leases
@@ -152,6 +159,10 @@ class AlpagymRollout(RolloutBase):
             self._topology_registry.acquire_alpasim_runtime(
                 driver_id=policy_endpoint_id
             )
+        )
+        logger.info(
+            "[alpagym] Acquired AlpaSim runtime endpoint: %s",
+            alpasim_runtime_endpoint,
         )
         max_concurrent_rollouts = rollout_worker_capacity(
             runtime_capacity=int(alpasim_runtime_endpoint.capacity),
@@ -177,6 +188,10 @@ class AlpagymRollout(RolloutBase):
                 require_policy_camera=humanoid_policy_camera_required(self._run_config),
             )
             self._humanoid_policy_server.start()
+            logger.info(
+                "[alpagym] Humanoid policy server started: %s",
+                self._humanoid_policy_server.topology_endpoint,
+            )
         elif simulation_domain == "av":
             policy_factory = build_policy_factory(
                 self._run_config, self._inference_engine
@@ -204,6 +219,7 @@ class AlpagymRollout(RolloutBase):
             ],
         )
         grpc.channel_ready_future(channel).result(timeout=5.0)
+        logger.info("[alpagym] AlpaSim runtime channel is ready")
         self._alpasim_runtime_stub = RuntimeServiceStub(channel)
 
         # TODO(cosmos-rl): the right resolution path is

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from alpagym_host.config import register_config_schema
-from alpagym_host.config_validation import validate_run_config
+from alpagym_host.config_validation import _validate_cosmos_mode, validate_run_config
 from alpagym_host.run_artifacts import build_artifact_paths, build_run_config
 from hydra import compose, initialize_config_module
 from hydra.errors import ConfigCompositionException
@@ -235,8 +235,10 @@ def test_validate_run_config_rejects_submit_with_non_slurm_backend(tmp_path: Pat
         validate_run_config(config, requested_command="submit")
 
 
-def test_validate_run_config_rejects_colocated_slurm_mode(tmp_path: Path) -> None:
-    """Slurm runs must explicitly author the Cosmos disaggregated mode."""
+def test_validate_run_config_allows_colocated_all_in_one_slurm_mode(
+    tmp_path: Path,
+) -> None:
+    """A single-node Slurm cell may colocate policy and rollout workers."""
     cfg = _compose_test_config(
         tmp_path,
         overrides=[
@@ -248,8 +250,25 @@ def test_validate_run_config_rejects_colocated_slurm_mode(tmp_path: Path) -> Non
     )
     config = build_run_config(cfg, build_artifact_paths(cfg))
 
-    with pytest.raises(ValueError, match="cosmos.mode must be 'disaggregated' for slurm"):
-        validate_run_config(config, requested_command="run")
+    _validate_cosmos_mode(config)
+
+
+def test_validate_run_config_rejects_colocated_multinode_slurm_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-node Slurm execution still requires disaggregated Cosmos."""
+    config = _compose_slurm_test_config(
+        tmp_path,
+        monkeypatch,
+        overrides=["cosmos.mode=colocated"],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="cosmos.mode must be 'disaggregated' for multi-node Slurm",
+    ):
+        _validate_cosmos_mode(config)
 
 
 def test_execute_run_delegates_to_unified_lifecycle(

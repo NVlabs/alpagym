@@ -33,7 +33,7 @@ from alpagym_host.checkpoint_resume import (
     validate_checkpoint_resume_source,
     validate_disabled_checkpoint_resume_contract,
 )
-from alpagym_host.config import RunConfig, load_run_config
+from alpagym_host.config import ProvenanceMode, RunConfig, load_run_config
 from cosmos_rl.dispatcher.data import schema as _rollout_schema
 from cosmos_rl.policy import config as _cosmos_config
 from cosmos_rl.policy.trainer import base as _trainer_base
@@ -1114,6 +1114,10 @@ class AlpagymGRPOTrainer(_grpo_trainer.GRPOTrainer):
         # Production cosmos invocations always set `custom.resolved_config_path` via
         # `--config`.
         run_config = _load_run_config(config)
+        self._write_ppo_update_diagnostic_receipts = bool(
+            getattr(self, "_write_ppo_update_diagnostic_receipts", False)
+            and run_config.execution.provenance_mode is ProvenanceMode.required
+        )
         initialize_perf(run_config)
         # Cosmos's super-init resolves a tokenizer from
         # ``config.policy.model_name_or_path`` and calls ``ModelRegistry.build_model``.

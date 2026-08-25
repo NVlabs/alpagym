@@ -121,7 +121,7 @@ def test_execute_run_runs_local_process_lifecycle(
     monkeypatch.setattr(
         run_lifecycle,
         "resolve_alpasim_checkout",
-        lambda config: tmp_path / "alpasim",
+        lambda config, **kwargs: tmp_path / "alpasim",
     )
     if formal_provenance:
         monkeypatch.setattr(
@@ -354,7 +354,7 @@ def test_execute_run_runs_distributed_slurm_topology(
     monkeypatch.setattr(
         run_lifecycle,
         "resolve_alpasim_checkout",
-        lambda config: tmp_path / "alpasim",
+        lambda config, **kwargs: tmp_path / "alpasim",
     )
     monkeypatch.setattr(
         run_lifecycle,
@@ -481,7 +481,7 @@ def test_execute_run_resolves_relative_slurm_wizard_paths(
     monkeypatch.setattr(
         run_lifecycle,
         "resolve_alpasim_checkout",
-        lambda config: tmp_path / "alpasim",
+        lambda config, **kwargs: tmp_path / "alpasim",
     )
     monkeypatch.setattr(
         run_lifecycle,

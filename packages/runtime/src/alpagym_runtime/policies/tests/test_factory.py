@@ -74,6 +74,7 @@ class _FakeInferenceModel:
 def _make_fake_bundle(
     *,
     load_inference_model: Any | None = None,
+    wrap_inference_model: Any | None = None,
 ) -> PolicyBundle:
     """Build a real ``PolicyBundle`` with no-op hooks plus optional overrides."""
     return PolicyBundle(
@@ -83,6 +84,7 @@ def _make_fake_bundle(
         load_inference_model=load_inference_model
         or (lambda run_config, device, dtype: None),
         build_model_inputs=lambda run_config: None,
+        wrap_inference_model=wrap_inference_model,
     )
 
 
@@ -112,6 +114,40 @@ def test_build_inference_engine_wires_bundle_model_to_engine(
     assert captured["run_config"] is config
     assert captured["dtype"] is torch.bfloat16
     assert captured["device"] == torch.device("cpu")
+
+
+def test_build_inference_engine_wraps_existing_colocated_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A colocated policy model is wrapped without loading a second checkpoint."""
+    existing_model = torch.nn.Linear(2, 2)
+    fake_model = _FakeInferenceModel()
+    loaded = False
+
+    def fake_load(*args: Any, **kwargs: Any) -> Any:
+        nonlocal loaded
+        loaded = True
+        return fake_model
+
+    def fake_wrap(model: torch.nn.Module) -> Any:
+        assert model is existing_model
+        return fake_model
+
+    monkeypatch.setattr(
+        factory,
+        "get_policy_bundle",
+        lambda kind: _make_fake_bundle(
+            load_inference_model=fake_load,
+            wrap_inference_model=fake_wrap,
+        ),
+    )
+
+    engine = factory.build_inference_engine(
+        _make_resolved_config(), existing_model=existing_model
+    )
+
+    assert engine._inference_model is fake_model
+    assert not loaded
 
 
 def test_build_inference_engine_accepts_batch_size_greater_than_one(

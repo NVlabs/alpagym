@@ -74,6 +74,7 @@ def _build_wizard_command(
     dataset: DatasetConfig,
     alpasim_run_dir: Path,
     checkout_root: Path,
+    python_executable: Path | None = None,
 ) -> list[str]:
     """Build argv that runs the AlpaSim Wizard from the checkout venv's interpreter."""
     wizard_args = config.wizard_args
@@ -98,7 +99,7 @@ def _build_wizard_command(
         else wizard_args.deploy
     )
     argv = [
-        str(checkout_root / ".venv" / "bin" / "python"),
+        str(python_executable or checkout_root / ".venv" / "bin" / "python"),
         "-m",
         "alpasim_wizard",
         f"hydra.searchpath=[file://{configs_dir}]",

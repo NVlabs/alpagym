@@ -806,7 +806,13 @@ def _fd_sha256(fd: int) -> str:
 
 
 def _rename_directory_noreplace(source: Path, destination: Path) -> None:
-    """Atomically publish one directory and never replace a race winner."""
+    """Publish an immutable directory without ever replacing a race winner.
+
+    Linux filesystems with ``renameat2(RENAME_NOREPLACE)`` get an atomic
+    directory publish. Filesystems such as Lustre that reject that flag use a
+    manifest-last hardlink fallback so readers fail closed until publication
+    is complete.
+    """
     if sys.platform != "linux":
         raise RuntimeError("immutable G1 VLA candidate publish requires Linux")
     libc = CDLL(None, use_errno=True)
@@ -831,6 +837,38 @@ def _rename_directory_noreplace(source: Path, destination: Path) -> None:
             f"refusing to overwrite immutable G1 VLA candidate: {destination}",
             str(destination),
         )
+    if error_number in {errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP}:
+        try:
+            destination.mkdir(mode=0o700)
+        except FileExistsError as error:
+            raise FileExistsError(
+                error.errno,
+                f"refusing to overwrite immutable G1 VLA candidate: {destination}",
+                str(destination),
+            ) from error
+        try:
+            children = sorted(
+                source.iterdir(),
+                key=lambda child: child.name == CANDIDATE_MANIFEST_FILENAME,
+            )
+            for child in children:
+                if not child.is_file() or child.is_symlink():
+                    raise ValueError(
+                        "G1 VLA candidate staging directory contains a non-regular file"
+                    )
+                os.link(child, destination / child.name, follow_symlinks=False)
+            os.chmod(destination, 0o555)
+            os.chmod(source, 0o700)
+            for child in children:
+                child.unlink()
+            source.rmdir()
+            return
+        except BaseException:
+            os.chmod(destination, 0o700)
+            for child in destination.iterdir():
+                child.unlink()
+            destination.rmdir()
+            raise
     raise OSError(error_number, os.strerror(error_number), str(destination))
 
 

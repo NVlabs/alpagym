@@ -14,10 +14,14 @@ from pathlib import Path
 from alpagym_host.config import AlpaSimConfig
 
 
-def resolve_alpasim_checkout(config: AlpaSimConfig) -> Path:
+def resolve_alpasim_checkout(
+    config: AlpaSimConfig, *, prepare_local_env: bool = True
+) -> Path:
     """Resolve or prepare the AlpaSim checkout for Wizard startup.
 
-    For a local ``repo_path``, sync its environment in place. For a ``repo_url`` +
+    For a local ``repo_path``, optionally sync its environment in place. Slurm
+    callers using a prebuilt container set ``prepare_local_env=False`` and use
+    the checkout only as a source overlay. For a ``repo_url`` +
     ``repo_ref``, return a content-addressed cached checkout built once: concurrent
     runs that share the cache build into private temp dirs and publish the first one
     with an atomic rename, so a concurrent sweep never corrupts a shared checkout.
@@ -28,8 +32,14 @@ def resolve_alpasim_checkout(config: AlpaSimConfig) -> Path:
             raise NotADirectoryError(checkout_root)
         logging.info("Using local AlpaSim checkout %s", checkout_root)
         _validate_alpasim_layout(checkout_root)
-        _compile_protos(checkout_root)
-        _sync_alpasim_env(checkout_root, relocatable=False)
+        if prepare_local_env:
+            _compile_protos(checkout_root)
+            _sync_alpasim_env(checkout_root, relocatable=False)
+        else:
+            logging.info(
+                "Using prebuilt container environment for local AlpaSim checkout %s",
+                checkout_root,
+            )
         return checkout_root
 
     if config.repo_url is None or config.repo_ref is None:

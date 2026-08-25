@@ -640,11 +640,20 @@ def _validate_rollout_qualification_config(config: RunConfig) -> None:
 def _validate_cosmos_mode(config: RunConfig) -> None:
     """Validate backend-specific Cosmos placement mode requirements."""
     execution_backend = ExecutionBackend(config.execution.backend)
+    if not execution_backend.is_slurm_run:
+        return
+    if config.cosmos.mode is CosmosRLMode.disaggregated:
+        return
     if (
-        execution_backend.is_slurm_run
-        and config.cosmos.mode is not CosmosRLMode.disaggregated
+        config.cosmos.mode is CosmosRLMode.colocated
+        and SlurmLayout(config.execution.slurm.topology.kind)
+        is SlurmLayout.all_in_one
+        and config.execution.slurm.nodes == 1
     ):
-        raise ValueError("cosmos.mode must be 'disaggregated' for slurm execution")
+        return
+    raise ValueError(
+        "cosmos.mode must be 'disaggregated' for multi-node Slurm execution"
+    )
 
 
 def _validate_slurm_topology_config(slurm: SlurmConfig) -> None:
@@ -1056,10 +1065,16 @@ def _validate_slurm_cosmos_gpu_capacity(config: RunConfig) -> None:
             f"Slurm worker exposes {cosmos_gpus_per_host}"
         )
 
-    required_gpus = (
-        config.cosmos.launch.policy_replicas * policy_gpus_per_replica
-        + config.cosmos.launch.rollout_replicas * rollout_gpus_per_replica
-    )
+    # Colocated mode deliberately runs policy and rollout actors on the same
+    # visible Cosmos GPU pool. Replica counts describe logical actors there,
+    # not disjoint Slurm GPU allocations. Keep the per-replica shape checks
+    # above, but only sum replica GPU demand for disaggregated launch plans.
+    required_gpus = 0
+    if config.cosmos.mode is CosmosRLMode.disaggregated:
+        required_gpus = (
+            config.cosmos.launch.policy_replicas * policy_gpus_per_replica
+            + config.cosmos.launch.rollout_replicas * rollout_gpus_per_replica
+        )
     available_gpus = sum(host.cosmos_gpu_count for host in cosmos_hosts)
     if required_gpus > available_gpus:
         errors.append(

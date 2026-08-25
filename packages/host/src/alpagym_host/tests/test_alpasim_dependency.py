@@ -313,6 +313,27 @@ def test_local_checkout_compiles_protos_then_syncs_editable(
     ]
 
 
+def test_local_checkout_can_use_prebuilt_container_environment(
+    tmp_path, monkeypatch
+) -> None:
+    """A Slurm source overlay does not rebuild its environment at launch."""
+    local_checkout = tmp_path / "alpasim"
+    _write_alpasim_layout(local_checkout)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        alpasim_dependency.subprocess,
+        "run",
+        lambda command, **kwargs: commands.append(command),
+    )
+
+    checkout_root = resolve_alpasim_checkout(
+        _local_config(local_checkout), prepare_local_env=False
+    )
+
+    assert checkout_root == local_checkout.resolve()
+    assert commands == []
+
+
 def test_cached_checkout_uses_configured_cache_dir(tmp_path, monkeypatch) -> None:
     """Configured checkout caches avoid node-local home directories."""
     commands: list[list[str]] = []

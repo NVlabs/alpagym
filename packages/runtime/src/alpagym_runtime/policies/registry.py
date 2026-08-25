@@ -102,12 +102,16 @@ class PolicyBundle:
     export_model_checkpoint: (
         Callable[[torch.nn.Module, Path, PolicyCheckpointExportContext], None] | None
     ) = None
+    wrap_inference_model: Callable[[torch.nn.Module], InferenceModel] | None = None
 
     def __post_init__(self) -> None:
         """Validate that every bundle hook is callable."""
         for field in fields(self):
             hook = getattr(self, field.name)
-            if field.name == "export_model_checkpoint" and hook is None:
+            if (
+                field.name in {"export_model_checkpoint", "wrap_inference_model"}
+                and hook is None
+            ):
                 continue
             if not callable(hook):
                 raise TypeError(f"PolicyBundle hook {field.name!r} must be callable")

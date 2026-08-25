@@ -35,6 +35,7 @@ def build_wizard_srun_command(
     host: RunHostPlan,
     slurm: SlurmConfig,
     wizard_command: list[str],
+    wizard_workdir: Path,
     log_path: Path,
 ) -> list[str]:
     """Build an srun command for an AlpaSim Wizard process on one Slurm host."""
@@ -43,6 +44,7 @@ def build_wizard_srun_command(
 
     script = "\n".join(
         [
+            *_container_shell_exports(slurm.export_env),
             "export SLURM_JOB_NODELIST=$(hostname)",
             "export SLURM_NODELIST=$(hostname)",
             # srun defaults to --export=ALL and this runs under `bash -lc`, a login shell
@@ -60,15 +62,21 @@ def build_wizard_srun_command(
         "--nodes=1",
         "--ntasks=1",
         f"--nodelist={host.hostname}",
-        f"--gpus-per-task={host.alpasim_gpus}",
-        f"--gpu-bind=mask_gpu:{_gpu_mask(host.alpasim_gpu_ids)}",
     ]
+    if slurm.container_image is not None:
+        srun_command.append(f"--container-image={slurm.container_image}")
+    if slurm.container_mounts:
+        srun_command.append(
+            f"--container-mounts={','.join(slurm.container_mounts)}"
+        )
+    srun_command.append(f"--container-workdir={wizard_workdir}")
     if not slurm.exclusive:
         srun_command.append("--cpu-bind=none")
     srun_command.extend(
         [
             f"--output={log_path}",
             f"--error={log_path}",
+            f"--export={','.join(['ALL', *slurm.export_env])}",
             "bash",
             "-lc",
             script,
@@ -120,6 +128,7 @@ def build_cosmos_srun_command(
             _cosmos_launcher_script(
                 workspace_sync_command=workspace_sync_command,
                 worker_commands=worker_commands,
+                export_env=slurm.export_env,
             ),
         ]
     )
@@ -129,6 +138,7 @@ def build_cosmos_srun_command(
 def _cosmos_launcher_script(
     workspace_sync_command: list[str],
     worker_commands: tuple[list[str], ...],
+    export_env: list[str] | None = None,
 ) -> str:
     """Render the per-task dispatcher for one multi-task Cosmos Slurm step.
 
@@ -137,7 +147,11 @@ def _cosmos_launcher_script(
     `SLURM_PROCID`; this wrapper uses that task id to exec the matching
     prebuilt Cosmos launcher command.
     """
-    lines = [shlex.join(workspace_sync_command), 'case "$SLURM_PROCID" in']
+    lines = [
+        *_container_shell_exports(export_env or []),
+        shlex.join(workspace_sync_command),
+        'case "$SLURM_PROCID" in',
+    ]
     for worker_index, worker_command in enumerate(worker_commands):
         lines.extend(
             [
@@ -156,6 +170,22 @@ def _cosmos_launcher_script(
         ]
     )
     return "\n".join(lines)
+
+
+def _container_shell_exports(export_env: list[str]) -> list[str]:
+    """Reapply shell-sensitive paths after Pyxis/login-shell initialization.
+
+    Slurm's ``--export`` propagates ordinary variables, but Pyxis and
+    ``bash -l`` may replace HOME and PATH from the container/user database.
+    Those two values control where runtime state is written and whether the
+    mounted Slurm clients are discoverable, so set them in the launched shell.
+    """
+    exports: list[str] = []
+    for assignment in export_env:
+        name, separator, value = assignment.partition("=")
+        if separator and name in {"HOME", "PATH"}:
+            exports.append(f"export {name}={shlex.quote(value)}")
+    return exports
 
 
 def _gpu_mask(gpu_ids: tuple[int, ...]) -> str:

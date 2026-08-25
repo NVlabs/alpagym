@@ -220,7 +220,10 @@ def test_entrypoint_installs_bridge_only_for_colocated_policy_process(
     )
     run_config = SimpleNamespace(
         logging_level="DEBUG",
-        cosmos=SimpleNamespace(mode=mode),
+        cosmos=SimpleNamespace(
+            mode=mode,
+            train=SimpleNamespace(resume=SimpleNamespace(enabled=False)),
+        ),
         policy=SimpleNamespace(model=SimpleNamespace(kind="fake")),
     )
     install_calls: list[None] = []
@@ -234,6 +237,11 @@ def test_entrypoint_installs_bridge_only_for_colocated_policy_process(
         entrypoint,
         "install_colocated_resume_bootstrap_bridge",
         lambda: install_calls.append(None),
+    )
+    monkeypatch.setattr(
+        entrypoint,
+        "install_colocated_fresh_rollout_bridge",
+        lambda: None,
     )
     monkeypatch.setattr(
         entrypoint, "get_policy_bundle", lambda model_kind: policy_bundle

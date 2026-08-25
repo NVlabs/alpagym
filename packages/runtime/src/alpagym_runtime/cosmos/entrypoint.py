@@ -19,6 +19,9 @@ from alpagym_runtime.cosmos import (
     rollout_backend as _rollout_backend,  # noqa: F401
     trainer as _trainer,  # noqa: F401
 )
+from alpagym_runtime.cosmos.colocated_fresh_rollout_bridge import (
+    install_colocated_fresh_rollout_bridge,
+)
 from alpagym_runtime.cosmos.colocated_resume_bridge import (
     install_colocated_resume_bootstrap_bridge,
 )
@@ -190,6 +193,8 @@ def main(argv: list[str] | None = None) -> None:
 
     if cosmos_role == "Policy" and run_config.cosmos.mode == CosmosRLMode.colocated:
         install_colocated_resume_bootstrap_bridge()
+        if not run_config.cosmos.train.resume.enabled:
+            install_colocated_fresh_rollout_bridge()
 
     # The Controller owns no data plane, but on NCCL it starts the TCPStore
     # master that Policy/Rollout workers rendezvous through and installs the

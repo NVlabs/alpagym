@@ -431,6 +431,7 @@ def get_bundle() -> PolicyBundle:
         load_inference_model=load_inference_model,
         build_model_inputs=build_model_inputs,
         export_model_checkpoint=export_model_checkpoint,
+        wrap_inference_model=VlaNativeInferenceModel,
     )
 
 

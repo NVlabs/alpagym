@@ -8,8 +8,8 @@ from alpagym_host.run_topology import RunHostPlan, RunTopologyPlan
 from alpagym_host.slurm import _gpu_mask, build_cosmos_srun_command, build_wizard_srun_command
 
 
-def test_build_wizard_srun_command_uses_slurm_gpu_binding_without_cuda_mask() -> None:
-    """AlpaSim placement uses Slurm GPU binding instead of shell CUDA masks."""
+def test_build_wizard_srun_command_leaves_gpu_binding_to_nested_services() -> None:
+    """The CPU-only Wizard must not narrow the allocation seen by its services."""
     host = RunHostPlan(
         hostname="mixed-0",
         host_index=1,
@@ -23,12 +23,13 @@ def test_build_wizard_srun_command_uses_slurm_gpu_binding_without_cuda_mask() ->
         host=host,
         slurm=_slurm_config(),
         wizard_command=["python", "-m", "alpasim.wizard"],
+        wizard_workdir=Path("/workspace/alpasim"),
         log_path=Path("/tmp/alpagym/logs/wizard_0.log"),
     )
 
     assert "--nodelist=mixed-0" in command
-    assert "--gpus-per-task=4" in command
-    assert "--gpu-bind=mask_gpu:0xf0" in command
+    assert not any(value.startswith("--gpus-per-task=") for value in command)
+    assert not any(value.startswith("--gpu-bind=") for value in command)
     assert "CUDA_VISIBLE_DEVICES" not in " ".join(command)
 
 
@@ -49,12 +50,43 @@ def test_build_wizard_srun_command_scrubs_uv_project_env_before_exec() -> None:
         host=host,
         slurm=_slurm_config(),
         wizard_command=["python", "-m", "alpasim.wizard"],
+        wizard_workdir=Path("/workspace/alpasim"),
         log_path=Path("/tmp/alpagym/logs/wizard_0.log"),
     )
 
     script = command[-1]
     assert "unset UV_PROJECT_ENVIRONMENT VIRTUAL_ENV" in script
     assert script.index("unset UV_PROJECT_ENVIRONMENT VIRTUAL_ENV") < script.index("exec ")
+
+
+def test_build_wizard_srun_command_reapplies_container_home_and_path() -> None:
+    """Pyxis/login initialization must not replace the authored runtime paths."""
+    host = RunHostPlan(
+        hostname="mixed-0",
+        host_index=0,
+        runs_cosmos=True,
+        runs_alpasim=True,
+        cosmos_gpus=1,
+        alpasim_gpus=1,
+    )
+    slurm = _slurm_config()
+    slurm.export_env = [
+        "HOME=/lustre/run-home",
+        "PATH=/cm/slurm/bin:/opt/venv/bin",
+    ]
+
+    command = build_wizard_srun_command(
+        host=host,
+        slurm=slurm,
+        wizard_command=["python", "-m", "alpasim.wizard"],
+        wizard_workdir=Path("/workspace/alpasim"),
+        log_path=Path("/tmp/alpagym/logs/wizard_0.log"),
+    )
+
+    assert command[-1].startswith(
+        "export HOME=/lustre/run-home\n"
+        "export PATH=/cm/slurm/bin:/opt/venv/bin\n"
+    )
 
 
 def test_build_wizard_srun_command_disables_cpu_binding_for_nonexclusive_step() -> None:
@@ -72,6 +104,7 @@ def test_build_wizard_srun_command_disables_cpu_binding_for_nonexclusive_step() 
         host=host,
         slurm=_slurm_config(exclusive=False),
         wizard_command=["python", "-m", "alpasim.wizard"],
+        wizard_workdir=Path("/workspace/alpasim"),
         log_path=Path("/tmp/alpagym/logs/wizard_0.log"),
     )
 
@@ -93,6 +126,7 @@ def test_build_wizard_srun_command_keeps_default_cpu_binding_for_exclusive_step(
         host=host,
         slurm=_slurm_config(exclusive=True),
         wizard_command=["python", "-m", "alpasim.wizard"],
+        wizard_workdir=Path("/workspace/alpasim"),
         log_path=Path("/tmp/alpagym/logs/wizard_0.log"),
     )
 
@@ -187,6 +221,37 @@ def test_build_cosmos_srun_command_passes_worker_flags_to_cosmos_launcher() -> N
         assert script.index(expected_arg) < entrypoint_index
     assert "--gpu-bind=mask_gpu:0xf" in command
     assert "ALPAGYM_WORKER_INDEX" not in command[-1]
+
+
+def test_build_cosmos_srun_command_reapplies_container_home_and_path() -> None:
+    """Cosmos workers retain authored HOME/PATH inside the Pyxis shell."""
+    host = RunHostPlan(
+        hostname="mixed-0",
+        host_index=0,
+        runs_cosmos=True,
+        runs_alpasim=True,
+        cosmos_gpus=1,
+        alpasim_gpus=1,
+    )
+    slurm = _slurm_config()
+    slurm.export_env = [
+        "HOME=/lustre/run-home",
+        "PATH=/cm/slurm/bin:/opt/venv/bin",
+    ]
+
+    command = build_cosmos_srun_command(
+        cosmos_hosts=(host,),
+        slurm=slurm,
+        container_image="/containers/alpagym.sqsh",
+        workspace_sync_command=["uv", "sync"],
+        worker_commands=(["uv", "run", "python", "worker.py"],),
+        log_dir=Path("/tmp/alpagym/logs"),
+    )
+
+    assert command[-1].startswith(
+        "export HOME=/lustre/run-home\n"
+        "export PATH=/cm/slurm/bin:/opt/venv/bin\n"
+    )
 
 
 def test_gpu_mask_preserves_non_contiguous_gpu_ids() -> None:

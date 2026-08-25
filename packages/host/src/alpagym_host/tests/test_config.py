@@ -33,6 +33,7 @@ from alpagym_host.config import (
 from alpagym_host.config_validation import (
     _validate_humanoid_config,
     _validate_provenance_config,
+    _validate_slurm_cosmos_gpu_capacity,
     _validate_vla_slurm_worker_mounts,
     _validate_wizard_startup_config,
     validate_run_config,
@@ -1910,6 +1911,24 @@ def test_slurm_cosmos_capacity_rejects_replicas_that_do_not_fit(
 
     with pytest.raises(ValueError, match="Cosmos Slurm GPU capacity"):
         validate_run_config(run_config, "run")
+
+
+def test_slurm_colocated_replicas_share_the_cosmos_gpu_pool(
+    tmp_path: Path,
+) -> None:
+    """Colocated policy and rollout actors are not separate Slurm GPU claims."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        f"policy.model.path={model_path.as_posix()}",
+        "topology=slurm_partial_node_1_2_1",
+        "execution.slurm.container_image=/containers/alpagym.sqsh",
+        "cosmos.mode=colocated",
+        "cosmos.launch.policy_replicas=1",
+        "cosmos.launch.rollout_replicas=1",
+    )
+
+    _validate_slurm_cosmos_gpu_capacity(run_config)
 
 
 @pytest.mark.parametrize(

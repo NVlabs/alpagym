@@ -23,7 +23,11 @@ _DTYPE_BY_NAME = {
 }
 
 
-def build_inference_engine(run_config: RunConfig) -> InferenceEngine:
+def build_inference_engine(
+    run_config: RunConfig,
+    *,
+    existing_model: torch.nn.Module | None = None,
+) -> InferenceEngine:
     """Build the rollout's inference engine for the configured policy family.
 
     Reads `run_config.policy.model` and `.inference`, then dispatches loading to
@@ -37,9 +41,15 @@ def build_inference_engine(run_config: RunConfig) -> InferenceEngine:
     if inference_cfg.sampling.force_determinism:
         set_deterministic()
 
-    inference_model = get_policy_bundle(model_cfg.kind).load_inference_model(
-        run_config, device, dtype
-    )
+    bundle = get_policy_bundle(model_cfg.kind)
+    if existing_model is None:
+        inference_model = bundle.load_inference_model(run_config, device, dtype)
+    else:
+        if bundle.wrap_inference_model is None:
+            raise ValueError(
+                f"policy bundle {model_cfg.kind!r} cannot wrap a colocated model"
+            )
+        inference_model = bundle.wrap_inference_model(existing_model)
 
     return InferenceEngine(
         inference_model=inference_model,
