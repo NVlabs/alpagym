@@ -2663,9 +2663,9 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                 f"got {target_behavior_kl!r}"
             )
         behavior_kl_target_mode = ppo_config.get("behavior_kl_target_mode", "hard")
-        if behavior_kl_target_mode not in {"hard", "soft"}:
+        if behavior_kl_target_mode not in {"hard", "soft", "warn"}:
             raise ValueError(
-                "PPO behavior_kl_target_mode must be either 'hard' or 'soft'"
+                "PPO behavior_kl_target_mode must be 'hard', 'soft', or 'warn'"
             )
         self._behavior_kl_target_mode = behavior_kl_target_mode
         behavior_kl_hard_limit = ppo_config.get("behavior_kl_hard_limit")
@@ -2686,6 +2686,15 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                     "PPO behavior_kl_hard_limit must be finite and greater than "
                     "the soft target_behavior_kl"
                 )
+        elif self._behavior_kl_target_mode == "warn":
+            if self._target_behavior_kl is None:
+                raise ValueError(
+                    "PPO warn behavior-KL target mode requires target_behavior_kl"
+                )
+            if self._behavior_kl_hard_limit is not None:
+                raise ValueError(
+                    "PPO warn behavior-KL target mode forbids behavior_kl_hard_limit"
+                )
         elif self._behavior_kl_hard_limit is not None:
             raise ValueError(
                 "PPO behavior_kl_hard_limit is only valid in soft target mode"
@@ -2694,6 +2703,10 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
         if type(behavior_kl_backtrack) is not bool:
             raise TypeError("PPO behavior-KL backtracking flag must be a boolean")
         self._behavior_kl_backtrack = behavior_kl_backtrack
+        if self._behavior_kl_target_mode == "warn" and self._behavior_kl_backtrack:
+            raise ValueError(
+                "PPO warn behavior-KL target mode forbids behavior_kl_backtrack"
+            )
         behavior_kl_backtrack_margin = ppo_config.get(
             "behavior_kl_backtrack_margin", 0.9
         )
@@ -3564,9 +3577,9 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
     ) -> None:
         """Validate replay identity and finite behavior-policy diagnostics.
 
-        ``target_behavior_kl`` is an optimizer calibration target.  Bounded
-        actor backtracking records whether it was reached, but a finite target
-        miss is not an infrastructure failure and must not terminate training.
+        ``target_behavior_kl`` is an optimizer calibration target. ``warn``
+        mode records any finite miss without changing or rejecting the actor
+        step. Non-finite diagnostics remain infrastructure failures.
         """
         if phase == "pre_update" and self._on_policy:
             valid_rows = int(metrics["train/pre_update_valid_rows"])
@@ -3619,6 +3632,16 @@ class AlpagymPPOTrainer(AlpagymGRPOTrainer):
                 f"PPO {phase_label} behavior KL is non-finite: {approx_kl}"
             )
         target_mode = getattr(self, "_behavior_kl_target_mode", "hard")
+        if target_mode == "warn":
+            if approx_kl > target:
+                logger.warning(
+                    "PPO %s behavior KL %.6g exceeds telemetry target %.6g; "
+                    "continuing without actor backtracking or update rejection",
+                    phase_label,
+                    approx_kl,
+                    target,
+                )
+            return
         hard_limit = getattr(self, "_behavior_kl_hard_limit", None)
         acceptance_limit = target if target_mode == "hard" else hard_limit
         if acceptance_limit is None:

@@ -1517,6 +1517,113 @@ def test_ppo_post_update_behavior_kl_target_allows_finite_overshoot(
     assert trainer.saved_checkpoints == [(1, 1, 0)]
 
 
+def test_ppo_warn_behavior_kl_keeps_finite_actor_step_without_backtracking(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Any finite warning-mode KL is telemetry, even far above the target."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = _ppo_step_guard_trainer(trainer_module)
+    trainer._target_behavior_kl = 0.003
+    trainer._behavior_kl_target_mode = "warn"
+    trainer._behavior_kl_hard_limit = None
+    trainer._behavior_kl_backtrack = False
+    events: list[str] = []
+    monkeypatch.setattr(
+        trainer_module, "filter_trainable_rollouts", lambda rollouts, **kwargs: rollouts
+    )
+    trainer._pre_update_diagnostics = lambda samples: {
+        "train/pre_update_approx_kl": 0.0,
+        "train/pre_update_valid_rows": len(samples),
+    }
+    trainer._post_update_diagnostics = lambda samples: {
+        "train/post_update_approx_kl": 123.0,
+        "train/post_update_valid_rows": len(samples),
+    }
+
+    def _record_training(
+        *args: Any,
+    ) -> tuple[float, float, int, float, float, float, float]:
+        del args
+        events.append("train")
+        trainer._optimizer_steps_applied_in_training_step = 1
+        return (1.0, 0.0, 1, 1.0, 1.0, 0.0, 0.0)
+
+    trainer._run_training_loop = _record_training
+    trainer._snapshot_actor_for_kl_backtracking = lambda: (_ for _ in ()).throw(
+        AssertionError("warning mode attempted to snapshot or backtrack the actor")
+    )
+
+    metrics = trainer.step_training(
+        rollouts=[object()],
+        current_step=1,
+        total_steps=1,
+        remain_samples_num=0,
+        inter_policy_nccl=object(),
+        is_master_replica=True,
+    )
+
+    assert events == ["train"]
+    assert metrics["train/post_update_approx_kl"] == pytest.approx(123.0)
+    assert "train/actor_backtrack_attempts" not in metrics
+    assert trainer.lr_schedulers.steps == 1
+    assert trainer.saved_checkpoints == [(1, 1, 0)]
+    assert any(
+        "exceeds telemetry target" in record.getMessage()
+        and "continuing without actor backtracking" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_ppo_warn_behavior_kl_rejects_nonfinite_before_publication(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Warning mode remains fail-closed for a non-finite post-update KL."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+    trainer = _ppo_step_guard_trainer(trainer_module)
+    trainer._target_behavior_kl = 0.003
+    trainer._behavior_kl_target_mode = "warn"
+    trainer._behavior_kl_hard_limit = None
+    trainer._behavior_kl_backtrack = False
+    monkeypatch.setattr(
+        trainer_module, "filter_trainable_rollouts", lambda rollouts, **kwargs: rollouts
+    )
+    trainer._pre_update_diagnostics = lambda samples: {
+        "train/pre_update_approx_kl": 0.0,
+        "train/pre_update_valid_rows": len(samples),
+    }
+    trainer._post_update_diagnostics = lambda samples: {
+        "train/post_update_approx_kl": float("nan"),
+        "train/post_update_valid_rows": len(samples),
+    }
+
+    def _record_training(
+        *args: Any,
+    ) -> tuple[float, float, int, float, float, float, float]:
+        del args
+        trainer._optimizer_steps_applied_in_training_step = 1
+        return (1.0, 0.0, 1, 1.0, 1.0, 0.0, 0.0)
+
+    trainer._run_training_loop = _record_training
+
+    with pytest.raises(FloatingPointError, match="post-update.*non-finite"):
+        trainer.step_training(
+            rollouts=[object()],
+            current_step=1,
+            total_steps=1,
+            remain_samples_num=0,
+            inter_policy_nccl=object(),
+            is_master_replica=True,
+        )
+
+    assert trainer.lr_schedulers.steps == 0
+    assert trainer.saved_checkpoints == []
+
+
 def test_ppo_behavior_kl_backtracking_scales_actor_only_before_accept(
     cosmos_stubs: None,
     monkeypatch: pytest.MonkeyPatch,
@@ -2298,6 +2405,52 @@ def test_ppo_behavior_kl_backtracking_requires_one_optimizer_iteration(
             config=config,
             parallel_dims=SimpleNamespace(world_size=1),
         )
+
+
+def test_ppo_warn_behavior_kl_initializes_without_hard_limit_or_backtracking(
+    cosmos_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trainer initialization preserves the telemetry-only warning contract."""
+    del cosmos_stubs
+    trainer_module = importlib.import_module("alpagym_runtime.cosmos.trainer")
+
+    def shared_init(
+        trainer: Any,
+        *,
+        config: object,
+        parallel_dims: object,
+        **kwargs: object,
+    ) -> None:
+        del config, parallel_dims, kwargs
+        trainer._grpo_optimization_iterations = 1
+        trainer._mini_batch = 1
+
+    monkeypatch.setattr(
+        trainer_module.AlpagymGRPOTrainer,
+        "__init__",
+        shared_init,
+    )
+    config = SimpleNamespace(
+        custom={
+            "ppo": {
+                "target_behavior_kl": 0.003,
+                "behavior_kl_target_mode": "warn",
+                "behavior_kl_hard_limit": None,
+                "behavior_kl_backtrack": False,
+            }
+        }
+    )
+
+    trainer = trainer_module.AlpagymPPOTrainer(
+        config=config,
+        parallel_dims=SimpleNamespace(world_size=1),
+    )
+
+    assert trainer._target_behavior_kl == pytest.approx(0.003)
+    assert trainer._behavior_kl_target_mode == "warn"
+    assert trainer._behavior_kl_hard_limit is None
+    assert trainer._behavior_kl_backtrack is False
 
 
 def test_final_checkpoint_respects_disabled_safetensors_export(

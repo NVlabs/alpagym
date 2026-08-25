@@ -57,9 +57,12 @@ def test_train2_staged_profile_is_independent_from_four_rollout_smoke(
     assert staged.cosmos.train.train_policy.on_policy is True
     assert staged.cosmos.train.train_policy.allowed_outdated_steps == 0
     assert smoke.cosmos.train.train_policy.ppo_behavior_kl_target_mode == "soft"
-    assert staged.cosmos.train.train_policy.ppo_behavior_kl_target_mode == "soft"
+    assert smoke.cosmos.train.train_policy.ppo_behavior_kl_hard_limit == 0.01
+    assert smoke.cosmos.train.train_policy.ppo_behavior_kl_backtrack is True
+    assert staged.cosmos.train.train_policy.ppo_behavior_kl_target_mode == "warn"
     assert staged.cosmos.train.train_policy.ppo_target_behavior_kl == 0.003
-    assert staged.cosmos.train.train_policy.ppo_behavior_kl_hard_limit == 0.01
+    assert staged.cosmos.train.train_policy.ppo_behavior_kl_hard_limit is None
+    assert staged.cosmos.train.train_policy.ppo_behavior_kl_backtrack is False
     assert staged.cosmos.train.ckpt.enable_checkpoint is True
     assert staged.cosmos.train.ckpt.save_mode == "sync"
     assert smoke.alpasim.humanoid.rollout_seed_base == 292285

@@ -278,12 +278,14 @@ class CosmosRLTrainPolicyConfig:
     # Optional pre/post-update KL target against the behavior policy that
     # generated the current PPO replay batch. This is distinct from
     # fixed-reference KL. ``hard`` preserves fail-closed legacy semantics;
-    # ``soft`` uses a separate catastrophic limit.
+    # ``soft`` uses a separate catastrophic limit; ``warn`` is telemetry-only
+    # and accepts every finite observed KL without changing the actor step.
     ppo_target_behavior_kl: float | None = None
     ppo_behavior_kl_target_mode: str = "hard"
     ppo_behavior_kl_hard_limit: float | None = None
     # When enabled, Flow-PPO retries an actor update with a conservatively
-    # scaled step toward the behavior-KL target.
+    # scaled step toward the behavior-KL target. Telemetry-only ``warn`` mode
+    # requires this to remain false.
     ppo_behavior_kl_backtrack: bool = False
     ppo_behavior_kl_backtrack_margin: float = 0.9
     ppo_behavior_kl_backtrack_max_attempts: int = 4
