@@ -15,6 +15,14 @@ cosmos:
     num_epochs: 50
     ckpt:
       save_freq: 5
+    train_policy:
+      # Phase-A reward probing treats 0.003 as telemetry only. Every finite KL
+      # publishes the single PPO update unchanged; ratio/gradient clipping are
+      # the update controls. Non-finite diagnostics still fail closed.
+      ppo_target_behavior_kl: 0.003
+      ppo_behavior_kl_target_mode: warn
+      ppo_behavior_kl_hard_limit: null
+      ppo_behavior_kl_backtrack: false
   rollout:
     n_generation: 2
 

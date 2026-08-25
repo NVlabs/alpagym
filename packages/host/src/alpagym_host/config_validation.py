@@ -920,9 +920,9 @@ def _validate_training_policy_config(config: RunConfig) -> None:
         raise ValueError(
             "PPO ppo_target_behavior_kl must be finite and positive when set"
         )
-    if train_policy.ppo_behavior_kl_target_mode not in {"hard", "soft"}:
+    if train_policy.ppo_behavior_kl_target_mode not in {"hard", "soft", "warn"}:
         raise ValueError(
-            "PPO ppo_behavior_kl_target_mode must be either 'hard' or 'soft'"
+            "PPO ppo_behavior_kl_target_mode must be 'hard', 'soft', or 'warn'"
         )
     hard_limit = train_policy.ppo_behavior_kl_hard_limit
     if hard_limit is not None and (
@@ -945,6 +945,22 @@ def _validate_training_policy_config(config: RunConfig) -> None:
             raise ValueError(
                 "PPO ppo_behavior_kl_hard_limit must exceed the soft "
                 "ppo_target_behavior_kl"
+            )
+    elif train_policy.ppo_behavior_kl_target_mode == "warn":
+        if train_policy.ppo_target_behavior_kl is None:
+            raise ValueError(
+                "PPO warn behavior-KL target mode requires "
+                "ppo_target_behavior_kl"
+            )
+        if hard_limit is not None:
+            raise ValueError(
+                "PPO warn behavior-KL target mode forbids "
+                "ppo_behavior_kl_hard_limit"
+            )
+        if train_policy.ppo_behavior_kl_backtrack is True:
+            raise ValueError(
+                "PPO warn behavior-KL target mode forbids "
+                "ppo_behavior_kl_backtrack"
             )
     elif hard_limit is not None:
         raise ValueError(

@@ -379,6 +379,53 @@ def test_training_policy_soft_kl_hard_limit_must_exceed_target(
         validate_run_config(run_config, "run")
 
 
+def test_training_policy_warn_kl_target_is_telemetry_only(tmp_path: Path) -> None:
+    """Warning mode accepts finite KL without a hard gate or actor retry."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        f"policy.model.path={model_path.as_posix()}",
+    )
+    train_policy = run_config.cosmos.train.train_policy
+    train_policy.ppo_target_behavior_kl = 0.003
+    train_policy.ppo_behavior_kl_target_mode = "warn"
+    train_policy.ppo_behavior_kl_hard_limit = None
+    train_policy.ppo_behavior_kl_backtrack = False
+
+    validate_run_config(run_config, "run")
+
+
+@pytest.mark.parametrize(
+    ("target", "hard_limit", "backtrack", "message"),
+    (
+        (None, None, False, "requires ppo_target_behavior_kl"),
+        (0.003, 0.01, False, "forbids ppo_behavior_kl_hard_limit"),
+        (0.003, None, True, "forbids ppo_behavior_kl_backtrack"),
+    ),
+)
+def test_training_policy_warn_kl_target_rejects_control_semantics(
+    tmp_path: Path,
+    target: float | None,
+    hard_limit: float | None,
+    backtrack: bool,
+    message: str,
+) -> None:
+    """Telemetry-only warning mode cannot silently acquire update controls."""
+    model_path = _write_hf_bundle_dir(tmp_path)
+    run_config = _make_run_config(
+        tmp_path,
+        f"policy.model.path={model_path.as_posix()}",
+    )
+    train_policy = run_config.cosmos.train.train_policy
+    train_policy.ppo_target_behavior_kl = target
+    train_policy.ppo_behavior_kl_target_mode = "warn"
+    train_policy.ppo_behavior_kl_hard_limit = hard_limit
+    train_policy.ppo_behavior_kl_backtrack = backtrack
+
+    with pytest.raises(ValueError, match=message):
+        validate_run_config(run_config, "run")
+
+
 def test_training_policy_rejects_unknown_kl_target_mode(tmp_path: Path) -> None:
     """KL acceptance semantics must be explicit and schema-validated."""
     model_path = _write_hf_bundle_dir(tmp_path)
@@ -386,7 +433,7 @@ def test_training_policy_rejects_unknown_kl_target_mode(tmp_path: Path) -> None:
         tmp_path,
         f"policy.model.path={model_path.as_posix()}",
     )
-    run_config.cosmos.train.train_policy.ppo_behavior_kl_target_mode = "warning"
+    run_config.cosmos.train.train_policy.ppo_behavior_kl_target_mode = "unknown"
 
     with pytest.raises(ValueError, match="ppo_behavior_kl_target_mode"):
         validate_run_config(run_config, "run")
