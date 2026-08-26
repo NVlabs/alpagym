@@ -103,6 +103,36 @@ def test_hq_stairs_experiment_requires_formal_provenance() -> None:
     assert config.execution.provenance_mode is ProvenanceMode.required
 
 
+def test_blue_taped_blocks_experiment_composes_with_six_second_horizon() -> None:
+    """The Blue blocks profile owns its scene, route, and 6 s horizon."""
+    register_config_schema()
+    with initialize_config_module(version_base=None, config_module="alpagym_host.conf"):
+        config = compose(
+            config_name="default",
+            overrides=[
+                "experiment=g1_vla_blue_taped_blocks_local_1gpu",
+                "policy.model.path=/tmp/model",
+                "alpasim.humanoid.repo_path=/tmp/humanoid",
+                "alpasim.humanoid.scene_store_path=/tmp/scene_store",
+                "alpasim.humanoid.visual_controller_release_path=/tmp/controller",
+                "alpasim.humanoid.scene_cache_path=/tmp/cache",
+                "alpasim.humanoid.runtime_cache_path=/tmp/runtime-cache",
+            ],
+        )
+
+    assert config.dataset.scene_ids == ["blue_taped_blocks_20260818_213023"]
+    assert config.alpasim.humanoid.scenario_ids_by_scene == {
+        "blue_taped_blocks_20260818_213023": "cross_platform"
+    }
+    assert config.alpasim.humanoid.reward_profile_id == "reference_route_centered.v2"
+    assert config.alpasim.humanoid.route_center_soft_m == 0.05
+    assert config.alpasim.humanoid.route_progress_credit_m == 0.25
+    assert config.alpasim.humanoid.route_corridor_half_width_m == 0.35
+    assert config.expected_valid_steps == 12
+    assert config.alpasim.wizard_args.n_sim_steps == 12
+    assert config.alpasim.wizard_args.control_timestep_us == 500_000
+
+
 def test_host_writes_and_loads_handoff_artifacts(
     tmp_path: Path,
 ) -> None:

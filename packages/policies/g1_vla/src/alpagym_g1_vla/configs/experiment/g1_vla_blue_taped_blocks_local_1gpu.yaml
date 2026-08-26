@@ -1,0 +1,102 @@
+# @package _global_
+
+defaults:
+  - override /policy: g1_vla
+  - override /topology: local_colocated_1gpu
+
+# Six seconds at the native 2 Hz VLA replan rate.
+expected_valid_steps: 12
+
+execution:
+  provenance_mode: required
+
+dataset:
+  test_suite_id: null
+  scene_ids: [blue_taped_blocks_20260818_213023]
+
+policy:
+  model:
+    path: ???
+
+alpasim:
+  simulation_domain: humanoid
+  runtime_rollout_timeout_s: 300.0
+  simulation_cleanup_margin_s: 60.0
+  simulation_timeout_s: 360.0
+  humanoid:
+    repo_path: ???
+    scene_store_path: ???
+    scenario_ids_by_scene:
+      blue_taped_blocks_20260818_213023: cross_platform
+    execution_profile: motion_reference
+    reference_frame_count: 50
+    reference_controller_profile: sonic_visual
+    visual_controller_release_path: ???
+    robot_physics_profile: sonic.isaac_training.g1_cylinder_model_12.mujoco_port.v1
+    policy_camera_profile: vla_d435_native
+    scene_cache_path: ???
+    runtime_cache_path: ???
+    num_envs: 1
+    rollout_seed_base: 202608250100000
+    service_image: alpasim-humanoid-nurec:local
+    # This scene is one straight route across a solid platform.  A corridor
+    # narrower than the platform's 0.395 m lateral half-width makes bypassing
+    # the obstacle an off-route failure, so the physics itself enforces the
+    # step-up/step-down behavior without a scene-specific height reward.
+    reward_profile_id: reference_route_centered.v2
+    route_center_soft_m: 0.05
+    route_progress_credit_m: 0.25
+    route_corridor_half_width_m: 0.35
+  wizard_args:
+    force_gt_duration_us: 0
+    control_timestep_us: 500_000
+    n_sim_steps: 12
+
+cosmos:
+  train:
+    train_batch_per_replica: 4
+    max_num_steps: 1
+    num_epochs: 1
+    seed: 20260825
+    deterministic: true
+    optm_lr: 2.5e-9
+    optm_part_lrs: [2.5e-9, 1.0e-4]
+    optm_warmup_steps: 0
+    epsilon: 1.0e-8
+    optm_weight_decay: 0.01
+    optm_betas: [0.9, 0.999]
+    optm_grad_norm_clip: 1.0
+    ckpt:
+      enable_checkpoint: true
+      save_freq: 5
+      save_mode: sync
+      export_safetensors: true
+      max_keep: 11
+    train_policy:
+      trainer_type: alpagym_flow_ppo
+      allowed_outdated_steps: 0
+      on_policy: true
+      mini_batch: 1
+      step_mini_batch: 1
+      grpo_optimization_iterations: 1
+      kl_beta: 0.0
+      reference_reset_interval: 0
+      ppo_gamma: 0.99
+      ppo_gae_lambda: 0.95
+      grpo_ratio_clip_low: 0.2
+      grpo_ratio_clip_high: 0.28
+      ppo_dual_clip_ratio: 3.0
+      ppo_value_loss_coef: 1.0
+      ppo_value_clip_range: 0.2
+      ppo_value_huber_delta: 10.0
+      ppo_normalize_advantages: true
+      ppo_target_behavior_kl: 0.003
+      ppo_behavior_kl_target_mode: warn
+      ppo_behavior_kl_hard_limit: null
+      ppo_behavior_kl_backtrack: false
+      ppo_behavior_kl_backtrack_margin: 0.9
+      ppo_behavior_kl_backtrack_max_attempts: 4
+  rollout:
+    n_generation: 4
+    batch_size: 1
+    prefetch_rollout: false
