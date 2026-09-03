@@ -23,7 +23,7 @@ override-dependencies = [
   # a newer revision (~88 commits ahead). Force the alpagym rev to avoid
   # a uv "conflicting URLs" error; cosmos-rl is fully backward-compatible
   # for the APIs alpamayo1-x-rl exercises.
-  "cosmos-rl @ git+https://github.com/nvidia-cosmos/cosmos-rl.git@d2a2c57c4bd6496482bc42da19a59b4432705eda",
+  "cosmos-rl @ git+https://github.com/nvidia-cosmos/cosmos-rl.git@89f2e5b5c817d99a240f1194ce37239ceb6f058a",
 ]
 # Restrict resolution to Linux x86_64 (CUDA). alpagym pulls vllm + flash-attn +
 # alpamayo1-x-rl which are Linux-only; resolving Windows/macOS splits fails.
@@ -69,7 +69,7 @@ alpagym-runtime = { workspace = true }
 alpamayo-r1 = { git = "https://github.com/NVlabs/alpamayo.git", rev = "4cda35d22bb257f0936ac272397627b9309ca211" }
 alpamayo-recipes = { git = "https://github.com/NVlabs/alpamayo-recipes.git", subdirectory = "src", rev = "1d99fc50370c96637157455da386323a44663c9d" }
 alpasim-grpc = { git = "https://github.com/NVlabs/alpasim.git", subdirectory = "src/grpc", rev = "46b401beaec27977cbb86826df8e39cec2d49e49" }
-cosmos-rl = { git = "https://github.com/nvidia-cosmos/cosmos-rl.git", rev = "d2a2c57c4bd6496482bc42da19a59b4432705eda" }
+cosmos-rl = { git = "https://github.com/nvidia-cosmos/cosmos-rl.git", rev = "89f2e5b5c817d99a240f1194ce37239ceb6f058a" }
 flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
 torch = { index = "pytorch-cu128" }
 torchaudio = { index = "pytorch-cu128" }
