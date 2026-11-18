@@ -12,10 +12,14 @@ rollout and training orchestration (the trainer). AlpaGym is the harness that
 wires them to a driving policy and keeps the interfaces small enough to swap any
 one piece.
 
-AlpaGym is in early but active development. It currently supports the
+> [!NOTE]
+> This repository contains the initial release of AlpaGym. A major update is coming soon,
+> bringing substantial throughput improvements, new training recipes, and support for
+> additional models, including a recipe for post-training
+> [Alpamayo 2 Edge](https://huggingface.co/nvidia/Alpamayo2-Edge).
+
+AlpaGym currently supports the
 [Alpamayo 1.5](https://github.com/NVlabs/alpamayo1.5) model with 10b parameters.
-Current work focuses on throughput and scaling, and on supporting more models and
-training algorithms.
 
 ## Table of Contents
 
